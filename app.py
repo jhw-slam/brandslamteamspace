@@ -605,3 +605,53 @@ m4.metric("전체 진행중", f"{sum(v for k, v in status_counts.items() if k no
 
 st.markdown("**상태별 현황**")
 st.bar_chart(pd.Series(status_counts))
+
+st.divider()
+
+# ══════════════════════════════════════════════════════════
+# 🎯 팀 OKR 현황 (읽기 전용 — 기존 OKR 자료 그대로, 편집 기능 없음)
+# ══════════════════════════════════════════════════════════
+st.subheader("🎯 팀 OKR 현황")
+st.caption("전사 목표(OKR)를 참고용으로 보여드려요. 여기서는 수정이 안 되고 확인만 하는 용도예요 — 편집은 기존 OKR 페이지에서 계속 하시면 됩니다.")
+
+
+@st.cache_data(ttl=60)
+def load_okr():
+    org = SUPA.table("okr_org").select("*").order("person").execute().data
+    items = SUPA.table("okr_items").select("*").order("person").execute().data
+    return org, items
+
+
+okr_org_data, okr_items_data = load_okr()
+
+if not okr_org_data:
+    st.caption("등록된 OKR이 없습니다.")
+else:
+    for o in okr_org_data:
+        with st.container(border=True):
+            pending_tag = " · 🔲 채용예정" if o.get("pending") else ""
+            st.markdown(f"#### 👤 {o['person']}{pending_tag}")
+            if o.get("tag"):
+                st.caption(o["tag"])
+            st.markdown(f"**🎯 Objective:** {o.get('objective') or '-'}")
+
+            krs = o.get("krs") or []
+            if krs:
+                st.markdown("**Key Results**")
+                for kr in krs:
+                    st.markdown(f"- {kr}")
+
+            person_items = [it for it in okr_items_data if it["person"] == o["person"]]
+            if person_items:
+                with st.expander(f"📌 세부 진행 항목 ({len(person_items)}개)"):
+                    for it in person_items:
+                        try:
+                            target = float(it.get("target_qty") or 0)
+                            progress = float(it.get("progress") or 0)
+                        except (TypeError, ValueError):
+                            target, progress = 0, 0
+                        pct = min(progress / target, 1.0) if target > 0 else (1.0 if progress > 0 else 0.0)
+                        conf = "✅" if it.get("confirmed") else "🔲"
+                        unit = it.get("unit") or ""
+                        st.caption(f"{conf} [{it.get('category') or '미분류'}] {it['title']} — {progress:g}/{target:g}{unit}")
+                        st.progress(pct)
