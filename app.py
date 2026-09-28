@@ -638,7 +638,6 @@ st.divider()
 # 🎯 팀 OKR 현황 (읽기 전용 — 기존 OKR 자료 그대로, 편집 기능 없음)
 # ══════════════════════════════════════════════════════════
 st.subheader("🎯 팀 OKR 현황")
-st.caption("전사 목표(OKR)를 참고용으로 보여드려요. 여기서는 수정이 안 되고 확인만 하는 용도예요 — 편집은 기존 OKR 페이지에서 계속 하시면 됩니다.")
 
 
 @st.cache_data(ttl=60)
@@ -648,28 +647,38 @@ def load_okr():
     return org, items
 
 
-okr_org_data, okr_items_data = load_okr()
+with st.expander("열기 (평소엔 접어둠)", expanded=False):
+    st.caption("전사 목표(OKR)를 참고용으로 보여드려요. 여기서는 수정이 안 되고 확인만 하는 용도예요 — 편집은 기존 OKR 페이지에서 계속 하시면 됩니다.")
+    okr_org_data, okr_items_data = load_okr()
 
-if not okr_org_data:
-    st.caption("등록된 OKR이 없습니다.")
-else:
-    for o in okr_org_data:
-        with st.container(border=True):
-            pending_tag = " · 🔲 채용예정" if o.get("pending") else ""
-            st.markdown(f"#### 👤 {o['person']}{pending_tag}")
-            if o.get("tag"):
-                st.caption(o["tag"])
-            st.markdown(f"**🎯 Objective:** {o.get('objective') or '-'}")
+    if not okr_org_data:
+        st.caption("등록된 OKR이 없습니다.")
+    else:
+        okr_view = st.radio("보기", ["🏢 회사 전체 OKR", "👤 개별 보기"], horizontal=True, key="okr_view_mode")
 
-            krs = o.get("krs") or []
-            if krs:
-                st.markdown("**Key Results**")
-                for kr in krs:
-                    st.markdown(f"- {kr}")
+        if okr_view == "🏢 회사 전체 OKR":
+            for o in okr_org_data:
+                pending_tag = " · 🔲채용예정" if o.get("pending") else ""
+                st.markdown(f"**{o['person']}**{pending_tag} — {o.get('objective') or '-'}")
+        else:
+            target_p = st.selectbox("사람 선택", [o["person"] for o in okr_org_data], key="okr_indiv_person")
+            o = next(x for x in okr_org_data if x["person"] == target_p)
+            with st.container(border=True):
+                pending_tag = " · 🔲 채용예정" if o.get("pending") else ""
+                st.markdown(f"#### 👤 {o['person']}{pending_tag}")
+                if o.get("tag"):
+                    st.caption(o["tag"])
+                st.markdown(f"**🎯 Objective:** {o.get('objective') or '-'}")
 
-            person_items = [it for it in okr_items_data if it["person"] == o["person"]]
-            if person_items:
-                with st.expander(f"📌 세부 진행 항목 ({len(person_items)}개)"):
+                krs = o.get("krs") or []
+                if krs:
+                    st.markdown("**Key Results**")
+                    for kr in krs:
+                        st.markdown(f"- {kr}")
+
+                person_items = [it for it in okr_items_data if it["person"] == o["person"]]
+                if person_items:
+                    st.markdown(f"**📌 세부 진행 항목 ({len(person_items)}개)**")
                     for it in person_items:
                         try:
                             target = float(it.get("target_qty") or 0)
