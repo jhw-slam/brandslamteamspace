@@ -185,14 +185,34 @@ st.divider()
 # 🖊️ 오늘 빠른 기록
 # ══════════════════════════════════════════════════════════
 st.subheader("🖊️ 오늘 빠른 기록")
-st.caption("특정 브랜드/인플루언서 카드를 안 만들어도, 그냥 오늘 뭐 했는지 한 줄만 남기면 됩니다.")
+st.caption("오늘 한 일, 내일/오늘 할 일, 뭐든 편하게 적으세요. 링크나 PDF도 같이 남길 수 있어요 — 형식 신경 안 쓰셔도 됩니다.")
 with st.form("quick_log_form", clear_on_submit=True):
-    qc1, qc2 = st.columns([4, 1])
-    quick_note = qc1.text_input("오늘 한 일", placeholder="예: 사누바리한테 왕홍 5명 섭외 지시함", label_visibility="collapsed")
-    quick_submitted = qc2.form_submit_button("기록", type="primary", use_container_width=True)
+    quick_note = st.text_area(
+        "오늘/앞으로 할 일", placeholder="예: 오늘 사누바리한테 왕홍 5명 섭외 지시함 / 내일은 명동점 재고 확인 예정",
+        label_visibility="collapsed", height=90,
+    )
+    qc1, qc2 = st.columns(2)
+    quick_link = qc1.text_input("참고 링크(구글시트/문서 등, 선택)", placeholder="https://...")
+    quick_file = qc2.file_uploader("파일 첨부(PDF 등, 선택)", type=["pdf", "docx", "png", "jpg", "jpeg", "xlsx"])
+    quick_submitted = st.form_submit_button("📝 기록", type="primary", use_container_width=True)
 if quick_submitted:
     if quick_note.strip():
-        SUPA.table("daily_activity_log").insert({"staff_name": my_name, "note": quick_note.strip()}).execute()
+        attachment_url = None
+        if quick_file is not None:
+            try:
+                path = f"{my_name}/{int(pd.Timestamp.now().timestamp())}_{quick_file.name}"
+                SUPA.storage.from_("daily-log-attachments").upload(
+                    path, quick_file.getvalue(),
+                    {"content-type": quick_file.type or "application/octet-stream"},
+                )
+                base = os.environ.get("SUPABASE_URL")
+                attachment_url = f"{base}/storage/v1/object/public/daily-log-attachments/{path}"
+            except Exception as e:
+                st.warning(f"파일 첨부는 실패했지만 기록은 남길게요 ({e})")
+        SUPA.table("daily_activity_log").insert({
+            "staff_name": my_name, "note": quick_note.strip(),
+            "link_url": quick_link.strip() or None, "attachment_url": attachment_url,
+        }).execute()
         st.success("기록 완료!")
         refresh()
     else:
@@ -203,7 +223,13 @@ if recent_logs:
     with st.expander(f"최근 기록 {len(recent_logs)}건 보기"):
         for lg in recent_logs:
             when = lg["created_at"][:16].replace("T", " ")
-            st.caption(f"{when} · **{lg['staff_name']}** · {lg['note']}")
+            extra = []
+            if lg.get("link_url"):
+                extra.append(f"[링크]({lg['link_url']})")
+            if lg.get("attachment_url"):
+                extra.append(f"[첨부파일]({lg['attachment_url']})")
+            extra_txt = " · " + " · ".join(extra) if extra else ""
+            st.caption(f"{when} · **{lg['staff_name']}** · {lg['note']}{extra_txt}")
 
 st.divider()
 
