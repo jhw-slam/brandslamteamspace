@@ -703,8 +703,11 @@ org_chart_dot = """
 digraph OrgChart {
     rankdir=TB;
     bgcolor="transparent";
-    node [shape=box, style="rounded,filled", fontname="Malgun Gothic", fontsize=12, margin="0.15,0.1"];
-    edge [color="#888888"];
+    splines=curved;
+    nodesep=0.45;
+    ranksep=0.65;
+    node [shape=box, style="rounded,filled", fontname="Malgun Gothic", fontsize=12, margin="0.18,0.12", penwidth=0];
+    edge [color="#AAAAAA", arrowhead=none, penwidth=1.6];
 
     CEO [label="장현우\\n대표", fillcolor="#1F3864", fontcolor="white"];
     SOL [label="박솔\\n이사", fillcolor="#2E5597", fontcolor="white"];
@@ -724,7 +727,7 @@ digraph OrgChart {
     GU -> GU1; GU -> GU2;
 
     GWAK1 [label="Meyna\\n인플루언서 협업", fillcolor="#D9E1F2"];
-    GWAK2 [label="Staff\\n(확인필요)", fillcolor="#EDEDED"];
+    GWAK2 [label="Sanubari\\n미국 담당", fillcolor="#D9E1F2"];
     GWAK3 [label="Staff\\n(확인필요)", fillcolor="#EDEDED"];
     GWAK4 [label="Staff\\n(확인필요)", fillcolor="#EDEDED"];
     GWAK -> GWAK1; GWAK -> GWAK2; GWAK -> GWAK3; GWAK -> GWAK4;
@@ -732,7 +735,7 @@ digraph OrgChart {
     KIM1 [label="충원 예정\\n(1명)", fillcolor="white", style="rounded,dashed"];
     KIM -> KIM1;
 
-    LEE1 [label="Sanubari\\n중국 섭외 담당", fillcolor="#D9E1F2"];
+    LEE1 [label="Staff\\n(확인필요)", fillcolor="#EDEDED"];
     LEE2 [label="Staff\\n(확인필요)", fillcolor="#EDEDED"];
     LEE3 [label="Staff\\n(확인필요)", fillcolor="#EDEDED"];
     LEE4 [label="Staff\\n(확인필요)", fillcolor="#EDEDED"];
