@@ -182,6 +182,78 @@ my_name = st.selectbox("내 이름", STAFF_NAMES, key="my_name")
 st.divider()
 
 # ══════════════════════════════════════════════════════════
+# 🎯 팀 OKR 현황 (읽기 전용 — 기존 OKR 자료 그대로, 편집 기능 없음)
+# ══════════════════════════════════════════════════════════
+st.subheader("🎯 팀 OKR 현황")
+
+
+@st.cache_data(ttl=60)
+def load_okr():
+    org = SUPA.table("okr_org").select("*").order("person").execute().data
+    items = SUPA.table("okr_items").select("*").order("person").execute().data
+    return org, items
+
+
+with st.expander("열기 (평소엔 접어둠)", expanded=False):
+    st.caption("전사 목표(OKR)를 참고용으로 보여드려요. 여기서는 수정이 안 되고 확인만 하는 용도예요 — 편집은 기존 OKR 페이지에서 계속 하시면 됩니다.")
+    okr_org_data, okr_items_data = load_okr()
+
+    if not okr_org_data:
+        st.caption("등록된 OKR이 없습니다.")
+    else:
+        okr_view = st.radio("보기", ["🏢 회사 전체 OKR", "👤 개별 보기"], horizontal=True, key="okr_view_mode")
+
+        if okr_view == "🏢 회사 전체 OKR":
+            for o in okr_org_data:
+                pending_tag = " · 🔲채용예정" if o.get("pending") else ""
+                st.markdown(f"**{o['person']}**{pending_tag} — {o.get('objective') or '-'}")
+        else:
+            target_p = st.selectbox("사람 선택", [o["person"] for o in okr_org_data], key="okr_indiv_person")
+            o = next(x for x in okr_org_data if x["person"] == target_p)
+            with st.container(border=True):
+                pending_tag = " · 🔲 채용예정" if o.get("pending") else ""
+                st.markdown(f"#### 👤 {o['person']}{pending_tag}")
+                if o.get("tag"):
+                    st.caption(o["tag"])
+                st.markdown(f"**🎯 Objective:** {o.get('objective') or '-'}")
+
+                krs = o.get("krs") or []
+                if krs:
+                    st.markdown("**Key Results**")
+                    for kr in krs:
+                        st.markdown(f"- {kr}")
+
+                person_items = [it for it in okr_items_data if it["person"] == o["person"]]
+
+                def _render_item_card(it):
+                    try:
+                        target = float(it.get("target_qty") or 0)
+                        progress = float(it.get("progress") or 0)
+                    except (TypeError, ValueError):
+                        target, progress = 0, 0
+                    pct = min(progress / target, 1.0) if target > 0 else (1.0 if progress > 0 else 0.0)
+                    conf = "✅" if it.get("confirmed") else "🔲"
+                    unit = it.get("unit") or ""
+                    progress_txt = f" — {progress:g}/{target:g}{unit}" if target > 0 else ""
+                    with st.container(border=True):
+                        st.markdown(f"{conf} **[{it.get('category') or '미분류'}]** {it['title']}{progress_txt}")
+                        if target > 0:
+                            st.progress(pct)
+
+                okr_items_this = [it for it in person_items if not it.get("is_recurring")]
+                kpi_items_this = [it for it in person_items if it.get("is_recurring")]
+
+                if okr_items_this:
+                    st.markdown(f"**🎯 이번 사이클 OKR 세부항목 ({len(okr_items_this)}개)** — 시한부 도전과제, 완료되면 끝")
+                    for it in okr_items_this:
+                        _render_item_card(it)
+                if kpi_items_this:
+                    st.markdown(f"**📊 상시 추적 KPI ({len(kpi_items_this)}개)** — 계속 반복해서 관리하는 건강지표")
+                    for it in kpi_items_this:
+                        _render_item_card(it)
+
+
+# ══════════════════════════════════════════════════════════
 # 🖊️ 오늘 빠른 기록
 # ══════════════════════════════════════════════════════════
 st.subheader("🖊️ 오늘 빠른 기록")
@@ -195,6 +267,49 @@ with st.form("quick_log_form", clear_on_submit=True):
     quick_link = qc1.text_input("참고 링크(구글시트/문서 등, 선택)", placeholder="https://...")
     quick_file = qc2.file_uploader("파일 첨부(PDF 등, 선택)", type=["pdf", "docx", "png", "jpg", "jpeg", "xlsx"])
     quick_submitted = st.form_submit_button("📝 기록", type="primary", use_container_width=True)
+def suggest_okr_match(note, person_items):
+    """개떡같이 써도 찰떡같이 알아듣기: 자유 기록을 이 사람의 OKR/KPI 항목과 매칭해서
+    진행치 업데이트를 제안한다. 확신 없으면 매칭 안 함."""
+    api_key = os.environ.get("ANTHROPIC_API_KEY")
+    if not api_key or not person_items:
+        return None, None
+    items_desc = "\n".join(
+        f"- id:{it['id']} [{it.get('category') or ''}] {it['title']} "
+        f"(현재 {it.get('progress') or 0}/{it.get('target_qty') or 0}{it.get('unit') or ''}, "
+        f"{'KPI(반복)' if it.get('is_recurring') else 'OKR(이번사이클)'})"
+        for it in person_items
+    )
+    system = (
+        "너는 직원이 자유롭게 쓴 하루 업무 기록을 보고, 그 사람의 OKR/KPI 항목 중 관련된 것을 찾아 "
+        "진행치 업데이트를 제안하는 보조원이다. 말투가 거칠거나 축약돼 있어도('개떡같이' 써도) 의미를 이해해서 매칭해라. "
+        "기록에 구체적 숫자가 있으면 그 항목의 새 누적 진행치를 계산해 제안하고, 숫자가 없으면 progress는 null로 둬라. "
+        "확신이 없으면 그 항목은 아예 배열에 넣지 마라. 최대 2개까지만 제안해라.\n\n"
+        f"이 사람의 OKR/KPI 목록:\n{items_desc}\n\n"
+        "출력은 오직 JSON 배열만: [{\"item_id\":\"...\", \"new_progress\": 숫자 또는 null, \"reason\":\"짧은 이유(20자 이내)\"}]. "
+        "다른 텍스트는 절대 포함하지 마라."
+    )
+    try:
+        res = requests.post(
+            "https://api.anthropic.com/v1/messages",
+            headers={"x-api-key": api_key, "anthropic-version": "2023-06-01", "content-type": "application/json"},
+            json={"model": "claude-sonnet-5", "max_tokens": 1000, "system": system,
+                  "messages": [{"role": "user", "content": f"오늘 기록: {note}"}]},
+            timeout=30,
+        )
+        if res.status_code >= 300:
+            return None, f"{res.status_code}"
+        data = res.json()
+        text = "".join(b.get("text", "") for b in data.get("content", []) if b.get("type") == "text").strip()
+        if text.startswith("```"):
+            text = text.strip("`")
+            if text.startswith("json"):
+                text = text[4:]
+        import json as _json
+        return _json.loads(text), None
+    except Exception as e:
+        return None, str(e)
+
+
 if quick_submitted:
     if quick_note.strip():
         attachment_url = None
@@ -213,10 +328,43 @@ if quick_submitted:
             "staff_name": my_name, "note": quick_note.strip(),
             "link_url": quick_link.strip() or None, "attachment_url": attachment_url,
         }).execute()
+
+        my_okr_items = [it for it in okr_items_data if it["person"] == my_name]
+        suggestions, err = suggest_okr_match(quick_note.strip(), my_okr_items)
+        if suggestions:
+            st.session_state["pending_okr_suggestions"] = suggestions
+
         st.success("기록 완료!")
         refresh()
     else:
         st.error("한 줄이라도 적어주세요.")
+
+# ── AI가 제안한 OKR/KPI 매칭 (개떡같이 써도 찰떡같이 알아듣기) ──
+pending = st.session_state.get("pending_okr_suggestions") or []
+if pending:
+    st.markdown("🤖 **방금 기록을 보고 이 항목들이 떠올랐어요 — 진행치를 반영할까요?**")
+    item_by_id = {it["id"]: it for it in okr_items_data}
+    for sug in list(pending):
+        it = item_by_id.get(sug.get("item_id"))
+        if not it:
+            st.session_state["pending_okr_suggestions"] = [s for s in st.session_state["pending_okr_suggestions"] if s is not sug]
+            continue
+        with st.container(border=True):
+            st.markdown(f"**[{it.get('category') or ''}] {it['title']}** — {sug.get('reason') or ''}")
+            new_val = sug.get("new_progress")
+            pc1, pc2 = st.columns(2)
+            if new_val is not None and pc1.button(f"✅ 진행치 {new_val:g}로 반영", key=f"apply_sug_{it['id']}"):
+                SUPA.table("okr_items").update({
+                    "progress": new_val, "last_checkin_at": date.today().isoformat(),
+                }).eq("id", it["id"]).execute()
+                st.session_state["pending_okr_suggestions"] = [s for s in st.session_state["pending_okr_suggestions"] if s is not sug]
+                st.toast("반영 완료!")
+                st.rerun()
+            elif new_val is None:
+                pc1.caption("숫자 언급이 없어서 자동 반영은 안 했어요.")
+            if pc2.button("무시", key=f"dismiss_sug_{it['id']}"):
+                st.session_state["pending_okr_suggestions"] = [s for s in st.session_state["pending_okr_suggestions"] if s is not sug]
+                st.rerun()
 
 recent_logs = load_activity_log()
 if recent_logs:
@@ -230,6 +378,8 @@ if recent_logs:
                 extra.append(f"[첨부파일]({lg['attachment_url']})")
             extra_txt = " · " + " · ".join(extra) if extra else ""
             st.caption(f"{when} · **{lg['staff_name']}** · {lg['note']}{extra_txt}")
+            if lg.get("manager_feedback"):
+                st.success(f"💬 대표 피드백: {lg['manager_reaction'] or ''} {lg['manager_feedback']}")
 
 st.divider()
 
@@ -237,6 +387,7 @@ st.divider()
 # 📥 구글시트로 일괄 등록
 # ══════════════════════════════════════════════════════════
 st.subheader("📥 구글시트로 일괄 등록")
+st.caption("💡 인플루언서 풀/캐스팅 작업을 직접 다루시는 분(곽재선·이단우 등)은 이걸로 한 번에 올리시고, 그 외 업무는 위 '오늘 빠른 기록'에 자유롭게 쓰시면 AI가 알아서 해석해요.")
 st.caption(
     "여러 건을 한 번에 올리고 싶으면, 구글시트 링크를 붙여넣으세요. "
     "시트는 '링크가 있는 모든 사용자 - 뷰어'로 공유 설정만 해두면 됩니다. "
@@ -631,65 +782,6 @@ m4.metric("전체 진행중", f"{sum(v for k, v in status_counts.items() if k no
 
 st.markdown("**상태별 현황**")
 st.bar_chart(pd.Series(status_counts))
-
-st.divider()
-
-# ══════════════════════════════════════════════════════════
-# 🎯 팀 OKR 현황 (읽기 전용 — 기존 OKR 자료 그대로, 편집 기능 없음)
-# ══════════════════════════════════════════════════════════
-st.subheader("🎯 팀 OKR 현황")
-
-
-@st.cache_data(ttl=60)
-def load_okr():
-    org = SUPA.table("okr_org").select("*").order("person").execute().data
-    items = SUPA.table("okr_items").select("*").order("person").execute().data
-    return org, items
-
-
-with st.expander("열기 (평소엔 접어둠)", expanded=False):
-    st.caption("전사 목표(OKR)를 참고용으로 보여드려요. 여기서는 수정이 안 되고 확인만 하는 용도예요 — 편집은 기존 OKR 페이지에서 계속 하시면 됩니다.")
-    okr_org_data, okr_items_data = load_okr()
-
-    if not okr_org_data:
-        st.caption("등록된 OKR이 없습니다.")
-    else:
-        okr_view = st.radio("보기", ["🏢 회사 전체 OKR", "👤 개별 보기"], horizontal=True, key="okr_view_mode")
-
-        if okr_view == "🏢 회사 전체 OKR":
-            for o in okr_org_data:
-                pending_tag = " · 🔲채용예정" if o.get("pending") else ""
-                st.markdown(f"**{o['person']}**{pending_tag} — {o.get('objective') or '-'}")
-        else:
-            target_p = st.selectbox("사람 선택", [o["person"] for o in okr_org_data], key="okr_indiv_person")
-            o = next(x for x in okr_org_data if x["person"] == target_p)
-            with st.container(border=True):
-                pending_tag = " · 🔲 채용예정" if o.get("pending") else ""
-                st.markdown(f"#### 👤 {o['person']}{pending_tag}")
-                if o.get("tag"):
-                    st.caption(o["tag"])
-                st.markdown(f"**🎯 Objective:** {o.get('objective') or '-'}")
-
-                krs = o.get("krs") or []
-                if krs:
-                    st.markdown("**Key Results**")
-                    for kr in krs:
-                        st.markdown(f"- {kr}")
-
-                person_items = [it for it in okr_items_data if it["person"] == o["person"]]
-                if person_items:
-                    st.markdown(f"**📌 세부 진행 항목 ({len(person_items)}개)**")
-                    for it in person_items:
-                        try:
-                            target = float(it.get("target_qty") or 0)
-                            progress = float(it.get("progress") or 0)
-                        except (TypeError, ValueError):
-                            target, progress = 0, 0
-                        pct = min(progress / target, 1.0) if target > 0 else (1.0 if progress > 0 else 0.0)
-                        conf = "✅" if it.get("confirmed") else "🔲"
-                        unit = it.get("unit") or ""
-                        st.caption(f"{conf} [{it.get('category') or '미분류'}] {it['title']} — {progress:g}/{target:g}{unit}")
-                        st.progress(pct)
 
 st.divider()
 
