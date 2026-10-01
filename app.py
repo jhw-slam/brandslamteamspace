@@ -927,6 +927,8 @@ if my_role == "sales":
                     meta.append(f"다음 갱신: {a['renewal_date']}")
                 if meta:
                     st.caption(" · ".join(meta))
+                if a.get("contract_drive_url"):
+                    st.caption(f"📎 [계약서/관련파일]({a['contract_drive_url']})")
                 if a.get("notes"):
                     st.caption(f"메모: {a['notes']}")
                 with st.expander("✏️ 수정"):
