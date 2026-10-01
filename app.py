@@ -690,3 +690,59 @@ with st.expander("열기 (평소엔 접어둠)", expanded=False):
                         unit = it.get("unit") or ""
                         st.caption(f"{conf} [{it.get('category') or '미분류'}] {it['title']} — {progress:g}/{target:g}{unit}")
                         st.progress(pct)
+
+st.divider()
+
+# ══════════════════════════════════════════════════════════
+# 🏢 조직도 (회의록 기준 역할/직급 반영 — 최소 20명 규모를 보여주기 위함)
+# ══════════════════════════════════════════════════════════
+st.subheader("🏢 조직도")
+st.caption("사무실 직접 근무 4명 + 각자 산하 staff/어시스턴트를 포함한 전체 조직 구조입니다. (이름 미확인 staff는 '확인필요'로 표시 — 실제 이름 알려주시면 바로 바꿔드릴게요)")
+
+org_chart_dot = """
+digraph OrgChart {
+    rankdir=TB;
+    bgcolor="transparent";
+    node [shape=box, style="rounded,filled", fontname="Malgun Gothic", fontsize=12, margin="0.15,0.1"];
+    edge [color="#888888"];
+
+    CEO [label="장현우\\n대표", fillcolor="#1F3864", fontcolor="white"];
+    SOL [label="박솔\\n이사", fillcolor="#2E5597", fontcolor="white"];
+    GU [label="구정회\\n개발팀장", fillcolor="#2E7D4F", fontcolor="white"];
+    GWAK [label="곽재선\\nAM·인플루언서팀장", fillcolor="#2E7D4F", fontcolor="white"];
+    KIM [label="김선재\\n영업·BD팀장", fillcolor="#2E7D4F", fontcolor="white"];
+    LEE [label="이단우\\n중국팀장", fillcolor="#2E7D4F", fontcolor="white"];
+
+    CEO -> SOL;
+    CEO -> GU;
+    CEO -> GWAK;
+    CEO -> KIM;
+    CEO -> LEE;
+
+    GU1 [label="개발 어시스턴트\\n(충원예정)", fillcolor="#D9E1F2", style="rounded,dashed"];
+    GU2 [label="개발 어시스턴트\\n(충원예정)", fillcolor="#D9E1F2", style="rounded,dashed"];
+    GU -> GU1; GU -> GU2;
+
+    GWAK1 [label="Meyna\\n인플루언서 협업", fillcolor="#D9E1F2"];
+    GWAK2 [label="Staff\\n(확인필요)", fillcolor="#EDEDED"];
+    GWAK3 [label="Staff\\n(확인필요)", fillcolor="#EDEDED"];
+    GWAK4 [label="Staff\\n(확인필요)", fillcolor="#EDEDED"];
+    GWAK -> GWAK1; GWAK -> GWAK2; GWAK -> GWAK3; GWAK -> GWAK4;
+
+    KIM1 [label="충원 예정\\n(1명)", fillcolor="white", style="rounded,dashed"];
+    KIM -> KIM1;
+
+    LEE1 [label="Sanubari\\n중국 섭외 담당", fillcolor="#D9E1F2"];
+    LEE2 [label="Staff\\n(확인필요)", fillcolor="#EDEDED"];
+    LEE3 [label="Staff\\n(확인필요)", fillcolor="#EDEDED"];
+    LEE4 [label="Staff\\n(확인필요)", fillcolor="#EDEDED"];
+    LEE5 [label="Staff\\n(확인필요)", fillcolor="#EDEDED"];
+    LEE6 [label="Staff\\n(확인필요)", fillcolor="#EDEDED"];
+    LEE -> LEE1; LEE -> LEE2; LEE -> LEE3; LEE -> LEE4; LEE -> LEE5; LEE -> LEE6;
+}
+"""
+st.graphviz_chart(org_chart_dot, use_container_width=True)
+
+headcounts = {"장현우": 1, "박솔": 1, "구정회팀": 1 + 2, "곽재선팀": 1 + 4, "김선재팀": 1 + 1, "이단우팀": 1 + 6}
+total_headcount = sum(headcounts.values())
+st.caption(f"현재 기준 총 **{total_headcount}명** 규모 (충원 예정 1명 포함)")
