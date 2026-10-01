@@ -179,6 +179,23 @@ def refresh():
 
 my_name = st.selectbox("내 이름", STAFF_NAMES, key="my_name")
 
+# ── 📋 채워주세요! (30분마다 도는 완성도 체크가 찾아낸 빈 정보) ──
+open_prompts = (
+    SUPA.table("data_completeness_prompts")
+    .select("*").eq("person", my_name).eq("status", "open")
+    .order("created_at", desc=True).execute().data
+)
+if open_prompts:
+    st.warning(f"📋 **현황판을 완성하려면 아래 {len(open_prompts)}건이 필요해요** (자동으로 채워지지 않아서 직접 확인 부탁드려요)")
+    for p in open_prompts:
+        pc1, pc2 = st.columns([5, 1])
+        pc1.caption(f"• {p['message']}")
+        if pc2.button("✅ 처리함", key=f"resolve_prompt_{p['id']}"):
+            SUPA.table("data_completeness_prompts").update({
+                "status": "dismissed",
+            }).eq("id", p["id"]).execute()
+            st.rerun()
+
 st.divider()
 
 # ══════════════════════════════════════════════════════════
