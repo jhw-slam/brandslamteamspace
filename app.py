@@ -182,6 +182,24 @@ my_name = st.selectbox("내 이름", STAFF_NAMES, key="my_name")
 st.divider()
 
 # ══════════════════════════════════════════════════════════
+# 🧭 회사 비전 (항상 보임 — 모두가 바라보는 방향)
+# ══════════════════════════════════════════════════════════
+vision_data = SUPA.table("company_vision").select("*").order("updated_at", desc=True).limit(1).execute().data
+if vision_data:
+    v = vision_data[0]
+    st.markdown(
+        f"""<div style="background: linear-gradient(135deg, #10234f, #2e5597); padding: 20px 28px; border-radius: 16px 16px 0 0;">
+<div style="color: #FFD700; font-size: 13px; font-weight: 800; letter-spacing: 3px;">VISION</div>
+<div style="color: white; font-size: 28px; font-weight: 800; margin-top: 4px;">{v['title']}</div>
+</div>""",
+        unsafe_allow_html=True,
+    )
+    with st.container(border=True):
+        st.markdown(v["content"])
+
+st.divider()
+
+# ══════════════════════════════════════════════════════════
 # 🎯 팀 OKR 현황 (읽기 전용 — 기존 OKR 자료 그대로, 편집 기능 없음)
 # ══════════════════════════════════════════════════════════
 st.subheader("🎯 팀 OKR 현황")
@@ -377,9 +395,30 @@ if recent_logs:
             if lg.get("attachment_url"):
                 extra.append(f"[첨부파일]({lg['attachment_url']})")
             extra_txt = " · " + " · ".join(extra) if extra else ""
-            st.caption(f"{when} · **{lg['staff_name']}** · {lg['note']}{extra_txt}")
+            is_mine = lg["staff_name"] == my_name
+            lc1, lc2 = st.columns([5, 1])
+            lc1.caption(f"{when} · **{lg['staff_name']}** · {lg['note']}{extra_txt}")
             if lg.get("manager_feedback"):
                 st.success(f"💬 대표 피드백: {lg['manager_reaction'] or ''} {lg['manager_feedback']}")
+            if is_mine:
+                if lc2.button("✏️ 수정", key=f"editlog_{lg['id']}"):
+                    st.session_state[f"editing_log_{lg['id']}"] = True
+                if st.session_state.get(f"editing_log_{lg['id']}"):
+                    with st.form(f"edit_log_form_{lg['id']}"):
+                        new_note = st.text_area("내용 수정", value=lg["note"], key=f"editnote_{lg['id']}")
+                        new_link = st.text_input("참고 링크", value=lg.get("link_url") or "", key=f"editlink_{lg['id']}")
+                        ec1, ec2 = st.columns(2)
+                        save_edit = ec1.form_submit_button("💾 저장", type="primary", use_container_width=True)
+                        cancel_edit = ec2.form_submit_button("취소", use_container_width=True)
+                    if save_edit:
+                        SUPA.table("daily_activity_log").update({
+                            "note": new_note.strip(), "link_url": new_link.strip() or None,
+                        }).eq("id", lg["id"]).execute()
+                        st.session_state[f"editing_log_{lg['id']}"] = False
+                        refresh()
+                    if cancel_edit:
+                        st.session_state[f"editing_log_{lg['id']}"] = False
+                        st.rerun()
 
 st.divider()
 
@@ -739,6 +778,250 @@ if recent_fc:
             status_label = {"open": "🟡 대기중", "resolved": "✅ 처리완료", "dismissed": "🗑️ 취소됨"}.get(f["status"], f["status"])
             direction_kr = "지출" if f["direction"] == "out" else "수입"
             st.caption(f"{f['expected_date']} · {direction_kr} · ₩{float(f['amount']):,.0f} · {status_label} · {f.get('submitted_by') or ''} · {f.get('reason') or ''}")
+
+st.divider()
+
+# ══════════════════════════════════════════════════════════
+# 📇 B2B 브랜드 관리 (세일즈) — 캘린더·계정·이슈·캠페인 주차루틴
+# ══════════════════════════════════════════════════════════
+st.subheader("📇 B2B 브랜드 관리 (세일즈)")
+st.caption("업체별 일정·이슈·캠페인을 관리하는 세일즈 전용 공간입니다. 브랜드 B2B 관리가 핵심 업무인 분(김선재 등)이 주로 쓰시면 되고, 다른 분들은 안 쓰셔도 됩니다.")
+
+WEEK_TEMPLATE = [
+    (1, "실행 및 가이드", "인플루언서 리스트 제안·전달, 매장 방문 진행, 콘텐츠 가이드라인 배포, 선물 제공 소통 후 가이드 전달"),
+    (2, "중간 리포팅", "1주차 방문·업로드 활동 1차 보고, 차주 운영·실행 계획 공유"),
+    (3, "성과 입증 및 세일즈", "업로드 활동 최종 보고, 초과 성과 어필, 재계약 당위성 전달, 익월 견적서 발송"),
+    (4, "마감 및 차월 준비", "월별 마감 PT, 다음달 계약 확정·입금 진행, 에이전시 대상 스탠바이 요청"),
+]
+
+
+@st.cache_data(ttl=20)
+def load_sales_accounts():
+    return SUPA.table("sales_accounts").select("*").order("brand_name").execute().data
+
+
+@st.cache_data(ttl=20)
+def load_sales_issues():
+    return SUPA.table("sales_issues").select("*").order("created_at", desc=True).execute().data
+
+
+@st.cache_data(ttl=20)
+def load_sales_campaigns():
+    return SUPA.table("sales_campaigns").select("*").order("open_date", desc=True).execute().data
+
+
+@st.cache_data(ttl=20)
+def load_sales_campaign_tasks():
+    return SUPA.table("sales_campaign_tasks").select("*").order("due_date").execute().data
+
+
+def refresh_sales():
+    load_sales_accounts.clear(); load_sales_issues.clear()
+    load_sales_campaigns.clear(); load_sales_campaign_tasks.clear()
+    st.rerun()
+
+
+sales_show_all = st.checkbox("전체 담당자 보기 (기본: 내 담당만)", value=False, key="sales_show_all")
+all_sales_accounts = load_sales_accounts()
+my_accounts = all_sales_accounts if sales_show_all else [a for a in all_sales_accounts if a["assigned_to"] == my_name]
+account_by_id = {a["id"]: a for a in all_sales_accounts}
+STATUS_OPTS_ACC = ["협상중", "계약완료", "운영중", "종료", "이탈"]
+
+tab_cal, tab_acc, tab_issue, tab_camp = st.tabs(["📅 일정 한눈에보기", "🏢 계정 관리", "🐛 이슈", "🚀 캠페인·주차루틴"])
+
+# ── 📅 일정 한눈에보기 ──────────────────────────────────
+with tab_cal:
+    st.markdown("**다가오는 일정**")
+    all_tasks = load_sales_campaign_tasks()
+    all_campaigns_map = {c["id"]: c for c in load_sales_campaigns()}
+    my_account_ids = {a["id"] for a in my_accounts}
+
+    cal_rows = []
+    for a in my_accounts:
+        if a.get("renewal_date"):
+            cal_rows.append({"날짜": a["renewal_date"], "종류": "🔁 갱신/온보딩", "내용": f"{a['brand_name']} 갱신일", "브랜드": a["brand_name"]})
+    for t in all_tasks:
+        camp = all_campaigns_map.get(t["campaign_id"])
+        if not camp or camp["account_id"] not in my_account_ids or t["status"] == "완료" or not t.get("due_date"):
+            continue
+        acc = account_by_id.get(camp["account_id"], {})
+        cal_rows.append({"날짜": t["due_date"], "종류": f"📌 {t['week_number']}주차: {t['task_title']}", "내용": camp["campaign_name"], "브랜드": acc.get("brand_name", "?")})
+
+    if not cal_rows:
+        st.caption("예정된 일정이 없습니다.")
+    else:
+        cal_df = pd.DataFrame(sorted(cal_rows, key=lambda r: r["날짜"]))
+        st.dataframe(cal_df[["날짜", "브랜드", "종류", "내용"]], hide_index=True, use_container_width=True)
+
+# ── 🏢 계정 관리 ────────────────────────────────────────
+with tab_acc:
+    st.markdown("**담당 브랜드 계정**")
+    with st.expander("➕ 새 브랜드 계정 등록"):
+        with st.form("new_account_form", clear_on_submit=True):
+            nac1, nac2 = st.columns(2)
+            new_brand = nac1.text_input("브랜드명 *")
+            new_status = nac2.selectbox("상태", STATUS_OPTS_ACC, index=2)
+            nac3, nac4 = st.columns(2)
+            new_contact_name = nac3.text_input("담당자 이름")
+            new_contact_email = nac4.text_input("담당자 이메일")
+            nac5, nac6, nac7 = st.columns(3)
+            new_budget = nac5.number_input("월 예산", min_value=0, step=100000, format="%d")
+            new_contract_start = nac6.date_input("계약 시작일", value=None)
+            new_renewal = nac7.date_input("다음 갱신/온보딩일", value=None)
+            new_notes = st.text_area("메모")
+            acc_submitted = st.form_submit_button("등록", type="primary")
+        if acc_submitted:
+            if not new_brand.strip():
+                st.error("브랜드명을 입력해주세요.")
+            else:
+                SUPA.table("sales_accounts").insert({
+                    "brand_name": new_brand.strip(), "assigned_to": my_name, "status": new_status,
+                    "contact_name": new_contact_name.strip() or None, "contact_email": new_contact_email.strip() or None,
+                    "monthly_budget": new_budget or None,
+                    "contract_start": new_contract_start.isoformat() if new_contract_start else None,
+                    "renewal_date": new_renewal.isoformat() if new_renewal else None,
+                    "notes": new_notes.strip() or None,
+                }).execute()
+                st.success("등록 완료!")
+                refresh_sales()
+
+    if not my_accounts:
+        st.caption("등록된 계정이 없습니다.")
+    for a in my_accounts:
+        with st.container(border=True):
+            sat = "⭐" * (a.get("satisfaction_score") or 0)
+            st.markdown(f"**🏢 {a['brand_name']}** · {a['status']} · 담당 {a['assigned_to']} {sat}")
+            meta = []
+            if a.get("contact_name"):
+                meta.append(f"담당자: {a['contact_name']}")
+            if a.get("monthly_budget"):
+                meta.append(f"월예산: ₩{float(a['monthly_budget']):,.0f}")
+            if a.get("renewal_date"):
+                meta.append(f"다음 갱신: {a['renewal_date']}")
+            if meta:
+                st.caption(" · ".join(meta))
+            if a.get("notes"):
+                st.caption(f"메모: {a['notes']}")
+            with st.expander("✏️ 수정"):
+                ec1, ec2 = st.columns(2)
+                e_status = ec1.selectbox("상태", STATUS_OPTS_ACC, index=STATUS_OPTS_ACC.index(a["status"]), key=f"accstatus_{a['id']}")
+                e_sat = ec2.slider("만족도(1~5)", 1, 5, value=a.get("satisfaction_score") or 3, key=f"accsat_{a['id']}")
+                e_renewal = st.date_input(
+                    "다음 갱신/온보딩일",
+                    value=pd.to_datetime(a["renewal_date"]).date() if a.get("renewal_date") else None,
+                    key=f"accrenew_{a['id']}",
+                )
+                e_notes = st.text_area("메모", value=a.get("notes") or "", key=f"accnotes_{a['id']}")
+                if st.button("저장", key=f"accsave_{a['id']}"):
+                    SUPA.table("sales_accounts").update({
+                        "status": e_status, "satisfaction_score": e_sat,
+                        "renewal_date": e_renewal.isoformat() if e_renewal else None,
+                        "notes": e_notes.strip() or None,
+                        "updated_at": pd.Timestamp.now(tz="UTC").isoformat(),
+                    }).eq("id", a["id"]).execute()
+                    st.success("저장 완료"); refresh_sales()
+
+# ── 🐛 이슈 ────────────────────────────────────────────
+with tab_issue:
+    st.markdown("**이슈 등록/관리**")
+    if not my_accounts:
+        st.caption("먼저 브랜드 계정을 등록해주세요.")
+    else:
+        with st.expander("➕ 새 이슈 등록"):
+            with st.form("new_issue_form", clear_on_submit=True):
+                acc_names = {a["brand_name"]: a["id"] for a in my_accounts}
+                sel_brand = st.selectbox("브랜드", list(acc_names.keys()), key="issue_brand_pick")
+                ic1, ic2 = st.columns(2)
+                issue_title = ic1.text_input("이슈 제목 *")
+                issue_priority = ic2.selectbox("우선순위", ["긴급", "높음", "보통", "낮음"], index=2)
+                issue_desc = st.text_area("상세 내용")
+                issue_submitted = st.form_submit_button("등록", type="primary")
+            if issue_submitted:
+                if not issue_title.strip():
+                    st.error("제목을 입력해주세요.")
+                else:
+                    SUPA.table("sales_issues").insert({
+                        "account_id": acc_names[sel_brand], "title": issue_title.strip(),
+                        "description": issue_desc.strip() or None, "priority": issue_priority,
+                        "created_by": my_name,
+                    }).execute()
+                    st.success("등록 완료!"); refresh_sales()
+
+        my_account_ids_issue = {a["id"] for a in my_accounts}
+        sales_issues_all = [i for i in load_sales_issues() if i["account_id"] in my_account_ids_issue]
+        show_resolved_issues = st.checkbox("해결된 이슈도 보기", value=False, key="show_resolved_issues")
+        if not show_resolved_issues:
+            sales_issues_all = [i for i in sales_issues_all if i["status"] != "해결됨"]
+        PRIORITY_EMOJI = {"긴급": "🔴", "높음": "🟠", "보통": "🟡", "낮음": "🟢"}
+        if not sales_issues_all:
+            st.caption("등록된 이슈가 없습니다.")
+        for i in sales_issues_all:
+            acc = account_by_id.get(i["account_id"], {})
+            with st.container(border=True):
+                st.markdown(f"{PRIORITY_EMOJI.get(i['priority'], '⚪')} **[{acc.get('brand_name', '?')}] {i['title']}** · {i['status']}")
+                if i.get("description"):
+                    st.caption(i["description"])
+                new_issue_status = st.selectbox(
+                    "상태", ["열림", "진행중", "해결됨"], index=["열림", "진행중", "해결됨"].index(i["status"]),
+                    key=f"issuestatus_{i['id']}", label_visibility="collapsed",
+                )
+                if st.button("저장", key=f"issuesave_{i['id']}"):
+                    update_payload = {"status": new_issue_status}
+                    if new_issue_status == "해결됨":
+                        update_payload["resolved_at"] = pd.Timestamp.now(tz="UTC").isoformat()
+                    SUPA.table("sales_issues").update(update_payload).eq("id", i["id"]).execute()
+                    st.success("저장 완료"); refresh_sales()
+
+# ── 🚀 캠페인·주차루틴 ──────────────────────────────────
+with tab_camp:
+    st.markdown("**캠페인 등록 → 4주 루틴 자동 생성**")
+    if not my_accounts:
+        st.caption("먼저 브랜드 계정을 등록해주세요.")
+    else:
+        with st.expander("🚀 새 캠페인 등록", expanded=True):
+            with st.form("new_campaign_form", clear_on_submit=True):
+                acc_names2 = {a["brand_name"]: a["id"] for a in my_accounts}
+                camp_brand = st.selectbox("브랜드", list(acc_names2.keys()), key="camp_brand_pick")
+                camp_name = st.text_input("캠페인명 *", placeholder="예: 9월 명동 오픈 캠페인")
+                camp_open_date = st.date_input("캠페인 오픈일", value=date.today(), key="camp_open_date")
+                camp_submitted = st.form_submit_button("등록 (4주 루틴 자동 생성)", type="primary")
+            if camp_submitted:
+                if not camp_name.strip():
+                    st.error("캠페인명을 입력해주세요.")
+                else:
+                    camp_res = SUPA.table("sales_campaigns").insert({
+                        "account_id": acc_names2[camp_brand], "campaign_name": camp_name.strip(),
+                        "open_date": camp_open_date.isoformat(), "created_by": my_name,
+                    }).execute()
+                    new_camp_id = camp_res.data[0]["id"]
+                    week_tasks = [{
+                        "campaign_id": new_camp_id, "week_number": wn, "task_title": wt,
+                        "task_description": wd, "due_date": (camp_open_date + timedelta(days=(wn - 1) * 7)).isoformat(),
+                    } for wn, wt, wd in WEEK_TEMPLATE]
+                    SUPA.table("sales_campaign_tasks").insert(week_tasks).execute()
+                    st.success(f"캠페인 등록 완료! 1~4주차 루틴 {len(week_tasks)}개가 자동으로 만들어졌어요.")
+                    refresh_sales()
+
+        my_account_ids_camp = {a["id"] for a in my_accounts}
+        my_campaigns = [c for c in load_sales_campaigns() if c["account_id"] in my_account_ids_camp]
+        if not my_campaigns:
+            st.caption("등록된 캠페인이 없습니다.")
+        for c in my_campaigns:
+            acc = account_by_id.get(c["account_id"], {})
+            with st.expander(f"🚀 [{acc.get('brand_name', '?')}] {c['campaign_name']} · 오픈 {c['open_date']} · {c['status']}"):
+                tasks = [t for t in load_sales_campaign_tasks() if t["campaign_id"] == c["id"]]
+                for t in sorted(tasks, key=lambda x: x["week_number"]):
+                    with st.container(border=True):
+                        st.markdown(f"**{t['week_number']}주차 — {t['task_title']}** · 마감 {t.get('due_date') or '-'}")
+                        if t.get("task_description"):
+                            st.caption(t["task_description"])
+                        new_tstatus = st.selectbox(
+                            "상태", ["예정", "진행중", "완료"], index=["예정", "진행중", "완료"].index(t["status"]),
+                            key=f"wtstatus_{t['id']}", label_visibility="collapsed",
+                        )
+                        if st.button("저장", key=f"wtsave_{t['id']}"):
+                            SUPA.table("sales_campaign_tasks").update({"status": new_tstatus}).eq("id", t["id"]).execute()
+                            st.success("저장 완료"); refresh_sales()
 
 st.divider()
 
