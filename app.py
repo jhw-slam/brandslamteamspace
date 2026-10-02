@@ -2,6 +2,7 @@ import os
 import io
 import re
 import json
+import uuid
 import base64
 import hashlib
 from datetime import date, datetime, timedelta
@@ -1124,37 +1125,109 @@ with st.expander("📷 스크린샷으로 대신 올리기 (시트 링크가 번
 
 pay_preview = st.session_state.get("payment_rows_preview")
 if pay_preview:
-    invalid_rows = [r for r in pay_preview if not r.get("payment_destination_verified")]
-    valid_rows = [r for r in pay_preview if r.get("payment_destination_verified")]
+    REQUIRED_FIELDS = ["influencer_name", "amount", "payment_method_raw", "content_link", "id_doc_link", "scheduled_date", "brand_names"]
+    FIELD_LABEL = {
+        "influencer_name": "이름", "amount": "금액", "payment_method_raw": "결제수단",
+        "content_link": "콘텐츠링크", "id_doc_link": "신분증링크", "scheduled_date": "송금예정일",
+        "brand_names": "참여 브랜드",
+    }
 
-    if invalid_rows:
-        st.error(
-            f"🚫 **{len(invalid_rows)}건은 송금 수단이 불명확해서 등록에서 제외됩니다** "
-            "(해외송금에서 계좌정보 하나라도 안 맞으면 신청 자체가 안 되는 것과 같은 원리예요):"
-        )
-        for r in invalid_rows:
-            st.caption(f"- {r.get('influencer_name')} (₩{r.get('amount'):,.0f}) — 결제수단 칸이 비어있어요")
+    def _missing_fields(r):
+        return [f for f in REQUIRED_FIELDS if not r.get(f)]
+
+    st.warning(
+        "📋 **완벽한 보고만 등록할 수 있어요** — 이름·금액·결제수단·콘텐츠링크·신분증링크·송금예정일·통화·참여브랜드가 "
+        "전부 채워져야 등록됩니다. 해외송금에서 정보 하나라도 안 맞으면 신청 자체가 막히는 것과 같은 원리예요."
+    )
+    st.markdown(f"**{len(pay_preview)}건 확인 중** — 빠진 항목은 아래에서 바로 채워주세요.")
+
+    complete_rows = []
+    for idx, r in enumerate(pay_preview):
+        missing = _missing_fields(r)
+        with st.container(border=True):
+            c1, c2 = st.columns([2, 1])
+            c1.markdown(f"**{r.get('influencer_name') or '(이름없음)'}** · {r.get('amount') or '-'}")
+            c1.caption(f"💳 결제수단: {r.get('payment_method_raw') or '-'}")
+            if r.get("paypal_email"):
+                c1.caption(f"⚠️ 페이팔 결제 계정(실제 송금 대상): **{r['paypal_email']}** — 안내메일 주소와 다를 수 있어요!")
+            elif r.get("payment_method_raw"):
+                c1.warning("⏳ 페이팔이 아니라서 송금까지 **최대 1개월** 걸릴 수 있어요 — 별도 송금일정으로 처리됩니다.")
+
+            if missing:
+                st.error(f"🚫 빠진 항목: {', '.join(FIELD_LABEL[f] for f in missing)} — 채워야 등록 가능")
+
+            # 빠진 필드를 그 자리에서 바로 채울 수 있게
+            if "content_link" in missing:
+                r["content_link"] = st.text_input("콘텐츠 링크", key=f"fix_content_{idx}", placeholder="인스타/틱톡 업로드 링크") or None
+            if "id_doc_link" in missing:
+                r["id_doc_link"] = st.text_input("신분증 사본 링크", key=f"fix_iddoc_{idx}", placeholder="구글드라이브 링크 등") or None
+            if "scheduled_date" in missing:
+                fixed_date = st.date_input("송금예정일", value=None, key=f"fix_date_{idx}")
+                r["scheduled_date"] = fixed_date.isoformat() if fixed_date else None
+            if "payment_method_raw" in missing:
+                r["payment_method_raw"] = st.text_input("결제수단(은행명+계좌번호 또는 PayPal 이메일)", key=f"fix_pm_{idx}") or None
+                r["paypal_email"] = _extract_email(r["payment_method_raw"])
+            if "brand_names" in missing:
+                r["brand_names"] = st.text_input(
+                    "참여 브랜드 (콤마로 여러개 가능)", key=f"fix_brands_{idx}",
+                    placeholder="예: 브랜드A, 브랜드B",
+                ) or None
+
+            r["currency"] = c2.selectbox(
+                "통화 *", ["KRW", "USD", "EUR", "GBP", "JPY"], key=f"currency_{idx}",
+                help="추측하지 않습니다 — 실제 지급 통화를 정확히 선택해주세요.",
+            )
+            notif_email = c2.text_input(
+                "안내메일 받을 주소(선택)", value=r.get("notification_email") or "",
+                key=f"notif_email_{idx}", placeholder="비워두면 자동메일 발송 안 함",
+            )
+            r["notification_email"] = notif_email.strip() or None
+            proposal_url = c2.text_input(
+                "지출기안서 링크(선택, 추후 필수화 예정)", value=r.get("expense_proposal_url") or "",
+                key=f"proposal_{idx}",
+            )
+            r["expense_proposal_url"] = proposal_url.strip() or None
+            contract_url = c2.text_input("계약서 링크(있으면)", value=r.get("contract_link") or "", key=f"contract_{idx}")
+            r["contract_link"] = contract_url.strip() or None
+
+            cc1, cc2 = c2.columns(2)
+            r["id_doc_confirmed"] = cc1.checkbox("신분증 확인함", key=f"iddoc_confirm_{idx}")
+            r["contract_confirmed"] = cc2.checkbox("계약서 확인함(또는 해당없음)", key=f"contract_confirm_{idx}")
+
+            pay_preview[idx] = r
+            fully_checked = not _missing_fields(r) and r["id_doc_confirmed"] and r["contract_confirmed"]
+            if not fully_checked:
+                missing_checks = []
+                if not r["id_doc_confirmed"]:
+                    missing_checks.append("신분증 확인")
+                if not r["contract_confirmed"]:
+                    missing_checks.append("계약서 확인")
+                if missing_checks and not missing:
+                    st.caption(f"☝️ 체크 필요: {', '.join(missing_checks)}")
+            if fully_checked:
+                complete_rows.append(r)
+
+    st.session_state["payment_rows_preview"] = pay_preview
+    valid_rows = complete_rows
 
     if valid_rows:
-        st.markdown(f"**✅ 등록 가능한 {len(valid_rows)}건** — 안내메일 받을 주소는 선택사항이니 아는 경우만 적어주세요.")
-        for idx, r in enumerate(valid_rows):
-            with st.container(border=True):
-                c1, c2 = st.columns([2, 1])
-                c1.markdown(f"**{r.get('influencer_name')}** · ₩{r.get('amount'):,.0f}")
-                c1.caption(f"💳 결제수단: {r.get('payment_method_raw') or '-'}")
-                if r.get("paypal_email"):
-                    c1.caption(f"⚠️ 페이팔 결제 계정(실제 송금 대상): **{r['paypal_email']}** — 안내메일 주소와 다를 수 있어요!")
-                if r.get("content_link"):
-                    c1.caption(f"🔗 콘텐츠: {r['content_link']}")
-                else:
-                    c1.caption("⚠️ 콘텐츠 링크 없음")
-                if not r.get("id_doc_link"):
-                    c1.caption("⚠️ 신분증 링크 없음")
-                notif_email = c2.text_input(
-                    "안내메일 받을 주소(선택)", value=r.get("notification_email") or "",
-                    key=f"notif_email_{idx}", placeholder="비워두면 자동메일 발송 안 함",
-                )
-                valid_rows[idx]["notification_email"] = notif_email.strip() or None
+        batch_total = sum(float(r.get("amount") or 0) for r in valid_rows)
+        by_currency = {}
+        for r in valid_rows:
+            cur = r.get("currency", "KRW")
+            by_currency[cur] = by_currency.get(cur, 0) + float(r.get("amount") or 0)
+        total_line = " · ".join(f"{cur} {amt:,.0f}" for cur, amt in by_currency.items())
+        st.success(f"✅ 완벽하게 채워진 {len(valid_rows)}건 — 등록 가능합니다.")
+        st.markdown(f"### 💰 이번 신청 전체 송금규모: {total_line}")
+        confirm_total = st.number_input(
+            "위 합계가 맞는지, 금액을 다시 한번 직접 입력해서 확인해주세요 (통화 섞여있으면 대표 통화 기준 숫자만)",
+            min_value=0.0, step=1.0, key="confirm_batch_total",
+        )
+        total_matches = abs(confirm_total - batch_total) < 1 if len(by_currency) == 1 else True
+        if len(by_currency) > 1:
+            st.caption("통화가 여러 개 섞여있어서 합계 재확인은 생략하고 통화별 금액만 참고해주세요.")
+        elif not total_matches:
+            st.error(f"입력하신 금액이 합계(₩{batch_total:,.0f})와 달라요 — 다시 확인해주세요.")
 
         if st.button("🔍 이미 송금한 내역과 겹치는지 확인하기", key="check_dup_paid"):
             paid_history = SUPA.table("payment_requests").select("*").eq("status", "paid").execute().data
@@ -1182,7 +1255,10 @@ if pay_preview:
                 st.success("겹치는 기존 내역을 못 찾았어요 (완전히 새로운 건으로 보여요).")
 
         double_check = st.checkbox("위 내용을 확인했고, 이미 송금한 내역과 안 겹치는 걸 확인했습니다", key="payment_double_check")
-        if st.button(f"✅ 이 {len(valid_rows)}건 일괄 등록", type="primary", key="payment_sheet_register", disabled=not double_check):
+        register_disabled = not double_check or (len(by_currency) == 1 and not total_matches)
+        if st.button(f"✅ 이 {len(valid_rows)}건 일괄 등록", type="primary", key="payment_sheet_register", disabled=register_disabled):
+            batch_id = str(uuid.uuid4())
+            all_brands = set()
             for r in valid_rows:
                 SUPA.table("payment_requests").insert({
                     "influencer_name": r.get("influencer_name"),
@@ -1193,13 +1269,27 @@ if pay_preview:
                     "tiktok_url": r.get("tiktok_url"), "instagram_url": r.get("instagram_url"),
                     "payment_method_raw": r.get("payment_method_raw"),
                     "content_link": r.get("content_link"), "id_doc_link": r.get("id_doc_link"),
-                    "dedup_key": r.get("dedup_key"), "double_checked": True,
-                    "payment_destination_verified": True,
+                    "contract_link": r.get("contract_link"), "brand_names": r.get("brand_names"),
+                    "id_doc_confirmed": r.get("id_doc_confirmed"), "contract_confirmed": r.get("contract_confirmed"),
+                    "currency": r.get("currency", "KRW"), "expense_proposal_url": r.get("expense_proposal_url"),
+                    "dedup_key": r.get("dedup_key"), "double_checked": True, "batch_id": batch_id,
+                    "payment_destination_verified": True, "report_complete": True,
                     "submitted_by": my_name,
                 }).execute()
+                for b in (r.get("brand_names") or "").split(","):
+                    if b.strip():
+                        all_brands.add(b.strip())
+
+            # 마진율 관리를 위해 구정회에게 지출포인트 공유 (DB 저장 + 할일로 알림)
+            brands_txt = ", ".join(sorted(all_brands)) if all_brands else "미지정"
+            SUPA.table("assigned_tasks").insert({
+                "person": "구정회", "category": "마진데이터",
+                "title": f"[지출발생] {brands_txt} · 총 {total_line} · {len(valid_rows)}건 — 마진율 반영 필요",
+            }).execute()
+
             st.session_state.pop("payment_rows_preview", None)
             st.session_state["payment_double_check"] = False
-            st.success(f"{len(valid_rows)}건 등록 완료! 대표님 재무캘린더에서 송금 처리해주실 거예요.")
+            st.success(f"{len(valid_rows)}건 등록 완료! 대표님 재무캘린더에서 송금 처리해주실 거고, 구정회님께도 마진데이터 알림 보냈어요.")
             st.rerun()
 
 # 재확인용: 내가 등록한 것만 보여줌 (송금 처리/완료 버튼은 재무캘린더=대표 전용)
