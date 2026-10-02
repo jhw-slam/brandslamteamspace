@@ -178,6 +178,8 @@ def refresh():
 
 
 my_name = st.selectbox("내 이름", STAFF_NAMES, key="my_name")
+ROLE_MAP = {"김선재": "sales", "곽재선": "influencer", "구정회": "dev", "이단우": "china_ops"}
+my_role = ROLE_MAP.get(my_name)
 
 # ── 📋 채워주세요! (30분마다 도는 완성도 체크가 찾아낸 빈 정보) ──
 open_prompts = (
@@ -195,6 +197,63 @@ if open_prompts:
                 "status": "dismissed",
             }).eq("id", p["id"]).execute()
             st.rerun()
+
+# ── 🤖 AI가 미리 준비해둔 내용 (구글드라이브 등에서 발견, 본인 확인만 하면 됨) ──
+ai_drafts = (
+    SUPA.table("ai_drafted_updates").select("*")
+    .eq("person", my_name).eq("status", "pending")
+    .order("created_at", desc=True).execute().data
+)
+if ai_drafts:
+    st.info(f"🤖 **구글드라이브 등에서 업무 관련 내용을 확인했어요** — 아래 {len(ai_drafts)}건, 맞는지만 봐주세요")
+    for d in ai_drafts:
+        with st.container(border=True):
+            st.write(d["draft_content"])
+            dc1, dc2 = st.columns([1, 2])
+            if dc1.button("✅ 맞아요, 문제없어요", key=f"confirm_draft_{d['id']}", use_container_width=True):
+                SUPA.table("ai_drafted_updates").update({
+                    "status": "applied", "resolved_at": pd.Timestamp.now(tz="UTC").isoformat(),
+                }).eq("id", d["id"]).execute()
+                st.rerun()
+            correction = dc2.text_input(
+                "틀린 부분 있으면 여기에 자유롭게 적어주세요", key=f"correction_{d['id']}",
+                placeholder="예: 계약 시작일은 9/1이 아니라 9/15이에요",
+            )
+            if correction.strip() and st.button("📝 수정사항 제출", key=f"submit_correction_{d['id']}"):
+                SUPA.table("ai_drafted_updates").update({
+                    "status": "correction_requested", "correction_note": correction.strip(),
+                }).eq("id", d["id"]).execute()
+                st.success("제출 완료! 30분 안에 알아서 정리해둘게요.")
+                st.rerun()
+
+# ── 📼 세일즈 전용: 등록된 업체명이 언급된 회의만 알림 (기밀 보호) ──
+if my_role == "sales":
+    sales_alerts = (
+        SUPA.table("sales_meeting_alerts").select("*")
+        .eq("person", my_name).eq("status", "open")
+        .order("meeting_date", desc=True).execute().data
+    )
+    if sales_alerts:
+        st.info(f"📼 **담당하시는 업체 관련 회의가 있었어요** — {len(sales_alerts)}건 (등록된 업체명이 언급된 회의만 보여드려요)")
+        for al in sales_alerts:
+            with st.container(border=True):
+                when = al["meeting_date"][:10] if al.get("meeting_date") else ""
+                st.markdown(f"**[{al['brand_matched']}]** {al.get('meeting_title') or ''} · {when}")
+                if al.get("summary_snippet"):
+                    st.caption(al["summary_snippet"])
+                ac1, ac2 = st.columns(2)
+                if ac1.button("✅ 업무보고에 반영해주세요", key=f"reflect_meeting_{al['id']}", use_container_width=True):
+                    SUPA.table("ai_drafted_updates").insert({
+                        "person": my_name, "source": "meeting", "source_ref": str(al["meeting_id"]),
+                        "target_table": "sales_accounts",
+                        "draft_content": f"[{al['brand_matched']}] 관련 회의 내용: {al.get('summary_snippet') or ''}",
+                    }).execute()
+                    SUPA.table("sales_meeting_alerts").update({"status": "reflected"}).eq("id", al["id"]).execute()
+                    st.success("반영 요청 접수! 위 'AI가 준비해둔 내용'에서 곧 확인하실 수 있어요.")
+                    st.rerun()
+                if ac2.button("그냥 참고만 할게요", key=f"dismiss_meeting_{al['id']}", use_container_width=True):
+                    SUPA.table("sales_meeting_alerts").update({"status": "dismissed"}).eq("id", al["id"]).execute()
+                    st.rerun()
 
 st.divider()
 
@@ -260,6 +319,30 @@ with st.expander("열기 (평소엔 접어둠)", expanded=False):
 
                 person_items = [it for it in okr_items_data if it["person"] == o["person"]]
 
+                # ── 요약 통계바 (옛 OKR목표관리 페이지의 "관리중업무/지연/주의/확정된목표/달성" 이식) ──
+                today_d = date.today()
+                total_cnt = len(person_items)
+                confirmed_cnt = sum(1 for it in person_items if it.get("confirmed"))
+                overdue_cnt = sum(
+                    1 for it in person_items
+                    if it.get("due_date") and pd.to_datetime(it["due_date"]).date() < today_d and not it.get("confirmed")
+                )
+                soon_cnt = sum(
+                    1 for it in person_items
+                    if it.get("due_date") and not it.get("confirmed")
+                    and today_d <= pd.to_datetime(it["due_date"]).date() <= today_d + timedelta(days=3)
+                )
+                achieved_cnt = sum(
+                    1 for it in person_items
+                    if it.get("confirmed") or (float(it.get("target_qty") or 0) > 0 and float(it.get("progress") or 0) >= float(it.get("target_qty") or 0))
+                )
+                sc1, sc2, sc3, sc4, sc5 = st.columns(5)
+                sc1.metric("관리 중 업무", f"{total_cnt}건")
+                sc2.metric("지연", f"{overdue_cnt}건", delta="확인 필요" if overdue_cnt else None, delta_color="inverse")
+                sc3.metric("주의(3일내 마감)", f"{soon_cnt}건")
+                sc4.metric("확정된 목표", f"{confirmed_cnt}/{total_cnt}")
+                sc5.metric("🏆 달성", f"{achieved_cnt}건")
+
                 def _render_item_card(it):
                     try:
                         target = float(it.get("target_qty") or 0)
@@ -270,8 +353,15 @@ with st.expander("열기 (평소엔 접어둠)", expanded=False):
                     conf = "✅" if it.get("confirmed") else "🔲"
                     unit = it.get("unit") or ""
                     progress_txt = f" — {progress:g}/{target:g}{unit}" if target > 0 else ""
+                    due_txt = ""
+                    if it.get("due_date"):
+                        d_date = pd.to_datetime(it["due_date"]).date()
+                        if not it.get("confirmed") and d_date < date.today():
+                            due_txt = f" · ⚠️ 마감 {d_date} (지연)"
+                        else:
+                            due_txt = f" · 마감 {d_date}"
                     with st.container(border=True):
-                        st.markdown(f"{conf} **[{it.get('category') or '미분류'}]** {it['title']}{progress_txt}")
+                        st.markdown(f"{conf} **[{it.get('category') or '미분류'}]** {it['title']}{progress_txt}{due_txt}")
                         if target > 0:
                             st.progress(pct)
 
@@ -806,9 +896,6 @@ st.divider()
 # 🧰 내 업무 도구 (역할별로 다른 화면이 뜹니다 — 다른 사람 도구는 안 보여요)
 # ══════════════════════════════════════════════════════════
 st.subheader("🧰 내 업무 도구")
-
-ROLE_MAP = {"김선재": "sales", "곽재선": "influencer", "구정회": "dev", "이단우": "china_ops"}
-my_role = ROLE_MAP.get(my_name)
 
 if my_role == "sales":
     st.subheader("📇 B2B 브랜드 관리 (세일즈)")
