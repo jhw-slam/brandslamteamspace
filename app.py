@@ -28,7 +28,7 @@ if PW and not st.session_state.get("ok"):
 st.title("📋 업무보고")
 st.caption("업체별 컨텐츠 배치, 가이드라인 준수, 섭외 지시, 예정입출금 — 오늘 진행한 것만 짧게 남겨주세요.")
 
-STAFF_NAMES = ["김선재", "곽재선", "구정회", "이단우", "Sanubari", "Meyna"]
+STAFF_NAMES = ["김선재", "곽재선", "구정회", "이단우", "Sanubari", "Meyna", "가상인턴"]
 CATEGORY_OPTS = ["뷰티", "라이프스타일", "기타"]
 CONTENT_TYPE_OPTS = ["PPL", "시딩", "방문형", "캐러셀", "기타"]
 STATUS_OPTS = ["섭외중", "섭외완료", "제작중", "업로드완료", "드롭앤고체크완료", "취소"]
