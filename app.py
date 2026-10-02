@@ -260,6 +260,35 @@ if my_role == "sales":
                     SUPA.table("sales_meeting_alerts").update({"status": "dismissed"}).eq("id", al["id"]).execute()
                     st.rerun()
 
+# ── 🧭 내 KPI 데이터 정렬 제안 (kpi_gap만 — 본인 데이터라 바로 처리) ──
+my_kpi_gaps = (
+    SUPA.table("kpi_alignment_suggestions").select("*")
+    .eq("person", my_name).eq("status", "open").eq("suggestion_type", "kpi_gap")
+    .order("created_at", desc=True).execute().data
+)
+if my_kpi_gaps:
+    st.info(f"🧭 **내 KPI 추적 관련 제안이 있어요** — {len(my_kpi_gaps)}건 (Claude가 목표랑 실제 데이터를 비교해서 찾은 것)")
+    for g in my_kpi_gaps:
+        with st.container(border=True):
+            st.write(g["suggestion_text"])
+            gl1, gl2 = st.columns([3, 1])
+            sheet_link = gl1.text_input(
+                "이 KPI를 추적할 구글시트 링크(있으면)", key=f"kpigap_link_{g['id']}",
+                placeholder="https://docs.google.com/spreadsheets/...", label_visibility="collapsed",
+            )
+            if gl2.button("등록", key=f"kpigap_register_{g['id']}", use_container_width=True):
+                if sheet_link.strip():
+                    SUPA.table("kpi_data_sources").insert({
+                        "person": my_name, "related_suggestion_text": g["suggestion_text"],
+                        "source_url": sheet_link.strip(),
+                    }).execute()
+                SUPA.table("kpi_alignment_suggestions").update({"status": "applied"}).eq("id", g["id"]).execute()
+                st.success("등록 완료! 다음부터 이 소스를 참고해서 분석할게요.")
+                st.rerun()
+            if st.button("아직 없어요 / 나중에", key=f"kpigap_skip_{g['id']}"):
+                SUPA.table("kpi_alignment_suggestions").update({"status": "dismissed"}).eq("id", g["id"]).execute()
+                st.rerun()
+
 st.divider()
 
 # ══════════════════════════════════════════════════════════
