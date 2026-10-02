@@ -63,6 +63,11 @@ SHEET_COL_MAP = {
     "scheduled_date": ["예정일", "예정 날짜"],
     "unit_price": ["단가", "인플루언서단가", "금액"],
     "casting_assigned_to": ["섭외지시대상", "섭외 지시 대상", "섭외담당"],
+    "bank_name": ["은행", "은행명", "지급은행"],
+    "bank_account_no": ["계좌번호", "계좌", "수취계좌"],
+    "account_holder_name": ["예금주", "수취인", "계좌주"],
+    "contract_link": ["계약서", "계약서링크", "서명계약서", "계약링크"],
+    "id_doc_link": ["신분증", "신분증링크", "신분증사본"],
     "guideline_link": ["가이드라인링크", "가이드라인 링크"],
     "notes": ["메모", "비고"],
 }
@@ -885,6 +890,88 @@ if recent_fc:
             status_label = {"open": "🟡 대기중", "resolved": "✅ 처리완료", "dismissed": "🗑️ 취소됨"}.get(f["status"], f["status"])
             direction_kr = "지출" if f["direction"] == "out" else "수입"
             st.caption(f"{f['expected_date']} · {direction_kr} · ₩{float(f['amount']):,.0f} · {status_label} · {f.get('submitted_by') or ''} · {f.get('reason') or ''}")
+
+st.divider()
+
+# ══════════════════════════════════════════════════════════
+# 📥 인플루언서 송금정보 — 구글시트에서 바로 읽어오기
+# ══════════════════════════════════════════════════════════
+st.subheader("📥 인플루언서 송금정보 (구글시트에서 바로 읽어오기)")
+st.caption(
+    "링크만 첨부하는 게 아니라, 시트 내용을 바로 읽어서 여기 화면에 표시해드려요 — 다시 시트 열어서 작업 안 하셔도 됩니다. "
+    "열 이름 예시: 이름, 금액, 예정일, 은행, 계좌번호, 예금주, 계약서, 신분증"
+)
+pay_sheet_url = st.text_input("구글시트 링크", key="payment_sheet_url", placeholder="https://docs.google.com/spreadsheets/d/...")
+if st.button("불러오기", key="payment_sheet_load"):
+    if not pay_sheet_url.strip():
+        st.error("링크를 붙여넣어주세요.")
+    else:
+        xlsx_url = _sheet_xlsx_url(pay_sheet_url.strip())
+        if not xlsx_url:
+            st.error("구글시트 링크 형식이 아닌 것 같아요.")
+        else:
+            try:
+                res = requests.get(xlsx_url, timeout=30)
+                if res.status_code != 200:
+                    raise ValueError(f"응답 코드 {res.status_code}")
+                all_sheets = pd.read_excel(io.BytesIO(res.content), sheet_name=None, header=None, dtype=str)
+                pay_rows = []
+                for _, raw_df in all_sheets.items():
+                    if raw_df.empty:
+                        continue
+                    for r in _parse_multi_section_sheet(raw_df):
+                        if r.get("influencer_name"):
+                            pay_rows.append(r)
+                st.session_state["payment_rows_preview"] = pay_rows
+                st.success(f"{len(pay_rows)}명 인식됨. 아래에서 확인 후 등록하세요.")
+            except Exception as e:
+                st.error(f"시트를 못 읽었어요 ({e}). '링크가 있는 모든 사용자 - 뷰어'로 공유되어 있는지 확인해주세요.")
+
+pay_preview = st.session_state.get("payment_rows_preview")
+if pay_preview:
+    preview_df = pd.DataFrame([{
+        "이름": r.get("influencer_name"), "금액": r.get("unit_price"), "예정일": r.get("scheduled_date"),
+        "은행": r.get("bank_name"), "계좌번호": r.get("bank_account_no"), "예금주": r.get("account_holder_name"),
+        "계약서": "✅" if r.get("contract_link") else "⚠️ 없음", "신분증": "✅" if r.get("id_doc_link") else "⚠️ 없음",
+    } for r in pay_preview])
+    st.dataframe(preview_df, hide_index=True, use_container_width=True)
+    if st.button(f"✅ 이 {len(pay_preview)}명 일괄 등록", type="primary", key="payment_sheet_register"):
+        for r in pay_preview:
+            SUPA.table("payment_requests").insert({
+                "influencer_name": r.get("influencer_name"),
+                "amount": _clean_number(r.get("unit_price")),
+                "scheduled_date": _clean_date(r.get("scheduled_date")),
+                "bank_name": r.get("bank_name"), "bank_account_no": r.get("bank_account_no"),
+                "account_holder_name": r.get("account_holder_name"),
+                "contract_link": r.get("contract_link"), "id_doc_link": r.get("id_doc_link"),
+                "submitted_by": my_name,
+            }).execute()
+        st.session_state.pop("payment_rows_preview", None)
+        st.success(f"{len(pay_preview)}명 등록 완료!")
+        st.rerun()
+
+pending_payments = (
+    SUPA.table("payment_requests").select("*").eq("status", "pending")
+    .order("scheduled_date").execute().data
+)
+if pending_payments:
+    st.markdown(f"**💸 송금 대기 중 ({len(pending_payments)}건)**")
+    for p in pending_payments:
+        with st.container(border=True):
+            amt = f"₩{float(p['amount']):,.0f}" if p.get("amount") else "-"
+            st.markdown(f"**{p['influencer_name']}** · {amt} · 예정일 {p.get('scheduled_date') or '-'}")
+            bank_info = " · ".join(filter(None, [p.get("bank_name"), p.get("bank_account_no"), p.get("account_holder_name")]))
+            if bank_info:
+                st.caption(f"🏦 {bank_info}")
+            doc_status = []
+            doc_status.append(f"계약서 {'✅' if p.get('contract_link') else '⚠️ 미수령'}" + (f" [열기]({p['contract_link']})" if p.get("contract_link") else ""))
+            doc_status.append(f"신분증 {'✅' if p.get('id_doc_link') else '⚠️ 미수령'}" + (f" [열기]({p['id_doc_link']})" if p.get("id_doc_link") else ""))
+            st.caption(" · ".join(doc_status))
+            if st.button("💰 송금완료 처리", key=f"pay_done_{p['id']}"):
+                SUPA.table("payment_requests").update({
+                    "status": "paid", "paid_at": pd.Timestamp.now(tz="UTC").isoformat(),
+                }).eq("id", p["id"]).execute()
+                st.rerun()
 
 st.divider()
 
