@@ -1,6 +1,10 @@
 import os
 import io
-from datetime import date, timedelta
+import re
+import json
+import base64
+import hashlib
+from datetime import date, datetime, timedelta
 
 import pandas as pd
 import requests
@@ -68,6 +72,7 @@ SHEET_COL_MAP = {
     "account_holder_name": ["예금주", "수취인", "계좌주"],
     "contract_link": ["계약서", "계약서링크", "서명계약서", "계약링크"],
     "id_doc_link": ["신분증", "신분증링크", "신분증사본"],
+    "influencer_email": ["이메일", "메일", "Email", "연락처이메일"],
     "guideline_link": ["가이드라인링크", "가이드라인 링크"],
     "notes": ["메모", "비고"],
 }
@@ -80,7 +85,7 @@ SHEET_COL_MAP_NORM = {
 def _clean_number(val):
     if val is None:
         return None
-    s = str(val).strip().replace(",", "")
+    s = str(val).strip().replace(",", "").replace("₩", "").replace("원", "").strip()
     if not s or s in ("-", "–", "N/A", "n/a"):
         return None
     try:
@@ -96,6 +101,13 @@ def _clean_date(val):
     if not s or s.lower() in ("nan", "nat", "none", "-", "n/a", "null"):
         return None
     s = s.replace(".", "-").rstrip("-")
+    # "26-09-28"(YY-MM-DD) 같은 2자리 연도는 pd.to_datetime이 순서를 잘못 추측하는 경우가 있어
+    # (예: 2028-09-26로 뒤바뀜) 명시적 포맷을 먼저 시도해서 그 문제를 막는다.
+    for fmt in ("%Y-%m-%d", "%y-%m-%d"):
+        try:
+            return datetime.strptime(s, fmt).date().isoformat()
+        except ValueError:
+            continue
     try:
         d = pd.to_datetime(s)
         if pd.isna(d):  # pd.to_datetime("nan") 등은 예외 없이 NaT를 반환하므로 반드시 별도 체크 필요
@@ -149,6 +161,60 @@ def _parse_multi_section_sheet(raw_df):
             if mapped.get("influencer_name"):
                 all_rows.append(mapped)
     return all_rows
+
+
+def _extract_email(text):
+    if not text:
+        return None
+    m = re.search(r"[\w\.\-+]+@[\w\-]+\.[\w\.\-]+", str(text))
+    return m.group(0) if m else None
+
+
+def _parse_payment_sheet_positional(raw_df, existing_keys):
+    """'유상 인플루언서 송금' 시트 전용 — 헤더 텍스트가 구글폼 질문이라 이름으로 못 찾으므로,
+    열 순서(A~L)로 고정해서 읽는다. A이름/B틱톡/C인스타/D방문일/E업로드일/F인스타콘텐츠/
+    G틱톡콘텐츠/H결제수단/I세금계산서/J금액/K신분증링크/L송금예정일."""
+    rows, skipped = [], 0
+    for i in range(1, len(raw_df)):  # 0행은 헤더라 건너뜀
+        vals = raw_df.iloc[i].tolist()
+        vals = (vals + [None] * 12)[:12]  # 12열 미만이어도 안전하게
+        name = str(vals[0]).strip() if pd.notna(vals[0]) else ""
+        amount = _clean_number(vals[9])
+        if not name or amount is None:
+            skipped += 1
+            continue  # 이름/금액이 없으면 이 포맷이 아니거나 빈 행 — 건너뜀 (2~4행 같은 기업용 블록 등)
+
+        tiktok = str(vals[1]).strip() if pd.notna(vals[1]) and str(vals[1]).strip() not in ("-", "") else None
+        instagram = str(vals[2]).strip() if pd.notna(vals[2]) else None
+        visit_date = _clean_date(vals[3])
+        upload_date = _clean_date(vals[4])
+        content_ig = str(vals[5]).strip() if pd.notna(vals[5]) else None
+        content_tiktok = str(vals[6]).strip() if pd.notna(vals[6]) else None
+        content_link = content_ig or content_tiktok
+        payment_method_raw = str(vals[7]).strip() if pd.notna(vals[7]) else None
+        id_doc_link = str(vals[10]).strip() if pd.notna(vals[10]) else None
+        scheduled_date = _clean_date(vals[11])
+        # ⚠️ 이건 "돈이 실제로 가는 페이팔 계정"이지, 안내메일 받을 주소가 아니다 — 절대 섞으면 안 됨
+        paypal_email = _extract_email(payment_method_raw)
+        # 결제수단 자체가 비어있으면("-", 공백 등) 어디로 보낼지 알 수 없는 상태 — 등록 차단 대상
+        destination_verified = bool(payment_method_raw and payment_method_raw.strip() not in ("-", ""))
+
+        dedup_src = f"{content_link or ''}|{visit_date or ''}|{amount}"
+        dedup_key = hashlib.md5(dedup_src.encode("utf-8")).hexdigest()
+        if dedup_key in existing_keys:
+            skipped += 1
+            continue
+
+        rows.append({
+            "influencer_name": name, "tiktok_url": tiktok, "instagram_url": instagram,
+            "visit_date": visit_date, "upload_date": upload_date, "content_link": content_link,
+            "payment_method_raw": payment_method_raw, "id_doc_link": id_doc_link,
+            "amount": amount, "scheduled_date": scheduled_date,
+            "paypal_email": paypal_email, "notification_email": None,
+            "payment_destination_verified": destination_verified,
+            "dedup_key": dedup_key,
+        })
+    return rows, skipped
 
 
 @st.cache_resource
@@ -927,8 +993,8 @@ st.divider()
 # ══════════════════════════════════════════════════════════
 st.subheader("📥 인플루언서 송금정보 (구글시트에서 바로 읽어오기)")
 st.caption(
-    "링크만 첨부하는 게 아니라, 시트 내용을 바로 읽어서 여기 화면에 표시해드려요 — 다시 시트 열어서 작업 안 하셔도 됩니다. "
-    "열 이름 예시: 이름, 금액, 예정일, 은행, 계좌번호, 예금주, 계약서, 신분증"
+    "실제 쓰시는 '유상 인플루언서 송금' 시트 포맷에 맞춰 읽어와요 (이름/틱톡/인스타/방문날짜/업로드일/콘텐츠링크/결제수단/금액/신분증링크/송금예정일 — 열 순서 고정). "
+    "같은 콘텐츠를 다시 올려도 중복 등록되지 않아요."
 )
 pay_sheet_url = st.text_input("구글시트 링크", key="payment_sheet_url", placeholder="https://docs.google.com/spreadsheets/d/...")
 if st.button("불러오기", key="payment_sheet_load"):
@@ -941,66 +1007,216 @@ if st.button("불러오기", key="payment_sheet_load"):
         else:
             try:
                 res = requests.get(xlsx_url, timeout=30)
-                if res.status_code != 200:
-                    raise ValueError(f"응답 코드 {res.status_code}")
-                all_sheets = pd.read_excel(io.BytesIO(res.content), sheet_name=None, header=None, dtype=str)
-                pay_rows = []
-                for _, raw_df in all_sheets.items():
-                    if raw_df.empty:
-                        continue
-                    for r in _parse_multi_section_sheet(raw_df):
-                        if r.get("influencer_name"):
-                            pay_rows.append(r)
-                st.session_state["payment_rows_preview"] = pay_rows
-                st.success(f"{len(pay_rows)}명 인식됨. 아래에서 확인 후 등록하세요.")
+                if res.status_code == 403 or res.status_code == 401:
+                    st.error(
+                        "🔒 **권한 문제예요** — 이 시트가 아직 비공개 상태라 저희 쪽에서 못 읽어요.\n\n"
+                        "구글시트에서 **우측 상단 '공유' → '일반 액세스'를 '링크가 있는 모든 사용자 - 뷰어'**로 바꿔주세요. "
+                        "(회사 계정끼리만 공유해도 외부 서버에서는 못 읽습니다)\n\n"
+                        "**그래도 복잡하면 아래 '📷 스크린샷으로 대신 올리기'를 쓰셔도 돼요 — 더 쉬울 수 있어요.**"
+                    )
+                elif res.status_code == 404:
+                    st.error("❌ 링크를 찾을 수 없어요. 주소가 정확한지 다시 확인해주세요.")
+                elif res.status_code != 200:
+                    st.error(f"❌ 구글시트 응답 오류 (코드 {res.status_code}). 잠시 후 다시 시도해주세요.")
+                else:
+                    all_sheets = pd.read_excel(io.BytesIO(res.content), sheet_name=None, header=None, dtype=str)
+                    pay_rows, skipped_rows = [], 0
+                    existing_keys = {
+                        r["dedup_key"] for r in SUPA.table("payment_requests").select("dedup_key").execute().data
+                        if r.get("dedup_key")
+                    }
+                    for _, raw_df in all_sheets.items():
+                        if raw_df.empty:
+                            continue
+                        rows, n_skip = _parse_payment_sheet_positional(raw_df, existing_keys)
+                        pay_rows.extend(rows)
+                        skipped_rows += n_skip
+                    st.session_state["payment_rows_preview"] = pay_rows
+                    msg = f"{len(pay_rows)}명 새로 인식됨."
+                    if skipped_rows:
+                        msg += f" (이미 등록됐거나 형식이 안 맞는 {skipped_rows}행은 건너뜀)"
+                    st.success(msg)
             except Exception as e:
-                st.error(f"시트를 못 읽었어요 ({e}). '링크가 있는 모든 사용자 - 뷰어'로 공유되어 있는지 확인해주세요.")
+                st.error(
+                    f"시트를 못 읽었어요 ({e}).\n\n"
+                    "**확인해주세요:** 구글시트 '공유' 설정이 '링크가 있는 모든 사용자 - 뷰어'로 되어있는지. "
+                    "그래도 안 되면 아래 '📷 스크린샷으로 대신 올리기'를 이용해주세요."
+                )
+
+st.markdown("**또는, 더 간단하게:**")
+with st.expander("📷 스크린샷으로 대신 올리기 (시트 링크가 번거로우면 이쪽이 더 쉬워요)"):
+    st.caption("송금 정보가 보이는 화면을 캡처해서 올리면, Claude가 읽어서 자동으로 채워드려요. 여러 장 올려도 됩니다.")
+    shot_files = st.file_uploader(
+        "스크린샷 업로드", type=["png", "jpg", "jpeg"], accept_multiple_files=True, key="payment_screenshot_up",
+    )
+    if shot_files and st.button("스크린샷 읽기", key="payment_screenshot_read"):
+        api_key = os.environ.get("ANTHROPIC_API_KEY")
+        if not api_key:
+            st.error("ANTHROPIC_API_KEY가 설정되어 있지 않아 이 기능은 못 써요.")
+        else:
+            existing_keys = {
+                r["dedup_key"] for r in SUPA.table("payment_requests").select("dedup_key").execute().data
+                if r.get("dedup_key")
+            }
+            shot_rows = []
+            with st.spinner("Claude가 스크린샷을 읽는 중..."):
+                for f in shot_files:
+                    img_b64 = base64.b64encode(f.getvalue()).decode("utf-8")
+                    media_type = f.type or "image/png"
+                    sys_prompt = (
+                        "이 이미지는 인플루언서 송금 정보 화면(또는 메시지)이다. 다음 정보를 찾아서 JSON으로만 출력해라: "
+                        "{\"influencer_name\": \"...\", \"amount\": 숫자(원화 기준, 콤마/₩ 제외), "
+                        "\"payment_method_raw\": \"은행명+계좌번호 또는 PayPal 이메일 등 보이는 그대로\", "
+                        "\"content_link\": \"콘텐츠 링크 있으면, 없으면 null\"}. "
+                        "확실하지 않은 값은 null로 둬라. 다른 텍스트는 절대 포함하지 마라."
+                    )
+                    try:
+                        r = requests.post(
+                            "https://api.anthropic.com/v1/messages",
+                            headers={"x-api-key": api_key, "anthropic-version": "2023-06-01", "content-type": "application/json"},
+                            json={
+                                "model": "claude-sonnet-5", "max_tokens": 500, "system": sys_prompt,
+                                "messages": [{"role": "user", "content": [
+                                    {"type": "image", "source": {"type": "base64", "media_type": media_type, "data": img_b64}},
+                                    {"type": "text", "text": "이 이미지에서 송금정보를 추출해줘."},
+                                ]}],
+                            },
+                            timeout=30,
+                        )
+                        if r.status_code >= 300:
+                            st.warning(f"{f.name}: 읽기 실패 ({r.status_code})")
+                            continue
+                        text = "".join(b.get("text", "") for b in r.json().get("content", []) if b.get("type") == "text").strip()
+                        if text.startswith("```"):
+                            text = text.strip("`")
+                            if text.startswith("json"):
+                                text = text[4:]
+                        d = json.loads(text)
+                        amount = _clean_number(d.get("amount"))
+                        if not d.get("influencer_name") or amount is None:
+                            st.warning(f"{f.name}: 이름/금액을 못 읽었어요. 직접 입력 폼을 이용해주세요.")
+                            continue
+                        payment_method_raw = d.get("payment_method_raw")
+                        paypal_email = _extract_email(payment_method_raw)
+                        content_link = d.get("content_link")
+                        dedup_src = f"{content_link or ''}||{amount}"
+                        dedup_key = hashlib.md5(dedup_src.encode("utf-8")).hexdigest()
+                        if dedup_key in existing_keys:
+                            st.caption(f"{f.name}: 이미 등록된 것 같아 건너뜀")
+                            continue
+                        shot_rows.append({
+                            "influencer_name": d.get("influencer_name"), "tiktok_url": None, "instagram_url": None,
+                            "visit_date": None, "upload_date": None, "content_link": content_link,
+                            "payment_method_raw": payment_method_raw, "id_doc_link": None,
+                            "amount": amount, "scheduled_date": None,
+                            "paypal_email": paypal_email, "notification_email": None,
+                            "payment_destination_verified": bool(payment_method_raw),
+                            "dedup_key": dedup_key,
+                        })
+                    except Exception as e:
+                        st.warning(f"{f.name}: 오류 ({e})")
+            if shot_rows:
+                st.session_state["payment_rows_preview"] = (
+                    st.session_state.get("payment_rows_preview") or []
+                ) + shot_rows
+                st.success(f"{len(shot_rows)}건 인식됨. 아래에서 확인해주세요.")
+                st.rerun()
 
 pay_preview = st.session_state.get("payment_rows_preview")
 if pay_preview:
-    preview_df = pd.DataFrame([{
-        "이름": r.get("influencer_name"), "금액": r.get("unit_price"), "예정일": r.get("scheduled_date"),
-        "은행": r.get("bank_name"), "계좌번호": r.get("bank_account_no"), "예금주": r.get("account_holder_name"),
-        "계약서": "✅" if r.get("contract_link") else "⚠️ 없음", "신분증": "✅" if r.get("id_doc_link") else "⚠️ 없음",
-    } for r in pay_preview])
-    st.dataframe(preview_df, hide_index=True, use_container_width=True)
-    if st.button(f"✅ 이 {len(pay_preview)}명 일괄 등록", type="primary", key="payment_sheet_register"):
-        for r in pay_preview:
-            SUPA.table("payment_requests").insert({
-                "influencer_name": r.get("influencer_name"),
-                "amount": _clean_number(r.get("unit_price")),
-                "scheduled_date": _clean_date(r.get("scheduled_date")),
-                "bank_name": r.get("bank_name"), "bank_account_no": r.get("bank_account_no"),
-                "account_holder_name": r.get("account_holder_name"),
-                "contract_link": r.get("contract_link"), "id_doc_link": r.get("id_doc_link"),
-                "submitted_by": my_name,
-            }).execute()
-        st.session_state.pop("payment_rows_preview", None)
-        st.success(f"{len(pay_preview)}명 등록 완료!")
-        st.rerun()
+    invalid_rows = [r for r in pay_preview if not r.get("payment_destination_verified")]
+    valid_rows = [r for r in pay_preview if r.get("payment_destination_verified")]
 
-pending_payments = (
+    if invalid_rows:
+        st.error(
+            f"🚫 **{len(invalid_rows)}건은 송금 수단이 불명확해서 등록에서 제외됩니다** "
+            "(해외송금에서 계좌정보 하나라도 안 맞으면 신청 자체가 안 되는 것과 같은 원리예요):"
+        )
+        for r in invalid_rows:
+            st.caption(f"- {r.get('influencer_name')} (₩{r.get('amount'):,.0f}) — 결제수단 칸이 비어있어요")
+
+    if valid_rows:
+        st.markdown(f"**✅ 등록 가능한 {len(valid_rows)}건** — 안내메일 받을 주소는 선택사항이니 아는 경우만 적어주세요.")
+        for idx, r in enumerate(valid_rows):
+            with st.container(border=True):
+                c1, c2 = st.columns([2, 1])
+                c1.markdown(f"**{r.get('influencer_name')}** · ₩{r.get('amount'):,.0f}")
+                c1.caption(f"💳 결제수단: {r.get('payment_method_raw') or '-'}")
+                if r.get("paypal_email"):
+                    c1.caption(f"⚠️ 페이팔 결제 계정(실제 송금 대상): **{r['paypal_email']}** — 안내메일 주소와 다를 수 있어요!")
+                if r.get("content_link"):
+                    c1.caption(f"🔗 콘텐츠: {r['content_link']}")
+                else:
+                    c1.caption("⚠️ 콘텐츠 링크 없음")
+                if not r.get("id_doc_link"):
+                    c1.caption("⚠️ 신분증 링크 없음")
+                notif_email = c2.text_input(
+                    "안내메일 받을 주소(선택)", value=r.get("notification_email") or "",
+                    key=f"notif_email_{idx}", placeholder="비워두면 자동메일 발송 안 함",
+                )
+                valid_rows[idx]["notification_email"] = notif_email.strip() or None
+
+        if st.button("🔍 이미 송금한 내역과 겹치는지 확인하기", key="check_dup_paid"):
+            paid_history = SUPA.table("payment_requests").select("*").eq("status", "paid").execute().data
+            bank_hits_total = 0
+            for r in valid_rows:
+                name = r.get("influencer_name") or ""
+                amt = r.get("amount") or 0
+                matches = [
+                    p for p in paid_history
+                    if p["influencer_name"] == name and abs(float(p.get("amount") or 0) - amt) < 1000
+                ]
+                bank_matches = (
+                    SUPA.table("bank_transactions").select("txn_date,amount,description")
+                    .ilike("description", f"%{name}%").eq("direction", "out").execute().data
+                    if name else []
+                )
+                if matches or bank_matches:
+                    bank_hits_total += 1
+                    st.warning(f"⚠️ **{name}** (₩{amt:,.0f}) — 비슷한 기존 기록 발견:")
+                    for m in matches:
+                        st.caption(f"  · 이미 송금처리됨: {m.get('paid_at', '')[:10]} · ₩{float(m['amount']):,.0f}")
+                    for b in bank_matches[:3]:
+                        st.caption(f"  · 은행거래 유사건: {b.get('txn_date')} · ₩{float(b['amount']):,.0f} · {b.get('description')}")
+            if bank_hits_total == 0:
+                st.success("겹치는 기존 내역을 못 찾았어요 (완전히 새로운 건으로 보여요).")
+
+        double_check = st.checkbox("위 내용을 확인했고, 이미 송금한 내역과 안 겹치는 걸 확인했습니다", key="payment_double_check")
+        if st.button(f"✅ 이 {len(valid_rows)}건 일괄 등록", type="primary", key="payment_sheet_register", disabled=not double_check):
+            for r in valid_rows:
+                SUPA.table("payment_requests").insert({
+                    "influencer_name": r.get("influencer_name"),
+                    "paypal_email": r.get("paypal_email"), "notification_email": r.get("notification_email"),
+                    "amount": r.get("amount"),
+                    "scheduled_date": r.get("scheduled_date"),
+                    "visit_date": r.get("visit_date"), "upload_date": r.get("upload_date"),
+                    "tiktok_url": r.get("tiktok_url"), "instagram_url": r.get("instagram_url"),
+                    "payment_method_raw": r.get("payment_method_raw"),
+                    "content_link": r.get("content_link"), "id_doc_link": r.get("id_doc_link"),
+                    "dedup_key": r.get("dedup_key"), "double_checked": True,
+                    "payment_destination_verified": True,
+                    "submitted_by": my_name,
+                }).execute()
+            st.session_state.pop("payment_rows_preview", None)
+            st.session_state["payment_double_check"] = False
+            st.success(f"{len(valid_rows)}건 등록 완료! 대표님 재무캘린더에서 송금 처리해주실 거예요.")
+            st.rerun()
+
+# 재확인용: 내가 등록한 것만 보여줌 (송금 처리/완료 버튼은 재무캘린더=대표 전용)
+my_pending_payments = (
     SUPA.table("payment_requests").select("*").eq("status", "pending")
-    .order("scheduled_date").execute().data
+    .eq("submitted_by", my_name).order("scheduled_date").execute().data
 )
-if pending_payments:
-    st.markdown(f"**💸 송금 대기 중 ({len(pending_payments)}건)**")
-    for p in pending_payments:
-        with st.container(border=True):
-            amt = f"₩{float(p['amount']):,.0f}" if p.get("amount") else "-"
-            st.markdown(f"**{p['influencer_name']}** · {amt} · 예정일 {p.get('scheduled_date') or '-'}")
-            bank_info = " · ".join(filter(None, [p.get("bank_name"), p.get("bank_account_no"), p.get("account_holder_name")]))
-            if bank_info:
-                st.caption(f"🏦 {bank_info}")
-            doc_status = []
-            doc_status.append(f"계약서 {'✅' if p.get('contract_link') else '⚠️ 미수령'}" + (f" [열기]({p['contract_link']})" if p.get("contract_link") else ""))
-            doc_status.append(f"신분증 {'✅' if p.get('id_doc_link') else '⚠️ 미수령'}" + (f" [열기]({p['id_doc_link']})" if p.get("id_doc_link") else ""))
-            st.caption(" · ".join(doc_status))
-            if st.button("💰 송금완료 처리", key=f"pay_done_{p['id']}"):
-                SUPA.table("payment_requests").update({
-                    "status": "paid", "paid_at": pd.Timestamp.now(tz="UTC").isoformat(),
-                }).eq("id", p["id"]).execute()
-                st.rerun()
+if my_pending_payments:
+    st.markdown(f"**💸 내가 등록한 송금요청 — 재확인용 ({len(my_pending_payments)}건, 대표님 처리 대기중)**")
+    confirm_df = pd.DataFrame([{
+        "이름": p["influencer_name"], "금액": f"₩{float(p['amount']):,.0f}" if p.get("amount") else "-",
+        "예정일": p.get("scheduled_date") or "-",
+        "콘텐츠링크": "✅" if p.get("content_link") else "⚠️ 없음",
+        "신분증": "✅" if p.get("id_doc_link") else "⚠️ 없음",
+    } for p in my_pending_payments])
+    st.dataframe(confirm_df, hide_index=True, use_container_width=True)
+    st.caption("내용이 틀렸으면 구글시트 수정 후 다시 불러와서 등록해주세요. 송금 완료 처리는 대표님이 재무캘린더에서 하시면 자동으로 알림 메일이 나가요.")
 
 st.divider()
 
