@@ -171,51 +171,136 @@ def _extract_email(text):
     return m.group(0) if m else None
 
 
-def _parse_payment_sheet_positional(raw_df, existing_keys):
-    """'유상 인플루언서 송금' 시트 전용 — 헤더 텍스트가 구글폼 질문이라 이름으로 못 찾으므로,
-    열 순서(A~L)로 고정해서 읽는다. A이름/B틱톡/C인스타/D방문일/E업로드일/F인스타콘텐츠/
-    G틱톡콘텐츠/H결제수단/I세금계산서/J금액/K신분증링크/L송금예정일."""
+def _ai_infer_column_mapping(all_sheets):
+    """본격적으로 전부 추출하기 전에, 열 구성을 어떻게 이해했는지 사람이 먼저 확인하게 한다
+    (예: 'A열이 이름이 맞나요?'에 해당하는 사전 점검 단계)."""
+    api_key = os.environ.get("ANTHROPIC_API_KEY")
+    if not api_key:
+        return None
+    sheet_samples = {}
+    for name, raw_df in all_sheets.items():
+        if raw_df.empty:
+            continue
+        header = [str(h) if pd.notna(h) else "" for h in raw_df.iloc[0].tolist()]
+        sample_rows = raw_df.iloc[1:3].fillna("").astype(str).values.tolist()
+        sheet_samples[name] = {"header": header, "sample_rows": sample_rows}
+    if not sheet_samples:
+        return None
+
+    system = (
+        "너는 스프레드시트의 열 구성을 사람에게 짧게 설명해주는 보조원이다. 헤더 텍스트와 샘플 행 1~2개를 보고, "
+        "각 열(A, B, C...)이 실제로 어떤 내용을 담고 있는지 추측해서, 한국어로 아주 짧게 정리해라. "
+        "예: 'A열: 인플루언서 이름 / B열: 비어있음(사용 안 함) / ... / J열: 송금액'. "
+        "헤더 텍스트가 질문 문장이라도 속지 말고 샘플 값을 보고 실제 의미를 판단해라. "
+        "여러 시트(탭)가 있으면 시트 이름별로 구분해서 적어라. 다른 설명 없이 이 요약만 출력해라."
+    )
+    try:
+        res = requests.post(
+            "https://api.anthropic.com/v1/messages",
+            headers={"x-api-key": api_key, "anthropic-version": "2023-06-01", "content-type": "application/json"},
+            json={"model": "claude-sonnet-5", "max_tokens": 1000, "system": system,
+                  "messages": [{"role": "user", "content": json.dumps(sheet_samples, ensure_ascii=False)}]},
+            timeout=30,
+        )
+        if res.status_code >= 300:
+            return None
+        return "".join(b.get("text", "") for b in res.json().get("content", []) if b.get("type") == "text").strip()
+    except Exception:
+        return None
+
+
+def _ai_extract_payment_rows(raw_df, existing_keys, batch_size=20, extra_hint=None):
+    """시트 양식이 제각각이라도(방문형/업로드형/기업형 등) Claude가 각 행의 '의미'를 보고
+    알아서 이름/금액/결제수단/링크 등을 뽑아낸다 — 열 위치를 고정하지 않는다.
+    헤더 텍스트가 구글폼 질문이라 믿을 수 없는 경우에도 셀 내용 자체로 판단한다."""
+    api_key = os.environ.get("ANTHROPIC_API_KEY")
     rows, skipped = [], 0
-    for i in range(1, len(raw_df)):  # 0행은 헤더라 건너뜀
-        vals = raw_df.iloc[i].tolist()
-        vals = (vals + [None] * 12)[:12]  # 12열 미만이어도 안전하게
-        name = str(vals[0]).strip() if pd.notna(vals[0]) else ""
-        amount = _clean_number(vals[9])
-        if not name or amount is None:
-            skipped += 1
-            continue  # 이름/금액이 없으면 이 포맷이 아니거나 빈 행 — 건너뜀 (2~4행 같은 기업용 블록 등)
+    if not api_key or raw_df.empty or len(raw_df) < 2:
+        return rows, max(0, len(raw_df) - 1)
 
-        tiktok = str(vals[1]).strip() if pd.notna(vals[1]) and str(vals[1]).strip() not in ("-", "") else None
-        instagram = str(vals[2]).strip() if pd.notna(vals[2]) else None
-        visit_date = _clean_date(vals[3])
-        upload_date = _clean_date(vals[4])
-        content_ig = str(vals[5]).strip() if pd.notna(vals[5]) else None
-        content_tiktok = str(vals[6]).strip() if pd.notna(vals[6]) else None
-        content_link = content_ig or content_tiktok
-        payment_method_raw = str(vals[7]).strip() if pd.notna(vals[7]) else None
-        id_doc_link = str(vals[10]).strip() if pd.notna(vals[10]) else None
-        scheduled_date = _clean_date(vals[11])
-        # ⚠️ 이건 "돈이 실제로 가는 페이팔 계정"이지, 안내메일 받을 주소가 아니다 — 절대 섞으면 안 됨
-        paypal_email = _extract_email(payment_method_raw)
-        # 결제수단 자체가 비어있으면("-", 공백 등) 어디로 보낼지 알 수 없는 상태 — 등록 차단 대상
-        destination_verified = bool(payment_method_raw and payment_method_raw.strip() not in ("-", ""))
+    header = [str(h) if pd.notna(h) else "" for h in raw_df.iloc[0].tolist()]
+    data_rows = raw_df.iloc[1:].fillna("").astype(str).values.tolist()
 
-        dedup_src = f"{content_link or ''}|{visit_date or ''}|{amount}"
-        dedup_key = hashlib.md5(dedup_src.encode("utf-8")).hexdigest()
-        if dedup_key in existing_keys:
-            skipped += 1
+    system = (
+        "너는 인플루언서 송금 정보가 담긴 스프레드시트의 각 행을 읽고, 열 순서가 어떻든 상관없이 "
+        "의미로 판단해서 다음 필드를 추출하는 보조원이다: influencer_name(이름), amount(송금액, 숫자만), "
+        "payment_method_raw(은행명+계좌번호 또는 PayPal 이메일 등 결제수단 — 원문 그대로), "
+        "content_link(인스타/틱톡 등 업로드된 콘텐츠 링크), visit_date(방문일, YYYY-MM-DD), "
+        "upload_date(업로드일, YYYY-MM-DD), scheduled_date(송금예정일, YYYY-MM-DD), "
+        "id_doc_link(신분증/계좌 사본 드라이브 링크).\n\n"
+        "헤더가 실제 필드명이 아니라 설명문/질문일 수 있다(구글폼으로 만든 시트 등) — 헤더 텍스트를 믿지 말고 "
+        "각 셀의 실제 '내용'을 보고 판단해라. 이름도 금액도 없는 행(안내문, 기업용 결제 블록, 빈 줄, 관련시트 링크만 있는 행 등)은 "
+        "skip:true로 건너뛰어라. 확신 없는 필드는 null로 둬라.\n\n"
+        "출력은 오직 JSON 배열만, 입력 행과 같은 순서·같은 개수로: "
+        "[{\"skip\":false,\"influencer_name\":\"...\",\"amount\":숫자 또는 null,\"payment_method_raw\":\"...\" 또는 null,"
+        "\"content_link\":\"...\" 또는 null,\"visit_date\":\"...\" 또는 null,\"upload_date\":\"...\" 또는 null,"
+        "\"scheduled_date\":\"...\" 또는 null,\"id_doc_link\":\"...\" 또는 null}, ...]. 다른 텍스트는 절대 포함하지 마라."
+    )
+    if extra_hint:
+        system += f"\n\n사용자가 직접 알려준 열 구성 보정 사항(반드시 반영해라): {extra_hint}"
+
+    for start in range(0, len(data_rows), batch_size):
+        chunk = data_rows[start:start + batch_size]
+        user_content = json.dumps({"headers": header, "rows": chunk}, ensure_ascii=False)
+        try:
+            res = requests.post(
+                "https://api.anthropic.com/v1/messages",
+                headers={"x-api-key": api_key, "anthropic-version": "2023-06-01", "content-type": "application/json"},
+                json={"model": "claude-sonnet-5", "max_tokens": 4000, "system": system,
+                      "messages": [{"role": "user", "content": user_content}]},
+                timeout=60,
+            )
+            if res.status_code >= 300:
+                skipped += len(chunk)
+                continue
+            text = "".join(b.get("text", "") for b in res.json().get("content", []) if b.get("type") == "text").strip()
+            if text.startswith("```"):
+                text = text.strip("`")
+                if text.startswith("json"):
+                    text = text[4:]
+            extracted = json.loads(text)
+        except Exception:
+            skipped += len(chunk)
             continue
 
-        rows.append({
-            "influencer_name": name, "tiktok_url": tiktok, "instagram_url": instagram,
-            "visit_date": visit_date, "upload_date": upload_date, "content_link": content_link,
-            "payment_method_raw": payment_method_raw, "id_doc_link": id_doc_link,
-            "amount": amount, "scheduled_date": scheduled_date,
-            "paypal_email": paypal_email, "notification_email": None,
-            "payment_destination_verified": destination_verified,
-            "dedup_key": dedup_key,
-        })
+        for item in extracted:
+            if not isinstance(item, dict) or item.get("skip"):
+                skipped += 1
+                continue
+            name = str(item.get("influencer_name") or "").strip()
+            amount = _clean_number(item.get("amount"))
+            if not name or amount is None:
+                skipped += 1
+                continue
+
+            payment_method_raw = item.get("payment_method_raw")
+            content_link = item.get("content_link")
+            visit_date = _clean_date(item.get("visit_date")) if item.get("visit_date") else None
+            upload_date = _clean_date(item.get("upload_date")) if item.get("upload_date") else None
+            scheduled_date = _clean_date(item.get("scheduled_date")) if item.get("scheduled_date") else None
+            id_doc_link = item.get("id_doc_link")
+            # ⚠️ 이건 "돈이 실제로 가는 페이팔 계정"이지, 안내메일 받을 주소가 아니다 — 절대 섞으면 안 됨
+            paypal_email = _extract_email(payment_method_raw)
+            # 결제수단 자체가 비어있으면("-", 공백 등) 어디로 보낼지 알 수 없는 상태 — 등록 차단 대상
+            destination_verified = bool(payment_method_raw and str(payment_method_raw).strip() not in ("-", ""))
+
+            dedup_src = f"{content_link or ''}|{visit_date or ''}|{amount}"
+            dedup_key = hashlib.md5(dedup_src.encode("utf-8")).hexdigest()
+            if dedup_key in existing_keys:
+                skipped += 1
+                continue
+
+            rows.append({
+                "influencer_name": name, "tiktok_url": None, "instagram_url": None,
+                "visit_date": visit_date, "upload_date": upload_date, "content_link": content_link,
+                "payment_method_raw": payment_method_raw, "id_doc_link": id_doc_link,
+                "amount": amount, "scheduled_date": scheduled_date,
+                "paypal_email": paypal_email, "notification_email": None,
+                "payment_destination_verified": destination_verified,
+                "dedup_key": dedup_key,
+            })
     return rows, skipped
+
 
 
 @st.cache_resource
@@ -1035,11 +1120,22 @@ with tab_finance:
     # ══════════════════════════════════════════════════════════
     st.subheader("📥 인플루언서 송금정보 (구글시트에서 바로 읽어오기)")
     st.caption(
-        "실제 쓰시는 '유상 인플루언서 송금' 시트 포맷에 맞춰 읽어와요 (이름/틱톡/인스타/방문날짜/업로드일/콘텐츠링크/결제수단/금액/신분증링크/송금예정일 — 열 순서 고정). "
+        "열 순서가 시트마다 달라도 괜찮아요 — Claude가 각 행의 내용을 보고 이름·금액·결제수단·링크를 알아서 찾아냅니다. "
         "같은 콘텐츠를 다시 올려도 중복 등록되지 않아요."
     )
+    PAYMENT_TEMPLATE_CSV = (
+        "이름,금액,결제수단,콘텐츠링크,방문일,업로드일,송금예정일,신분증링크\n"
+        "홍길동,150000,하나은행 123-456789-01,https://instagram.com/p/xxxx,2026-10-01,2026-10-05,2026-10-10,https://drive.google.com/...\n"
+    )
+    dl1, dl2 = st.columns([1, 3])
+    dl1.download_button(
+        "📋 표준 양식 다운로드", data=PAYMENT_TEMPLATE_CSV, file_name="송금정보_양식.csv",
+        mime="text/csv", key="download_payment_template",
+    )
+    dl2.caption("이 양식대로 채우시면 가장 정확하게 인식돼요. 다른 형식(기존에 쓰시던 시트)도 AI가 알아서 읽어보려 시도합니다.")
+
     pay_sheet_url = st.text_input("구글시트 링크", key="payment_sheet_url", placeholder="https://docs.google.com/spreadsheets/d/...")
-    if st.button("불러오기", key="payment_sheet_load"):
+    if st.button("1단계: 시트 구조 확인", key="payment_sheet_load"):
         if not pay_sheet_url.strip():
             st.error("링크를 붙여넣어주세요.")
         else:
@@ -1062,28 +1158,54 @@ with tab_finance:
                         st.error(f"❌ 구글시트 응답 오류 (코드 {res.status_code}). 잠시 후 다시 시도해주세요.")
                     else:
                         all_sheets = pd.read_excel(io.BytesIO(res.content), sheet_name=None, header=None, dtype=str)
-                        pay_rows, skipped_rows = [], 0
-                        existing_keys = {
-                            r["dedup_key"] for r in SUPA.table("payment_requests").select("dedup_key").execute().data
-                            if r.get("dedup_key")
-                        }
-                        for _, raw_df in all_sheets.items():
-                            if raw_df.empty:
-                                continue
-                            rows, n_skip = _parse_payment_sheet_positional(raw_df, existing_keys)
-                            pay_rows.extend(rows)
-                            skipped_rows += n_skip
-                        st.session_state["payment_rows_preview"] = pay_rows
-                        msg = f"{len(pay_rows)}명 새로 인식됨."
-                        if skipped_rows:
-                            msg += f" (이미 등록됐거나 형식이 안 맞는 {skipped_rows}행은 건너뜀)"
-                        st.success(msg)
+                        with st.spinner("Claude가 열 구성을 파악하는 중..."):
+                            mapping_desc = _ai_infer_column_mapping(all_sheets)
+                        st.session_state["payment_all_sheets"] = all_sheets
+                        st.session_state["payment_mapping_desc"] = mapping_desc or "(자동 파악 실패 — 그냥 2단계에서 바로 추출을 시도해볼게요)"
+                        st.session_state.pop("payment_rows_preview", None)
                 except Exception as e:
                     st.error(
                         f"시트를 못 읽었어요 ({e}).\n\n"
                         "**확인해주세요:** 구글시트 '공유' 설정이 '링크가 있는 모든 사용자 - 뷰어'로 되어있는지. "
                         "그래도 안 되면 아래 '📷 스크린샷으로 대신 올리기'를 이용해주세요."
                     )
+
+    mapping_desc = st.session_state.get("payment_mapping_desc")
+    if mapping_desc and st.session_state.get("payment_all_sheets") is not None:
+        st.info(f"🧐 **제가 파악한 열 구성이에요 — 맞는지 봐주세요:**\n\n{mapping_desc}")
+        mapping_correction = st.text_input(
+            "다르면 바로잡아주세요(선택)", key="mapping_correction",
+            placeholder="예: A열은 이름이 아니라 방문 장소예요, 이름은 C열이에요",
+        )
+        mc1, mc2 = st.columns(2)
+        if mc1.button("✅ 맞아요, 전체 추출 진행", key="confirm_mapping_proceed", type="primary", use_container_width=True):
+            all_sheets = st.session_state["payment_all_sheets"]
+            pay_rows, skipped_rows = [], 0
+            existing_keys = {
+                r["dedup_key"] for r in SUPA.table("payment_requests").select("dedup_key").execute().data
+                if r.get("dedup_key")
+            }
+            with st.spinner("Claude가 전체 내용을 읽는 중..."):
+                for _, raw_df in all_sheets.items():
+                    if raw_df.empty:
+                        continue
+                    rows, n_skip = _ai_extract_payment_rows(
+                        raw_df, existing_keys, extra_hint=mapping_correction.strip() or None,
+                    )
+                    pay_rows.extend(rows)
+                    skipped_rows += n_skip
+            st.session_state["payment_rows_preview"] = pay_rows
+            st.session_state.pop("payment_mapping_desc", None)
+            st.session_state.pop("payment_all_sheets", None)
+            msg = f"{len(pay_rows)}명 새로 인식됨."
+            if skipped_rows:
+                msg += f" (이미 등록됐거나 형식이 안 맞는 {skipped_rows}행은 건너뜀)"
+            st.success(msg)
+            st.rerun()
+        if mc2.button("❌ 다시 확인 (취소)", key="cancel_mapping", use_container_width=True):
+            st.session_state.pop("payment_mapping_desc", None)
+            st.session_state.pop("payment_all_sheets", None)
+            st.rerun()
 
     st.markdown("**또는, 더 간단하게:**")
     with st.expander("📷 스크린샷으로 대신 올리기 (시트 링크가 번거로우면 이쪽이 더 쉬워요)"):
