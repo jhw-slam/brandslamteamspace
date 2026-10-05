@@ -354,12 +354,22 @@ def _ai_infer_column_mapping(all_sheets):
         return None, f"예외 발생: {e}"
 
 
-def _ai_extract_payment_rows(raw_df, existing_keys, batch_size=20, extra_hint=None):
+def _ai_extract_payment_rows(raw_df, existing_keys, batch_size=20, extra_hint=None, report=None):
     """시트 양식이 제각각이라도(방문형/업로드형/기업형 등) Claude가 각 행의 '의미'를 보고
     알아서 이름/금액/결제수단/링크 등을 뽑아낸다 — 열 위치를 고정하지 않는다.
     헤더 텍스트가 구글폼 질문이라 믿을 수 없는 경우에도 셀 내용 자체로 판단한다."""
     api_key = os.environ.get("ANTHROPIC_API_KEY")
     rows, skipped = [], 0
+    if report is None:
+        report = {}
+    report.setdefault("errors", [])
+    report.setdefault("reasons", {})
+
+    def _why(reason, n=1):
+        report["reasons"][reason] = report["reasons"].get(reason, 0) + n
+
+    if not api_key:
+        report["errors"].append("ANTHROPIC_API_KEY 환경변수가 이 서비스에 설정돼 있지 않아요.")
     if not api_key or raw_df.empty or len(raw_df) < 2:
         return rows, max(0, len(raw_df) - 1)
 
@@ -396,26 +406,30 @@ def _ai_extract_payment_rows(raw_df, existing_keys, batch_size=20, extra_hint=No
                 timeout=60,
             )
             if res.status_code >= 300:
+                report["errors"].append(f"Claude API 응답 오류 (코드 {res.status_code}): {res.text[:200]}")
                 skipped += len(chunk)
                 continue
             text = "".join(b.get("text", "") for b in res.json().get("content", []) if b.get("type") == "text").strip()
-            if text.startswith("```"):
-                text = text.strip("`")
-                if text.startswith("json"):
-                    text = text[4:]
-            extracted = json.loads(text)
-        except Exception:
+            # 앞뒤에 설명이나 ```json 이 붙어 와도 JSON 배열 부분만 꺼낸다
+            lb, rb = text.find("["), text.rfind("]")
+            if lb == -1 or rb <= lb:
+                raise ValueError(f"JSON 배열을 못 찾음. 응답 앞부분: {text[:120]}")
+            extracted = json.loads(text[lb:rb + 1])
+        except Exception as e:
+            report["errors"].append(f"{start + 1}~{start + len(chunk)}행 처리 실패 ({type(e).__name__}: {e})")
             skipped += len(chunk)
             continue
 
         for item in extracted:
             if not isinstance(item, dict) or item.get("skip"):
                 skipped += 1
+                _why("AI가 송금 정보가 아닌 행(안내문·빈 줄 등)으로 판단")
                 continue
             name = str(item.get("influencer_name") or "").strip()
             amount = _clean_number(item.get("amount"))
             if not name or amount is None:
                 skipped += 1
+                _why("이름 또는 금액을 못 찾음")
                 continue
 
             payment_method_raw = item.get("payment_method_raw")
@@ -433,6 +447,7 @@ def _ai_extract_payment_rows(raw_df, existing_keys, batch_size=20, extra_hint=No
             dedup_key = hashlib.md5(dedup_src.encode("utf-8")).hexdigest()
             if dedup_key in existing_keys:
                 skipped += 1
+                _why("이미 등록된 건(중복)")
                 continue
 
             rows.append({
@@ -1340,6 +1355,7 @@ with tab_finance:
         if mc1.button("✅ 맞아요, 전체 추출 진행", key="confirm_mapping_proceed", type="primary", use_container_width=True):
             all_sheets = st.session_state["payment_all_sheets"]
             pay_rows, skipped_rows = [], 0
+            extract_report = {"errors": [], "reasons": {}}
             existing_keys = {
                 r["dedup_key"] for r in SUPA.table("payment_requests").select("dedup_key").execute().data
                 if r.get("dedup_key")
@@ -1350,17 +1366,30 @@ with tab_finance:
                         continue
                     rows, n_skip = _ai_extract_payment_rows(
                         raw_df, existing_keys, extra_hint=mapping_correction.strip() or None,
+                        report=extract_report,
                     )
                     pay_rows.extend(rows)
                     skipped_rows += n_skip
-            st.session_state["payment_rows_preview"] = pay_rows
-            st.session_state.pop("payment_mapping_desc", None)
-            st.session_state.pop("payment_all_sheets", None)
-            msg = f"{len(pay_rows)}명 새로 인식됨."
-            if skipped_rows:
-                msg += f" (이미 등록됐거나 형식이 안 맞는 {skipped_rows}행은 건너뜀)"
-            st.success(msg)
-            st.rerun()
+            reason_lines = "".join(f"\n- {k}: {v}행" for k, v in extract_report["reasons"].items())
+            if not pay_rows:
+                # 0건이면 화면을 초기화하지 않고(=다시 시도할 수 있게) 이유를 그대로 보여준다
+                err_lines = "".join(f"\n- {e}" for e in dict.fromkeys(extract_report["errors"]))
+                st.error(
+                    "❌ 새로 인식된 송금 건이 0건이에요. 아래 이유를 확인해주세요." + (f"\n\n**오류**{err_lines}" if err_lines else "")
+                    + (f"\n\n**건너뛴 이유**{reason_lines}" if reason_lines else "")
+                    + "\n\n제목줄 행 번호나 위의 '열 구성 보정'을 고친 뒤 다시 눌러보세요."
+                )
+            else:
+                msg = f"✅ {len(pay_rows)}명 새로 인식됨."
+                if skipped_rows:
+                    msg += f" (건너뜀 {skipped_rows}행){reason_lines}"
+                if extract_report["errors"]:
+                    msg += "\n\n⚠️ 일부 구간은 처리하지 못했어요:" + "".join(f"\n- {e}" for e in dict.fromkeys(extract_report["errors"]))
+                st.session_state["payment_rows_preview"] = pay_rows
+                st.session_state["payment_extract_msg"] = msg
+                st.session_state.pop("payment_mapping_desc", None)
+                st.session_state.pop("payment_all_sheets", None)
+                st.rerun()
         if mc2.button("❌ 다시 확인 (취소)", key="cancel_mapping", use_container_width=True):
             st.session_state.pop("payment_mapping_desc", None)
             st.session_state.pop("payment_all_sheets", None)
@@ -1462,6 +1491,8 @@ with tab_finance:
                     st.rerun()
 
     pay_preview = st.session_state.get("payment_rows_preview")
+    if st.session_state.get("payment_extract_msg") and pay_preview:
+        st.success(st.session_state["payment_extract_msg"])
     if pay_preview:
         REQUIRED_FIELDS = ["influencer_name", "amount", "payment_method_raw", "content_link", "id_doc_link", "scheduled_date", "brand_names"]
         FIELD_LABEL = {
