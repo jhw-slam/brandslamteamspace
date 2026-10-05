@@ -647,7 +647,7 @@ def refresh():
 
 
 my_name = st.selectbox("내 이름", STAFF_NAMES, key="my_name")
-ROLE_MAP = {"김선재": "sales", "곽재선": "influencer", "구정회": "dev", "이단우": "china_ops"}
+ROLE_MAP = {"김선재": "sales", "곽재선": "influencer", "구정회": "dev", "이단우": "china_ops", "가상인턴": "sales"}  # 가상인턴=테스트 계정(세일즈 화면 시험용)
 my_role = ROLE_MAP.get(my_name)
 
 
