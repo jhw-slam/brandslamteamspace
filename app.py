@@ -176,7 +176,7 @@ def _ai_infer_column_mapping(all_sheets):
     (예: 'A열이 이름이 맞나요?'에 해당하는 사전 점검 단계)."""
     api_key = os.environ.get("ANTHROPIC_API_KEY")
     if not api_key:
-        return None
+        return None, "ANTHROPIC_API_KEY 환경변수가 이 앱(brandslamteamspace)에 설정되어 있지 않아요."
     sheet_samples = {}
     for name, raw_df in all_sheets.items():
         if raw_df.empty:
@@ -185,7 +185,7 @@ def _ai_infer_column_mapping(all_sheets):
         sample_rows = raw_df.iloc[1:3].fillna("").astype(str).values.tolist()
         sheet_samples[name] = {"header": header, "sample_rows": sample_rows}
     if not sheet_samples:
-        return None
+        return None, "시트에서 읽을 데이터를 못 찾았어요(빈 시트)."
 
     system = (
         "너는 스프레드시트의 열 구성을 사람에게 짧게 설명해주는 보조원이다. 헤더 텍스트와 샘플 행 1~2개를 보고, "
@@ -203,10 +203,11 @@ def _ai_infer_column_mapping(all_sheets):
             timeout=30,
         )
         if res.status_code >= 300:
-            return None
-        return "".join(b.get("text", "") for b in res.json().get("content", []) if b.get("type") == "text").strip()
-    except Exception:
-        return None
+            return None, f"API 오류 {res.status_code}: {res.text[:300]}"
+        text = "".join(b.get("text", "") for b in res.json().get("content", []) if b.get("type") == "text").strip()
+        return text, None
+    except Exception as e:
+        return None, f"예외 발생: {e}"
 
 
 def _ai_extract_payment_rows(raw_df, existing_keys, batch_size=20, extra_hint=None):
@@ -338,128 +339,6 @@ my_name = st.selectbox("내 이름", STAFF_NAMES, key="my_name")
 ROLE_MAP = {"김선재": "sales", "곽재선": "influencer", "구정회": "dev", "이단우": "china_ops"}
 my_role = ROLE_MAP.get(my_name)
 
-# ── 📋 채워주세요! (30분마다 도는 완성도 체크가 찾아낸 빈 정보) ──
-open_prompts = (
-    SUPA.table("data_completeness_prompts")
-    .select("*").eq("person", my_name).eq("status", "open")
-    .order("created_at", desc=True).execute().data
-)
-if open_prompts:
-    st.warning(f"📋 **현황판을 완성하려면 아래 {len(open_prompts)}건이 필요해요** (자동으로 채워지지 않아서 직접 확인 부탁드려요)")
-    for p in open_prompts:
-        pc1, pc2 = st.columns([5, 1])
-        pc1.caption(f"• {p['message']}")
-        if pc2.button("✅ 처리함", key=f"resolve_prompt_{p['id']}"):
-            SUPA.table("data_completeness_prompts").update({
-                "status": "dismissed",
-            }).eq("id", p["id"]).execute()
-            st.rerun()
-
-# ── 🤖 AI가 미리 준비해둔 내용 (구글드라이브 등에서 발견, 본인 확인만 하면 됨) ──
-ai_drafts = (
-    SUPA.table("ai_drafted_updates").select("*")
-    .eq("person", my_name).eq("status", "pending")
-    .order("created_at", desc=True).execute().data
-)
-if ai_drafts:
-    st.info(f"🤖 **구글드라이브 등에서 업무 관련 내용을 확인했어요** — 아래 {len(ai_drafts)}건, 맞는지만 봐주세요")
-    for d in ai_drafts:
-        with st.container(border=True):
-            st.write(d["draft_content"])
-            dc1, dc2 = st.columns([1, 2])
-            if dc1.button("✅ 맞아요, 문제없어요", key=f"confirm_draft_{d['id']}", use_container_width=True):
-                SUPA.table("ai_drafted_updates").update({
-                    "status": "applied", "resolved_at": pd.Timestamp.now(tz="UTC").isoformat(),
-                }).eq("id", d["id"]).execute()
-                st.rerun()
-            correction = dc2.text_input(
-                "틀린 부분 있으면 여기에 자유롭게 적어주세요", key=f"correction_{d['id']}",
-                placeholder="예: 계약 시작일은 9/1이 아니라 9/15이에요",
-            )
-            if correction.strip() and st.button("📝 수정사항 제출", key=f"submit_correction_{d['id']}"):
-                SUPA.table("ai_drafted_updates").update({
-                    "status": "correction_requested", "correction_note": correction.strip(),
-                }).eq("id", d["id"]).execute()
-                st.success("제출 완료! 30분 안에 알아서 정리해둘게요.")
-                st.rerun()
-
-# ── 📼 세일즈 전용: 등록된 업체명이 언급된 회의만 알림 (기밀 보호) ──
-if my_role == "sales":
-    sales_alerts = (
-        SUPA.table("sales_meeting_alerts").select("*")
-        .eq("person", my_name).eq("status", "open")
-        .order("meeting_date", desc=True).execute().data
-    )
-    if sales_alerts:
-        st.info(f"📼 **담당하시는 업체 관련 회의가 있었어요** — {len(sales_alerts)}건 (등록된 업체명이 언급된 회의만 보여드려요)")
-        for al in sales_alerts:
-            with st.container(border=True):
-                when = al["meeting_date"][:10] if al.get("meeting_date") else ""
-                st.markdown(f"**[{al['brand_matched']}]** {al.get('meeting_title') or ''} · {when}")
-                if al.get("summary_snippet"):
-                    st.caption(al["summary_snippet"])
-                ac1, ac2 = st.columns(2)
-                if ac1.button("✅ 업무보고에 반영해주세요", key=f"reflect_meeting_{al['id']}", use_container_width=True):
-                    SUPA.table("ai_drafted_updates").insert({
-                        "person": my_name, "source": "meeting", "source_ref": str(al["meeting_id"]),
-                        "target_table": "sales_accounts",
-                        "draft_content": f"[{al['brand_matched']}] 관련 회의 내용: {al.get('summary_snippet') or ''}",
-                    }).execute()
-                    SUPA.table("sales_meeting_alerts").update({"status": "reflected"}).eq("id", al["id"]).execute()
-                    st.success("반영 요청 접수! 위 'AI가 준비해둔 내용'에서 곧 확인하실 수 있어요.")
-                    st.rerun()
-                if ac2.button("그냥 참고만 할게요", key=f"dismiss_meeting_{al['id']}", use_container_width=True):
-                    SUPA.table("sales_meeting_alerts").update({"status": "dismissed"}).eq("id", al["id"]).execute()
-                    st.rerun()
-
-# ── 🧭 내 KPI 데이터 정렬 제안 (kpi_gap만 — 본인 데이터라 바로 처리) ──
-my_kpi_gaps = (
-    SUPA.table("kpi_alignment_suggestions").select("*")
-    .eq("person", my_name).eq("status", "open").eq("suggestion_type", "kpi_gap")
-    .order("created_at", desc=True).execute().data
-)
-if my_kpi_gaps:
-    st.info(f"🧭 **내 KPI 추적 관련 제안이 있어요** — {len(my_kpi_gaps)}건 (Claude가 목표랑 실제 데이터를 비교해서 찾은 것)")
-    for g in my_kpi_gaps:
-        with st.container(border=True):
-            st.write(g["suggestion_text"])
-            gl1, gl2 = st.columns([3, 1])
-            sheet_link = gl1.text_input(
-                "이 KPI를 추적할 구글시트 링크(있으면)", key=f"kpigap_link_{g['id']}",
-                placeholder="https://docs.google.com/spreadsheets/...", label_visibility="collapsed",
-            )
-            if gl2.button("등록", key=f"kpigap_register_{g['id']}", use_container_width=True):
-                if sheet_link.strip():
-                    SUPA.table("kpi_data_sources").insert({
-                        "person": my_name, "related_suggestion_text": g["suggestion_text"],
-                        "source_url": sheet_link.strip(),
-                    }).execute()
-                SUPA.table("kpi_alignment_suggestions").update({"status": "applied"}).eq("id", g["id"]).execute()
-                st.success("등록 완료! 다음부터 이 소스를 참고해서 분석할게요.")
-                st.rerun()
-            if st.button("아직 없어요 / 나중에", key=f"kpigap_skip_{g['id']}"):
-                SUPA.table("kpi_alignment_suggestions").update({"status": "dismissed"}).eq("id", g["id"]).execute()
-                st.rerun()
-
-st.divider()
-
-# ══════════════════════════════════════════════════════════
-# 🧭 회사 비전 (항상 보임 — 모두가 바라보는 방향)
-# ══════════════════════════════════════════════════════════
-vision_data = SUPA.table("company_vision").select("*").order("updated_at", desc=True).limit(1).execute().data
-if vision_data:
-    v = vision_data[0]
-    st.markdown(
-        f"""<div style="background: linear-gradient(135deg, #10234f, #2e5597); padding: 20px 28px; border-radius: 16px 16px 0 0;">
-<div style="color: #FFD700; font-size: 13px; font-weight: 800; letter-spacing: 3px;">VISION</div>
-<div style="color: white; font-size: 28px; font-weight: 800; margin-top: 4px;">{v['title']}</div>
-</div>""",
-        unsafe_allow_html=True,
-    )
-    with st.container(border=True):
-        st.markdown(v["content"])
-
-st.divider()
 
 st.markdown("""
 <style>
@@ -495,9 +374,134 @@ div[data-testid="stVerticalBlockBorderWrapper"] {
 </style>
 """, unsafe_allow_html=True)
 
-tab_okr, tab_log, tab_campaign, tab_finance, tab_mywork, tab_summary, tab_org = st.tabs([
-    "🎯 목표", "📝 오늘 기록", "📋 캠페인", "💰 재무", "🧰 내 업무", "📊 요약", "🏢 조직도",
+tab_home, tab_okr, tab_log, tab_campaign, tab_finance, tab_mywork, tab_summary, tab_org = st.tabs([
+    "🏠 홈", "🎯 목표", "📝 오늘 기록", "📋 캠페인", "💰 재무", "🧰 내 업무", "📊 요약", "🏢 조직도",
 ])
+
+with tab_home:
+    # ── 📋 채워주세요! (30분마다 도는 완성도 체크가 찾아낸 빈 정보) ──
+    open_prompts = (
+        SUPA.table("data_completeness_prompts")
+        .select("*").eq("person", my_name).eq("status", "open")
+        .order("created_at", desc=True).execute().data
+    )
+    if open_prompts:
+        st.warning(f"📋 **현황판을 완성하려면 아래 {len(open_prompts)}건이 필요해요** (자동으로 채워지지 않아서 직접 확인 부탁드려요)")
+        for p in open_prompts:
+            pc1, pc2 = st.columns([5, 1])
+            pc1.caption(f"• {p['message']}")
+            if pc2.button("✅ 처리함", key=f"resolve_prompt_{p['id']}"):
+                SUPA.table("data_completeness_prompts").update({
+                    "status": "dismissed",
+                }).eq("id", p["id"]).execute()
+                st.rerun()
+
+    # ── 🤖 AI가 미리 준비해둔 내용 (구글드라이브 등에서 발견, 본인 확인만 하면 됨) ──
+    ai_drafts = (
+        SUPA.table("ai_drafted_updates").select("*")
+        .eq("person", my_name).eq("status", "pending")
+        .order("created_at", desc=True).execute().data
+    )
+    if ai_drafts:
+        st.info(f"🤖 **구글드라이브 등에서 업무 관련 내용을 확인했어요** — 아래 {len(ai_drafts)}건, 맞는지만 봐주세요")
+        for d in ai_drafts:
+            with st.container(border=True):
+                st.write(d["draft_content"])
+                dc1, dc2 = st.columns([1, 2])
+                if dc1.button("✅ 맞아요, 문제없어요", key=f"confirm_draft_{d['id']}", use_container_width=True):
+                    SUPA.table("ai_drafted_updates").update({
+                        "status": "applied", "resolved_at": pd.Timestamp.now(tz="UTC").isoformat(),
+                    }).eq("id", d["id"]).execute()
+                    st.rerun()
+                correction = dc2.text_input(
+                    "틀린 부분 있으면 여기에 자유롭게 적어주세요", key=f"correction_{d['id']}",
+                    placeholder="예: 계약 시작일은 9/1이 아니라 9/15이에요",
+                )
+                if correction.strip() and st.button("📝 수정사항 제출", key=f"submit_correction_{d['id']}"):
+                    SUPA.table("ai_drafted_updates").update({
+                        "status": "correction_requested", "correction_note": correction.strip(),
+                    }).eq("id", d["id"]).execute()
+                    st.success("제출 완료! 30분 안에 알아서 정리해둘게요.")
+                    st.rerun()
+
+    # ── 📼 세일즈 전용: 등록된 업체명이 언급된 회의만 알림 (기밀 보호) ──
+    if my_role == "sales":
+        sales_alerts = (
+            SUPA.table("sales_meeting_alerts").select("*")
+            .eq("person", my_name).eq("status", "open")
+            .order("meeting_date", desc=True).execute().data
+        )
+        if sales_alerts:
+            st.info(f"📼 **담당하시는 업체 관련 회의가 있었어요** — {len(sales_alerts)}건 (등록된 업체명이 언급된 회의만 보여드려요)")
+            for al in sales_alerts:
+                with st.container(border=True):
+                    when = al["meeting_date"][:10] if al.get("meeting_date") else ""
+                    st.markdown(f"**[{al['brand_matched']}]** {al.get('meeting_title') or ''} · {when}")
+                    if al.get("summary_snippet"):
+                        st.caption(al["summary_snippet"])
+                    ac1, ac2 = st.columns(2)
+                    if ac1.button("✅ 업무보고에 반영해주세요", key=f"reflect_meeting_{al['id']}", use_container_width=True):
+                        SUPA.table("ai_drafted_updates").insert({
+                            "person": my_name, "source": "meeting", "source_ref": str(al["meeting_id"]),
+                            "target_table": "sales_accounts",
+                            "draft_content": f"[{al['brand_matched']}] 관련 회의 내용: {al.get('summary_snippet') or ''}",
+                        }).execute()
+                        SUPA.table("sales_meeting_alerts").update({"status": "reflected"}).eq("id", al["id"]).execute()
+                        st.success("반영 요청 접수! 위 'AI가 준비해둔 내용'에서 곧 확인하실 수 있어요.")
+                        st.rerun()
+                    if ac2.button("그냥 참고만 할게요", key=f"dismiss_meeting_{al['id']}", use_container_width=True):
+                        SUPA.table("sales_meeting_alerts").update({"status": "dismissed"}).eq("id", al["id"]).execute()
+                        st.rerun()
+
+    # ── 🧭 내 KPI 데이터 정렬 제안 (kpi_gap만 — 본인 데이터라 바로 처리) ──
+    my_kpi_gaps = (
+        SUPA.table("kpi_alignment_suggestions").select("*")
+        .eq("person", my_name).eq("status", "open").eq("suggestion_type", "kpi_gap")
+        .order("created_at", desc=True).execute().data
+    )
+    if my_kpi_gaps:
+        st.info(f"🧭 **내 KPI 추적 관련 제안이 있어요** — {len(my_kpi_gaps)}건 (Claude가 목표랑 실제 데이터를 비교해서 찾은 것)")
+        for g in my_kpi_gaps:
+            with st.container(border=True):
+                st.write(g["suggestion_text"])
+                gl1, gl2 = st.columns([3, 1])
+                sheet_link = gl1.text_input(
+                    "이 KPI를 추적할 구글시트 링크(있으면)", key=f"kpigap_link_{g['id']}",
+                    placeholder="https://docs.google.com/spreadsheets/...", label_visibility="collapsed",
+                )
+                if gl2.button("등록", key=f"kpigap_register_{g['id']}", use_container_width=True):
+                    if sheet_link.strip():
+                        SUPA.table("kpi_data_sources").insert({
+                            "person": my_name, "related_suggestion_text": g["suggestion_text"],
+                            "source_url": sheet_link.strip(),
+                        }).execute()
+                    SUPA.table("kpi_alignment_suggestions").update({"status": "applied"}).eq("id", g["id"]).execute()
+                    st.success("등록 완료! 다음부터 이 소스를 참고해서 분석할게요.")
+                    st.rerun()
+                if st.button("아직 없어요 / 나중에", key=f"kpigap_skip_{g['id']}"):
+                    SUPA.table("kpi_alignment_suggestions").update({"status": "dismissed"}).eq("id", g["id"]).execute()
+                    st.rerun()
+
+    st.divider()
+
+    # ══════════════════════════════════════════════════════════
+    # 🧭 회사 비전 (항상 보임 — 모두가 바라보는 방향)
+    # ══════════════════════════════════════════════════════════
+    vision_data = SUPA.table("company_vision").select("*").order("updated_at", desc=True).limit(1).execute().data
+    if vision_data:
+        v = vision_data[0]
+        st.markdown(
+            f"""<div style="background: linear-gradient(135deg, #10234f, #2e5597); padding: 20px 28px; border-radius: 16px 16px 0 0;">
+    <div style="color: #FFD700; font-size: 13px; font-weight: 800; letter-spacing: 3px;">VISION</div>
+    <div style="color: white; font-size: 28px; font-weight: 800; margin-top: 4px;">{v['title']}</div>
+    </div>""",
+            unsafe_allow_html=True,
+        )
+        with st.container(border=True):
+            st.markdown(v["content"])
+
+    st.divider()
+
 
 with tab_okr:
     # ══════════════════════════════════════════════════════════
@@ -1129,7 +1133,7 @@ with tab_finance:
     )
     dl1, dl2 = st.columns([1, 3])
     dl1.download_button(
-        "📋 표준 양식 다운로드", data=PAYMENT_TEMPLATE_CSV, file_name="송금정보_양식.csv",
+        "📋 표준 양식 다운로드", data=PAYMENT_TEMPLATE_CSV.encode("utf-8-sig"), file_name="송금정보_양식.csv",
         mime="text/csv", key="download_payment_template",
     )
     dl2.caption("이 양식대로 채우시면 가장 정확하게 인식돼요. 다른 형식(기존에 쓰시던 시트)도 AI가 알아서 읽어보려 시도합니다.")
@@ -1159,9 +1163,13 @@ with tab_finance:
                     else:
                         all_sheets = pd.read_excel(io.BytesIO(res.content), sheet_name=None, header=None, dtype=str)
                         with st.spinner("Claude가 열 구성을 파악하는 중..."):
-                            mapping_desc = _ai_infer_column_mapping(all_sheets)
+                            mapping_desc, mapping_err = _ai_infer_column_mapping(all_sheets)
                         st.session_state["payment_all_sheets"] = all_sheets
-                        st.session_state["payment_mapping_desc"] = mapping_desc or "(자동 파악 실패 — 그냥 2단계에서 바로 추출을 시도해볼게요)"
+                        if mapping_desc:
+                            st.session_state["payment_mapping_desc"] = mapping_desc
+                        else:
+                            st.session_state["payment_mapping_desc"] = f"(자동 파악 실패: {mapping_err} — 그냥 2단계에서 바로 추출을 시도해볼게요)"
+                            st.warning(f"⚠️ 열 구조 파악 실패 — {mapping_err}")
                         st.session_state.pop("payment_rows_preview", None)
                 except Exception as e:
                     st.error(
@@ -1225,8 +1233,24 @@ with tab_finance:
                 shot_rows = []
                 with st.spinner("Claude가 스크린샷을 읽는 중..."):
                     for f in shot_files:
-                        img_b64 = base64.b64encode(f.getvalue()).decode("utf-8")
+                        img_bytes = f.getvalue()
                         media_type = f.type or "image/png"
+                        # 전체화면 캡처는 해상도가 너무 커서 API가 거부(400)하는 경우가 많아, 가로/세로 1568px로 축소
+                        try:
+                            from PIL import Image
+                            img = Image.open(io.BytesIO(img_bytes))
+                            img = img.convert("RGB")
+                            max_dim = 1568
+                            if max(img.size) > max_dim:
+                                ratio = max_dim / max(img.size)
+                                img = img.resize((int(img.width * ratio), int(img.height * ratio)))
+                            buf = io.BytesIO()
+                            img.save(buf, format="JPEG", quality=85)
+                            img_bytes = buf.getvalue()
+                            media_type = "image/jpeg"
+                        except Exception as resize_err:
+                            st.caption(f"{f.name}: 리사이즈 건너뜀({resize_err}), 원본으로 시도")
+                        img_b64 = base64.b64encode(img_bytes).decode("utf-8")
                         sys_prompt = (
                             "이 이미지는 인플루언서 송금 정보 화면(또는 메시지)이다. 다음 정보를 찾아서 JSON으로만 출력해라: "
                             "{\"influencer_name\": \"...\", \"amount\": 숫자(원화 기준, 콤마/₩ 제외), "
@@ -1248,7 +1272,7 @@ with tab_finance:
                                 timeout=30,
                             )
                             if r.status_code >= 300:
-                                st.warning(f"{f.name}: 읽기 실패 ({r.status_code})")
+                                st.warning(f"{f.name}: 읽기 실패 ({r.status_code}) — {r.text[:300]}")
                                 continue
                             text = "".join(b.get("text", "") for b in r.json().get("content", []) if b.get("type") == "text").strip()
                             if text.startswith("```"):
