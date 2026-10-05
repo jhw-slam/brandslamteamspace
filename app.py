@@ -346,6 +346,56 @@ def _drive_q(text):
     return str(text).replace("\\", "\\\\").replace("'", "\\'")
 
 
+class _DriveError(Exception):
+    """드라이브 호출 실패 — 메시지를 그대로 화면에 보여준다."""
+
+
+def _sa_field(key):
+    try:
+        return json.loads(os.environ.get("GOOGLE_SERVICE_ACCOUNT_JSON") or "{}").get(key)
+    except Exception:
+        return None
+
+
+def _google_error_parts(res):
+    """구글 오류 응답에서 (error.message, error.errors[0].reason, error.details[].reason 목록)을 꺼낸다."""
+    try:
+        err = res.json().get("error", {})
+    except Exception:
+        return (res.text or "")[:200], None, []
+    if not isinstance(err, dict):
+        return str(err)[:200], None, []
+    errors = err.get("errors") or []
+    reason = errors[0].get("reason") if errors and isinstance(errors[0], dict) else None
+    details = [d.get("reason") for d in (err.get("details") or []) if isinstance(d, dict) and d.get("reason")]
+    return (err.get("message") or (res.text or "")[:200]), reason, details
+
+
+def _drive_http_error(res, target="최상위 폴더"):
+    """드라이브 오류 응답을 원인별 안내 + 구글이 보낸 원문(message/reason)으로 바꾼다."""
+    message, reason, details = _google_error_parts(res)
+    code = res.status_code
+    email = _sa_field("client_email") or "(서비스계정 이메일)"
+    if reason in ("accessNotConfigured", "SERVICE_DISABLED") or "SERVICE_DISABLED" in details:
+        project = _sa_field("project_id") or "<서비스계정 JSON의 project_id>"
+        head = (f"Drive API가 꺼져 있어요. 아래 링크에서 '사용'을 눌러 켜주세요 (켠 뒤 몇 분 걸릴 수 있어요):\n"
+                f"https://console.cloud.google.com/apis/library/drive.googleapis.com?project={project}")
+    elif code == 404:
+        head = (f"{target}을(를) 못 찾았어요 (404). **서비스계정이 공유 드라이브 멤버가 아니에요.** "
+                f"공유 드라이브라면 그 드라이브에 `{email}` 을(를) 멤버(뷰어 이상)로 추가해주세요. "
+                "일반 폴더라면 폴더 공유에 같은 이메일을 뷰어로 추가하고, DRIVE_FOLDER_ID가 맞는지도 확인해주세요.")
+    elif code == 403:
+        head = (f"{target}을(를) 열 권한이 없어요 (403). 폴더 공유에 `{email}` 을(를) 뷰어로 추가해주세요.")
+    elif code == 401:
+        head = "구글 인증이 거부됐어요 (401). GOOGLE_SERVICE_ACCOUNT_JSON 값이 맞는지 확인해주세요."
+    else:
+        head = f"드라이브 응답 오류 (코드 {code})."
+    raw = f"구글 응답: {message}" + (f" (reason: {reason})" if reason else "")
+    if details and set(details) - {reason}:
+        raw += f" [details: {', '.join(dict.fromkeys(details))}]"
+    return f"{head}\n\n{raw}"
+
+
 def _drive_list(token, q, fields="id,name,mimeType,webViewLink,modifiedTime,parents", page_cap=5):
     """드라이브 files.list를 페이지 끝까지(최대 page_cap쪽) 읽는다. 공유 드라이브 포함."""
     out, page_token = [], None
@@ -358,7 +408,7 @@ def _drive_list(token, q, fields="id,name,mimeType,webViewLink,modifiedTime,pare
             params["pageToken"] = page_token
         res = requests.get(_DRIVE_API, params=params, headers={"Authorization": f"Bearer {token}"}, timeout=30)
         if res.status_code != 200:
-            raise RuntimeError(f"드라이브 응답 오류 {res.status_code}: {res.text[:200]}")
+            raise _DriveError(_drive_http_error(res, "폴더 목록"))
         data = res.json()
         out.extend(data.get("files", []))
         page_token = data.get("nextPageToken")
@@ -381,13 +431,8 @@ def _drive_find_contracts(brand_name, campaign_name="", max_folders=400):
             f"{_DRIVE_API}/{root}", params={"fields": "id,name", "supportsAllDrives": "true"},
             headers={"Authorization": f"Bearer {token}"}, timeout=30,
         )
-        if meta.status_code in (403, 404):
-            return [], None, (
-                f"최상위 폴더({root})를 못 열었어요 (코드 {meta.status_code}). "
-                f"구글드라이브에서 그 폴더 **공유**에 서비스계정 이메일 `{sa_email}` 을(를) **뷰어**로 추가해주세요. "
-                "(크론의 드라이브 스캔이 0건이던 것도 같은 이유일 가능성이 높아요)")
         if meta.status_code != 200:
-            return [], None, f"드라이브 응답 오류 {meta.status_code}: {meta.text[:200]}"
+            return [], None, _drive_http_error(meta, f"최상위 폴더({root})")
 
         # 1) 하위 폴더 전체를 층별로 훑어서 {폴더ID: (이름, 부모ID)} 로 만든다
         folders = {root: (meta.json().get("name", ""), None)}
@@ -444,11 +489,28 @@ def _drive_find_contracts(brand_name, campaign_name="", max_folders=400):
                 "id": f["id"], "name": f["name"], "path": fpath, "link": f.get("webViewLink"),
                 "modified": (f.get("modifiedTime") or "")[:10], "score": score,
             })
+        # 이름에 '계약서'가 들어간 폴더는 폴더 자체를 후보로 제안한다(브랜드명이 경로에 있으면 더 위로)
+        n_files = len(cands)
+        for fid in ids:
+            fname = folders[fid][0]
+            if fid == root or "계약서" not in fname:
+                continue
+            fpath_full = path_of(fid)
+            parent_id = folders[fid][1]
+            score = 4 + (3 if brand_l and brand_l in fpath_full.lower() else 0) + (1 if camp_l and camp_l in fpath_full.lower() else 0)
+            cands.append({
+                "id": fid, "name": fname, "path": path_of(parent_id) if parent_id in folders else "",
+                "link": f"https://drive.google.com/drive/folders/{fid}", "modified": "", "score": score, "kind": "folder",
+            })
+        n_folders = len(cands) - n_files
         cands.sort(key=lambda c: (c["score"], c["modified"]), reverse=True)
-        note = f"폴더 {len(folders)}개를 훑어서 '{brand}' 관련 파일 {len(cands)}개를 찾았어요."
+        note = f"폴더 {len(folders)}개를 훑어서 '계약서' 폴더 {n_folders}개"
+        note += f", '{brand}' 관련 파일 {n_files}개를 찾았어요." if brand else "를 찾았어요. (브랜드명을 입력하면 그 브랜드 파일도 같이 찾아요)"
         if len(folders) >= max_folders:
             note += f" (폴더가 많아서 앞 {max_folders}개까지만 훑었어요)"
         return cands[:20], note, None
+    except _DriveError as e:
+        return [], None, str(e)
     except Exception as e:
         return [], None, f"드라이브에서 찾는 중 문제가 생겼어요 ({type(e).__name__}: {e})"
 
@@ -2074,17 +2136,20 @@ with tab_mywork:
                     else:
                         st.caption(drive_res["note"])
                         if not drive_res["cands"]:
-                            st.warning("관련 파일을 못 찾았어요. 파일 이름이나 폴더 이름에 브랜드명이 들어 있는지 확인하시거나, 위에서 직접 올려주세요.")
+                            st.warning("'계약서'가 들어간 폴더도, 브랜드명이 들어간 파일도 못 찾았어요. 폴더·파일 이름을 확인하시거나, 위에서 직접 올려주세요.")
                         else:
                             by_id = {c["id"]: c for c in drive_res["cands"]}
                             pick_id = st.radio(
-                                "찾은 파일 중 이 캠페인의 계약서를 골라주세요", list(by_id.keys()), index=None,
-                                format_func=lambda fid: f"{by_id[fid]['name']}  ·  {by_id[fid]['path'] or '(최상위)'}  ·  수정 {by_id[fid]['modified'] or '-'}",
+                                "찾은 폴더·파일 중 이 캠페인의 계약서를 골라주세요", list(by_id.keys()), index=None,
+                                format_func=lambda fid: (
+                                        f"📁 {by_id[fid]['name']}  ·  {by_id[fid]['path'] or '(최상위)'}  ·  폴더" if by_id[fid].get("kind") == "folder"
+                                        else f"📄 {by_id[fid]['name']}  ·  {by_id[fid]['path'] or '(최상위)'}  ·  수정 {by_id[fid]['modified'] or '-'}"
+                                    ),
                                 key=f"camp_drive_pick_{cv}",
                             )
                             drive_pick = by_id.get(pick_id)
                             if drive_pick and drive_pick.get("link"):
-                                st.markdown(f"👉 [선택한 파일 미리 열어보기]({drive_pick['link']})")
+                                st.markdown(f"👉 [선택한 항목 드라이브에서 열어보기]({drive_pick['link']})")
 
                 if st.button("등록 (4주 루틴 자동 생성)", type="primary", key=f"camp_new_submit_{cv}"):
                     if not camp_name.strip():
@@ -2130,7 +2195,8 @@ with tab_mywork:
                             except Exception as e:
                                 st.warning(f"계약서 업로드는 실패했지만 캠페인은 등록됐어요 ({type(e).__name__}: {e})")
                         elif drive_pick and drive_res and drive_res["brand"] == camp_brand_for_drive:
-                            contract_url, contract_name = drive_pick.get("link"), drive_pick["name"]
+                            contract_url = drive_pick.get("link")
+                            contract_name = f"📁 {drive_pick['name']}" if drive_pick.get("kind") == "folder" else drive_pick["name"]
                         if contract_url:
                             try:
                                 SUPA.table("sales_campaigns").update({
