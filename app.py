@@ -342,6 +342,11 @@ def _drive_token():
         return None, email, f"구글 인증에 실패했어요 ({type(e).__name__}: {e})"
 
 
+def _drive_norm(text):
+    """비교용으로 공백·기호를 없애고 소문자로 맞춘다. 'Farm Skin_방문형' → 'farmskin방문형'"""
+    return re.sub(r"[^0-9a-z가-힣]", "", str(text or "").lower())
+
+
 def _drive_q(text):
     return str(text).replace("\\", "\\\\").replace("'", "\\'")
 
@@ -417,8 +422,8 @@ def _drive_list(token, q, fields="id,name,mimeType,webViewLink,modifiedTime,pare
     return out
 
 
-def _drive_find_contracts(brand_name, campaign_name="", max_folders=400):
-    """DRIVE_FOLDER_ID(최상위 폴더) 아래 모든 하위 폴더를 훑어서, 브랜드 이름이 파일명/폴더명에 들어간 파일을 찾는다.
+def _drive_find_contracts(brand_name, campaign_name="", max_folders=400, max_show=60):
+    """DRIVE_FOLDER_ID(최상위 폴더) 아래 모든 하위 폴더를 훑어서, 이름에 '계약'이 들어간 폴더와 업체명이 들어간 폴더·파일을 찾는다.
     반환: (후보 목록, 안내문구, 에러문구). 후보: {'id','name','path','link','modified','score'}"""
     root = os.environ.get("DRIVE_FOLDER_ID")
     if not root:
@@ -455,60 +460,95 @@ def _drive_find_contracts(brand_name, campaign_name="", max_folders=400):
             return " / ".join(reversed(names))
 
         brand = (brand_name or "").strip()
-        brand_l = brand.lower()
-        camp_l = (campaign_name or "").strip().lower()
-        # 2) 파일명에 브랜드가 들어간 파일 + 이름에 브랜드가 들어간 폴더 안의 모든 파일
-        found = {}
+        brand_n = _drive_norm(brand)
+        camp_n = _drive_norm(campaign_name)
         ids = list(folders)
-        brand_folder_ids = [fid for fid in ids if brand_l and brand_l in path_of(fid).lower()]
-        queries = []
-        for i in range(0, len(ids), 25):
-            parents = " or ".join(f"'{pid}' in parents" for pid in ids[i:i + 25])
-            if brand:
-                queries.append(f"({parents}) and trashed=false and mimeType!='application/vnd.google-apps.folder' and name contains '{_drive_q(brand)}'")
-        for i in range(0, len(brand_folder_ids), 25):
-            parents = " or ".join(f"'{pid}' in parents" for pid in brand_folder_ids[i:i + 25])
-            queries.append(f"({parents}) and trashed=false and mimeType!='application/vnd.google-apps.folder'")
-        for q in queries:
-            for f in _drive_list(token, q):
-                found[f["id"]] = f
+
+        def chain_names(fid):  # 최상위 폴더를 뺀 폴더 이름들(바깥 → 안쪽)
+            names, cur = [], fid
+            while cur in folders and cur != root and len(names) < 12:
+                names.append(folders[cur][0]); cur = folders[cur][1]
+            return list(reversed(names))
+
+        def in_contract(fid):  # 이름에 '계약'이 들어간 폴더이거나 그 아래에 있는 폴더
+            return any("계약" in n for n in chain_names(fid))
+
+        def brand_in_chain(fid):
+            return bool(brand_n) and any(brand_n in _drive_norm(n) for n in chain_names(fid))
+
+        # 2) 파일: '계약' 폴더 아래 + 업체명이 들어간 폴더 아래의 모든 파일을 가져와서, 파일명/폴더경로에 업체명이 있으면 전부 후보로 삼는다
+        #    (드라이브의 name contains 검색은 단어 앞부분만 맞춰서, 'farmskin_계약서'처럼 붙은 이름은 파이썬에서 직접 걸러낸다)
+        found, api_hits = {}, set()
+        if brand_n:
+            scan_ids = [fid for fid in ids if fid != root and (in_contract(fid) or brand_in_chain(fid))]
+            for i in range(0, len(scan_ids), 25):
+                parents = " or ".join(f"'{pid}' in parents" for pid in scan_ids[i:i + 25])
+                for f in _drive_list(token, f"({parents}) and trashed=false and mimeType!='application/vnd.google-apps.folder'", page_cap=10):
+                    found[f["id"]] = f
+            for i in range(0, len(ids), 25):  # 보조: 계약 폴더 밖에 있는 파일 중 이름에 업체명이 있는 것
+                parents = " or ".join(f"'{pid}' in parents" for pid in ids[i:i + 25])
+                for f in _drive_list(token, f"({parents}) and trashed=false and mimeType!='application/vnd.google-apps.folder' and name contains '{_drive_q(brand)}'"):
+                    found[f["id"]] = f
+                    api_hits.add(f["id"])
 
         cands = []
         for f in found.values():
-            name_l = f["name"].lower()
             parent = (f.get("parents") or [None])[0]
             fpath = path_of(parent) if parent in folders else ""
+            name_hit = bool(brand_n) and brand_n in _drive_norm(f["name"])
+            path_hit = parent in folders and brand_in_chain(parent)
+            if not (name_hit or path_hit or f["id"] in api_hits):
+                continue  # '계약' 폴더 안에 있어도 업체명과 무관한 파일은 제외
             score = 0
-            if any(w in name_l for w in _CONTRACT_WORDS) or any(w in fpath.lower() for w in _CONTRACT_WORDS):
+            if parent in folders and in_contract(parent):
                 score += 3
-            if brand_l and brand_l in name_l:
+            if name_hit:
+                score += 4
+            if path_hit:
                 score += 2
-            if camp_l and camp_l in name_l:
+            if any(w in f["name"].lower() for w in _CONTRACT_WORDS):
+                score += 1
+            if camp_n and camp_n in _drive_norm(f["name"]):
                 score += 2
             cands.append({
                 "id": f["id"], "name": f["name"], "path": fpath, "link": f.get("webViewLink"),
-                "modified": (f.get("modifiedTime") or "")[:10], "score": score,
+                "modified": (f.get("modifiedTime") or "")[:10], "score": score, "kind": "file",
             })
-        # 이름에 '계약서'가 들어간 폴더는 폴더 자체를 후보로 제안한다(브랜드명이 경로에 있으면 더 위로)
         n_files = len(cands)
+
+        # 3) 폴더: 이름에 '계약'이 들어간 폴더 + 이름에 업체명이 들어간 폴더(예: '계약서/farmskin 방문형')를 폴더째로 제안
+        n_contract_folders = n_brand_folders = 0
         for fid in ids:
             fname = folders[fid][0]
-            if fid == root or "계약서" not in fname:
+            if fid == root:
                 continue
-            fpath_full = path_of(fid)
+            is_contract = "계약" in fname
+            is_brand = bool(brand_n) and brand_n in _drive_norm(fname)
+            if not (is_contract or is_brand):
+                continue
+            score = (6 + (2 if in_contract(fid) else 0)) if is_brand else 4
+            if is_contract and brand_in_chain(fid):
+                score += 3
+            if camp_n and camp_n in _drive_norm(path_of(fid)):
+                score += 1
             parent_id = folders[fid][1]
-            score = 4 + (3 if brand_l and brand_l in fpath_full.lower() else 0) + (1 if camp_l and camp_l in fpath_full.lower() else 0)
+            n_brand_folders += is_brand
+            n_contract_folders += (is_contract and not is_brand)
             cands.append({
                 "id": fid, "name": fname, "path": path_of(parent_id) if parent_id in folders else "",
                 "link": f"https://drive.google.com/drive/folders/{fid}", "modified": "", "score": score, "kind": "folder",
             })
-        n_folders = len(cands) - n_files
         cands.sort(key=lambda c: (c["score"], c["modified"]), reverse=True)
-        note = f"폴더 {len(folders)}개를 훑어서 '계약서' 폴더 {n_folders}개"
-        note += f", '{brand}' 관련 파일 {n_files}개를 찾았어요." if brand else "를 찾았어요. (브랜드명을 입력하면 그 브랜드 파일도 같이 찾아요)"
+        note = f"폴더 {len(folders)}개를 훑어서 '계약' 폴더 {n_contract_folders}개"
+        if brand:
+            note += f", '{brand}' 폴더 {n_brand_folders}개, '{brand}' 관련 파일 {n_files}개를 찾았어요."
+        else:
+            note += "를 찾았어요. (브랜드명을 입력하면 그 브랜드 폴더·파일도 같이 찾아요)"
+        if len(cands) > max_show:
+            note += f" 점수가 높은 {max_show}개만 보여드려요."
         if len(folders) >= max_folders:
             note += f" (폴더가 많아서 앞 {max_folders}개까지만 훑었어요)"
-        return cands[:20], note, None
+        return cands[:max_show], note, None
     except _DriveError as e:
         return [], None, str(e)
     except Exception as e:
