@@ -171,11 +171,101 @@ def _extract_email(text):
     return m.group(0) if m else None
 
 
+def _google_file_id(url):
+    """구글시트/드라이브 링크에서 파일 ID를 뽑는다. (id, 종류) — 종류: 'sheet' | 'drive' | 'published' | None"""
+    url = (url or "").strip()
+    if "/spreadsheets/d/e/" in url:
+        return None, "published"
+    m = re.search(r"/spreadsheets/d/([\w-]+)", url)
+    if m:
+        return m.group(1), "sheet"
+    m = re.search(r"drive\.google\.com/file/d/([\w-]+)", url) or re.search(r"[?&]id=([\w-]+)", url)
+    if m:
+        return m.group(1), "drive"
+    return None, None
+
+
+def _fetch_google_sheet(url):
+    """구글시트 링크를 읽어 {탭이름: DataFrame}으로 돌려준다.
+    실패하면 (None, 원인제목, 해결방법)을 돌려줘서 화면에 그대로 보여줄 수 있게 한다."""
+    file_id, kind = _google_file_id(url)
+    if kind == "published":
+        return None, "'웹에 게시' 링크는 읽을 수 없어요", (
+            "구글시트 **주소창의 링크**(…/spreadsheets/d/…/edit)를 복사해서 붙여넣어주세요. "
+            "'파일 → 공유 → 웹에 게시'로 만든 링크는 지원하지 않아요.")
+    if not file_id:
+        return None, "구글시트 링크가 아닌 것 같아요", (
+            "브라우저 주소창의 링크(https://docs.google.com/spreadsheets/d/…)를 그대로 복사해서 붙여넣어주세요.")
+
+    perm_title = "권한 문제예요 — 저희 쪽에서 이 시트를 열 수 없어요"
+    perm_fix = (
+        "구글시트 우측 상단 **'공유' → '일반 액세스'를 '링크가 있는 모든 사용자' + '뷰어'**로 바꿔주세요. "
+        "'회사 이름(조직) 내 사용자'로만 열어두면 외부 서버에서는 읽을 수 없습니다. "
+        "공유가 어렵다면 시트를 **엑셀(.xlsx)로 다운로드해서 아래 '파일로 올리기'**를 쓰셔도 돼요.")
+
+    def _get(u):
+        return requests.get(u, timeout=30, headers={"User-Agent": "Mozilla/5.0"}, allow_redirects=True)
+
+    try:
+        urls = []
+        if kind == "sheet":
+            urls.append(f"https://docs.google.com/spreadsheets/d/{file_id}/export?format=xlsx")
+        urls.append(f"https://drive.google.com/uc?export=download&id={file_id}")  # 드라이브에 올린 엑셀 파일용
+        content, last_status = None, None
+        for u in urls:
+            res = _get(u)
+            last_status = res.status_code
+            host_login = "accounts.google.com" in res.url
+            if res.status_code == 200 and res.content[:2] == b"PK" and not host_login:
+                content = res.content
+                break
+            if res.status_code in (401, 403) or host_login or (res.status_code == 200 and b"<html" in res.content[:500].lower()):
+                last_status = 403  # 로그인 페이지로 튕기면 비공개라는 뜻 (코드는 200으로 와서 헷갈림)
+                break
+            if res.status_code == 404:
+                break
+            # 400 등: 다음 주소(드라이브 직접 다운로드)로 재시도
+        if content is None:
+            if last_status in (401, 403):
+                return None, perm_title, perm_fix
+            if last_status == 404:
+                return None, "시트를 찾을 수 없어요", "링크가 잘렸거나 삭제된 시트일 수 있어요. 주소를 다시 복사해주세요."
+            return None, f"구글 응답이 이상해요 (코드 {last_status})", (
+                "시트가 '구글 스프레드시트' 형식이 아니거나 일시적인 오류일 수 있어요. "
+                "잠시 후 다시 시도하시거나, 엑셀로 다운로드해서 '파일로 올리기'를 써주세요.")
+        sheets = pd.read_excel(io.BytesIO(content), sheet_name=None, header=None, dtype=str)
+        if not sheets or all(df.empty for df in sheets.values()):
+            return None, "시트가 비어 있어요", "내용이 있는 탭이 하나도 없어요. 맞는 파일인지 확인해주세요."
+        return sheets, None, None
+    except requests.exceptions.RequestException as e:
+        return None, "구글에 연결하지 못했어요", f"네트워크 문제일 수 있어요. 잠시 후 다시 시도해주세요. (상세: {type(e).__name__}: {e})"
+    except Exception as e:
+        return None, "파일을 해석하지 못했어요", f"(상세: {type(e).__name__}: {e})"
+
+
+def _read_uploaded_sheet_file(f):
+    """직접 올린 .xlsx / .csv 파일을 {탭이름: DataFrame}으로 읽는다. (sheets, 에러문구)"""
+    try:
+        if f.name.lower().endswith(".csv"):
+            raw = f.getvalue()
+            for enc in ("utf-8-sig", "cp949"):
+                try:
+                    return {"CSV": pd.read_csv(io.StringIO(raw.decode(enc)), header=None, dtype=str)}, None
+                except UnicodeDecodeError:
+                    continue
+            return None, "CSV 글자 인코딩을 알 수 없어요. 엑셀(.xlsx)로 저장해서 올려주세요."
+        return pd.read_excel(io.BytesIO(f.getvalue()), sheet_name=None, header=None, dtype=str), None
+    except Exception as e:
+        return None, f"파일을 읽지 못했어요 ({type(e).__name__}: {e})"
+
+
 def _ai_infer_column_mapping(all_sheets):
     """본격적으로 전부 추출하기 전에, 열 구성을 어떻게 이해했는지 사람이 먼저 확인하게 한다
     (예: 'A열이 이름이 맞나요?'에 해당하는 사전 점검 단계)."""
+    st.session_state.pop("payment_mapping_err", None)
     api_key = os.environ.get("ANTHROPIC_API_KEY")
     if not api_key:
+        st.session_state["payment_mapping_err"] = "ANTHROPIC_API_KEY 환경변수가 이 서비스에 설정돼 있지 않아요."
         return None
     sheet_samples = {}
     for name, raw_df in all_sheets.items():
@@ -203,9 +293,11 @@ def _ai_infer_column_mapping(all_sheets):
             timeout=30,
         )
         if res.status_code >= 300:
+            st.session_state["payment_mapping_err"] = f"Claude API 응답 오류 (코드 {res.status_code}): {res.text[:200]}"
             return None
         return "".join(b.get("text", "") for b in res.json().get("content", []) if b.get("type") == "text").strip()
-    except Exception:
+    except Exception as e:
+        st.session_state["payment_mapping_err"] = f"Claude API 호출 실패 ({type(e).__name__}: {e})"
         return None
 
 
@@ -1135,40 +1227,27 @@ with tab_finance:
     dl2.caption("이 양식대로 채우시면 가장 정확하게 인식돼요. 다른 형식(기존에 쓰시던 시트)도 AI가 알아서 읽어보려 시도합니다.")
 
     pay_sheet_url = st.text_input("구글시트 링크", key="payment_sheet_url", placeholder="https://docs.google.com/spreadsheets/d/...")
+    pay_sheet_file = st.file_uploader(
+        "또는 엑셀(.xlsx)/CSV 파일로 올리기 (링크 공유가 어려울 때)", type=["xlsx", "csv"], key="payment_sheet_file",
+    )
     if st.button("1단계: 시트 구조 확인", key="payment_sheet_load"):
-        if not pay_sheet_url.strip():
-            st.error("링크를 붙여넣어주세요.")
+        all_sheets, err_title, err_fix = None, None, None
+        if pay_sheet_file is not None:
+            all_sheets, err_title = _read_uploaded_sheet_file(pay_sheet_file)
+        elif pay_sheet_url.strip():
+            all_sheets, err_title, err_fix = _fetch_google_sheet(pay_sheet_url)
         else:
-            xlsx_url = _sheet_xlsx_url(pay_sheet_url.strip())
-            if not xlsx_url:
-                st.error("구글시트 링크 형식이 아닌 것 같아요.")
-            else:
-                try:
-                    res = requests.get(xlsx_url, timeout=30)
-                    if res.status_code == 403 or res.status_code == 401:
-                        st.error(
-                            "🔒 **권한 문제예요** — 이 시트가 아직 비공개 상태라 저희 쪽에서 못 읽어요.\n\n"
-                            "구글시트에서 **우측 상단 '공유' → '일반 액세스'를 '링크가 있는 모든 사용자 - 뷰어'**로 바꿔주세요. "
-                            "(회사 계정끼리만 공유해도 외부 서버에서는 못 읽습니다)\n\n"
-                            "**그래도 복잡하면 아래 '📷 스크린샷으로 대신 올리기'를 쓰셔도 돼요 — 더 쉬울 수 있어요.**"
-                        )
-                    elif res.status_code == 404:
-                        st.error("❌ 링크를 찾을 수 없어요. 주소가 정확한지 다시 확인해주세요.")
-                    elif res.status_code != 200:
-                        st.error(f"❌ 구글시트 응답 오류 (코드 {res.status_code}). 잠시 후 다시 시도해주세요.")
-                    else:
-                        all_sheets = pd.read_excel(io.BytesIO(res.content), sheet_name=None, header=None, dtype=str)
-                        with st.spinner("Claude가 열 구성을 파악하는 중..."):
-                            mapping_desc = _ai_infer_column_mapping(all_sheets)
-                        st.session_state["payment_all_sheets"] = all_sheets
-                        st.session_state["payment_mapping_desc"] = mapping_desc or "(자동 파악 실패 — 그냥 2단계에서 바로 추출을 시도해볼게요)"
-                        st.session_state.pop("payment_rows_preview", None)
-                except Exception as e:
-                    st.error(
-                        f"시트를 못 읽었어요 ({e}).\n\n"
-                        "**확인해주세요:** 구글시트 '공유' 설정이 '링크가 있는 모든 사용자 - 뷰어'로 되어있는지. "
-                        "그래도 안 되면 아래 '📷 스크린샷으로 대신 올리기'를 이용해주세요."
-                    )
+            err_title = "링크를 붙여넣거나 파일을 올려주세요."
+        if all_sheets is None:
+            st.error(f"❌ {err_title}" + (f"\n\n{err_fix}" if err_fix else ""))
+        else:
+            with st.spinner("Claude가 열 구성을 파악하는 중..."):
+                mapping_desc = _ai_infer_column_mapping(all_sheets)
+            st.session_state["payment_all_sheets"] = all_sheets
+            st.session_state["payment_mapping_desc"] = mapping_desc or "(자동 파악 실패 — 그냥 2단계에서 바로 추출을 시도해볼게요)"
+            if not mapping_desc and st.session_state.get("payment_mapping_err"):
+                st.warning(f"열 구성 자동 파악이 안 됐어요: {st.session_state['payment_mapping_err']}")
+            st.session_state.pop("payment_rows_preview", None)
 
     mapping_desc = st.session_state.get("payment_mapping_desc")
     if mapping_desc and st.session_state.get("payment_all_sheets") is not None:
