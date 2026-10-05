@@ -259,6 +259,62 @@ def _read_uploaded_sheet_file(f):
         return None, f"파일을 읽지 못했어요 ({type(e).__name__}: {e})"
 
 
+def _cell_is_datalike(v):
+    """셀이 '값'(금액·URL·이메일·날짜·계좌번호)처럼 보이면 True, 비었으면 None, 글자뿐이면 False."""
+    sv = str(v).strip()
+    if not sv or sv.lower() == "nan":
+        return None
+    if re.search(r"\d", sv) and re.fullmatch(r"[\d,.\s₩원$-]+", sv):
+        return True
+    if "@" in sv or sv.lower().startswith("http") or re.search(r"\d{2,}-\d{2,}", sv):
+        return True
+    return bool(re.fullmatch(r"\d{2,4}[-./]\d{1,2}[-./]\d{1,2}", sv))
+
+
+def _detect_header_rows(raw_df):
+    """한 탭 안에서 '제목줄(헤더)처럼 보이는 행'을 찾는다. 반환: 1부터 세는 행 번호 목록(못 찾으면 [1]).
+    제목줄 = 내용 있는 칸 3개 이상이 전부 글자뿐이고, 바로 뒤 몇 줄 안에 값(금액·URL 등)이 있는 행."""
+    kinds = [[_cell_is_datalike(v) for v in row] for row in raw_df.values.tolist()]
+    found = []
+    for i, ks in enumerate(kinds):
+        filled = [k for k in ks if k is not None]
+        if len(filled) < 3 or any(filled):
+            continue
+        if found and found[-1] == i:  # 바로 윗줄도 제목줄이면 두 줄짜리 제목으로 보고 첫 줄만 사용
+            continue
+        if any(True in [k for k in nxt if k is not None] for nxt in kinds[i + 1:i + 4]):
+            found.append(i + 1)
+    return found or [1]
+
+
+def _parse_row_numbers(text, max_row):
+    """'1, 22, 45' → [1, 22, 45]. 범위를 벗어나거나 숫자가 아닌 건 버린다."""
+    nums = {int(t) for t in re.findall(r"\d+", str(text or "")) if 1 <= int(t) <= max_row}
+    return sorted(nums)
+
+
+def _col_letter(n):
+    out = ""
+    n += 1
+    while n:
+        n, r = divmod(n - 1, 26)
+        out = chr(65 + r) + out
+    return out
+
+
+def _collect_sections(all_sheets):
+    """탭마다 사용자가 확인한 제목줄 행 번호대로 표 구간을 나눈다. {'탭 · 행 a~b': DataFrame(첫 행=제목줄)}"""
+    sections = {}
+    for i, (name, df) in enumerate(all_sheets.items()):
+        if st.session_state.get(f"hdr_skip_{i}") or df.empty:
+            continue
+        heads = _parse_row_numbers(st.session_state.get(f"hdr_rows_{i}", ""), len(df)) or [1]
+        for k, h in enumerate(heads):
+            end = heads[k + 1] - 1 if k + 1 < len(heads) else len(df)
+            sections[f"{name} · 행 {h}~{end}"] = df.iloc[h - 1:end].reset_index(drop=True)
+    return sections
+
+
 def _ai_infer_column_mapping(all_sheets):
     """본격적으로 전부 추출하기 전에, 열 구성을 어떻게 이해했는지 사람이 먼저 확인하게 한다
     (예: 'A열이 이름이 맞나요?'에 해당하는 사전 점검 단계)."""
@@ -1241,8 +1297,11 @@ with tab_finance:
         if all_sheets is None:
             st.error(f"❌ {err_title}" + (f"\n\n{err_fix}" if err_fix else ""))
         else:
+            for i, (_nm, _df) in enumerate(all_sheets.items()):  # 탭마다 제목줄 후보를 미리 채워둔다(사용자가 고칠 수 있음)
+                st.session_state[f"hdr_rows_{i}"] = ", ".join(str(n) for n in _detect_header_rows(_df))
+                st.session_state[f"hdr_skip_{i}"] = bool(_df.empty)
             with st.spinner("Claude가 열 구성을 파악하는 중..."):
-                mapping_desc, mapping_err = _ai_infer_column_mapping(all_sheets)
+                mapping_desc, mapping_err = _ai_infer_column_mapping(_collect_sections(all_sheets))
             st.session_state["payment_all_sheets"] = all_sheets
             if mapping_desc:
                 st.session_state["payment_mapping_desc"] = mapping_desc
@@ -1254,6 +1313,25 @@ with tab_finance:
     mapping_desc = st.session_state.get("payment_mapping_desc")
     if mapping_desc and st.session_state.get("payment_all_sheets") is not None:
         st.info(f"🧐 **제가 파악한 열 구성이에요 — 맞는지 봐주세요:**\n\n{mapping_desc}")
+        st.markdown("**🗂️ 탭별 표 구간 확인** — 한 탭 안에서 제목줄(헤더)이 중간에 또 나오면, 제목줄 행 번호를 모두 적어주세요.")
+        for i, (sheet_name, sheet_df) in enumerate(st.session_state["payment_all_sheets"].items()):
+            heads = _parse_row_numbers(st.session_state.get(f"hdr_rows_{i}", ""), len(sheet_df)) or [1]
+            with st.expander(f"탭 '{sheet_name}' ({len(sheet_df)}행) — 제목줄 {len(heads)}개로 인식", expanded=len(heads) > 1):
+                hc1, hc2 = st.columns([3, 1])
+                hc1.text_input("제목줄(헤더) 행 번호 — 여러 개면 쉼표로 (예: 1, 22)", key=f"hdr_rows_{i}")
+                hc2.checkbox("이 탭은 제외", key=f"hdr_skip_{i}")
+                preview = sheet_df.head(80).fillna("").astype(str).copy()
+                preview.columns = [_col_letter(j) for j in range(preview.shape[1])]
+                preview.insert(0, "행", range(1, len(preview) + 1))
+                preview.insert(1, " ", ["◀ 제목줄" if n in heads else "" for n in preview["행"]])
+                st.dataframe(preview, hide_index=True, use_container_width=True)
+                if len(sheet_df) > 80:
+                    st.caption(f"(앞 80행만 보여드려요. 80행 뒤에 제목줄이 또 있으면 행 번호를 직접 적어주세요.)")
+        if st.button("🔄 제목줄을 바꿨어요 — 열 구성 다시 파악", key="remap_sections"):
+            with st.spinner("Claude가 열 구성을 다시 파악하는 중..."):
+                _desc, _err = _ai_infer_column_mapping(_collect_sections(st.session_state["payment_all_sheets"]))
+            st.session_state["payment_mapping_desc"] = _desc or f"(자동 파악 실패: {_err} — 그냥 2단계에서 바로 추출을 시도해볼게요)"
+            st.rerun()
         mapping_correction = st.text_input(
             "다르면 바로잡아주세요(선택)", key="mapping_correction",
             placeholder="예: A열은 이름이 아니라 방문 장소예요, 이름은 C열이에요",
@@ -1267,7 +1345,7 @@ with tab_finance:
                 if r.get("dedup_key")
             }
             with st.spinner("Claude가 전체 내용을 읽는 중..."):
-                for _, raw_df in all_sheets.items():
+                for _label, raw_df in _collect_sections(all_sheets).items():
                     if raw_df.empty:
                         continue
                     rows, n_skip = _ai_extract_payment_rows(
