@@ -555,6 +555,27 @@ def _drive_find_contracts(brand_name, campaign_name="", max_folders=400, max_sho
         return [], None, f"드라이브에서 찾는 중 문제가 생겼어요 ({type(e).__name__}: {e})"
 
 
+@st.cache_data(ttl=120, show_spinner=False)
+def _drive_children(folder_id):
+    """폴더 안의 항목(하위 폴더 + 파일)을 읽는다. 반환: (항목 목록, 에러문구). 하위 폴더가 먼저, 파일은 최근 수정순."""
+    token, _email, err = _drive_token()
+    if err:
+        return [], err
+    try:
+        items = _drive_list(
+            token, f"'{_drive_q(folder_id)}' in parents and trashed=false",
+            fields="id,name,mimeType,webViewLink,modifiedTime", page_cap=5,
+        )
+    except _DriveError as e:
+        return [], str(e)
+    except Exception as e:
+        return [], f"폴더 내용을 읽는 중 문제가 생겼어요 ({type(e).__name__}: {e})"
+    is_folder = lambda it: it.get("mimeType") == "application/vnd.google-apps.folder"
+    folders_ = sorted([i for i in items if is_folder(i)], key=lambda i: i["name"].lower())
+    files_ = sorted([i for i in items if not is_folder(i)], key=lambda i: i.get("modifiedTime") or "", reverse=True)
+    return folders_ + files_, None
+
+
 def _api_error_text(status, body):
     """Claude API 오류를 직원이 이해할 수 있는 말로 바꾼다(원문도 같이 보여줘서 원인을 숨기지 않는다)."""
     body = str(body or "")
@@ -2165,6 +2186,7 @@ with tab_mywork:
                         _cands, _note, _err = _drive_find_contracts(new_brand_name.strip() if camp_brand == NEW_BRAND else camp_brand, camp_name)
                     st.session_state["camp_drive_result"] = {"brand": camp_brand if camp_brand != NEW_BRAND else new_brand_name.strip(), "cands": _cands, "note": _note, "err": _err}
                     st.session_state.pop(f"camp_drive_pick_{cv}", None)
+                    st.session_state.pop("camp_browse", None)
 
                 drive_res = st.session_state.get("camp_drive_result")
                 drive_pick = None
@@ -2180,7 +2202,7 @@ with tab_mywork:
                         else:
                             by_id = {c["id"]: c for c in drive_res["cands"]}
                             pick_id = st.radio(
-                                "찾은 폴더·파일 중 이 캠페인의 계약서를 골라주세요", list(by_id.keys()), index=None,
+                                "찾은 폴더·파일 중 골라주세요 (폴더를 고르면 안의 파일이 아래에 나와요)", list(by_id.keys()), index=None,
                                 format_func=lambda fid: (
                                         f"📁 {by_id[fid]['name']}  ·  {by_id[fid]['path'] or '(최상위)'}  ·  폴더" if by_id[fid].get("kind") == "folder"
                                         else f"📄 {by_id[fid]['name']}  ·  {by_id[fid]['path'] or '(최상위)'}  ·  수정 {by_id[fid]['modified'] or '-'}"
@@ -2188,8 +2210,41 @@ with tab_mywork:
                                 key=f"camp_drive_pick_{cv}",
                             )
                             drive_pick = by_id.get(pick_id)
-                            if drive_pick and drive_pick.get("link"):
-                                st.markdown(f"👉 [선택한 항목 드라이브에서 열어보기]({drive_pick['link']})")
+                            if drive_pick and drive_pick.get("kind") == "folder":
+                                # 폴더를 고르면 이 화면 안에서 그 안의 폴더·파일을 보여주고, 파일을 고르게 한다
+                                bs = st.session_state.get("camp_browse")
+                                if not bs or bs["root"] != pick_id:
+                                    bs = {"root": pick_id, "stack": [{"id": pick_id, "name": drive_pick["name"]}]}
+                                    st.session_state["camp_browse"] = bs
+                                cur = bs["stack"][-1]
+                                st.markdown("📂 **" + " › ".join(x["name"] for x in bs["stack"]) + "**")
+                                kids, kids_err = _drive_children(cur["id"])
+                                drive_pick = None  # 폴더 자체가 아니라, 폴더 안에서 고른 파일만 계약서로 연결한다
+                                if len(bs["stack"]) > 1 and st.button("⬆ 상위 폴더로", key=f"camp_up_{cv}"):
+                                    bs["stack"].pop()
+                                    st.rerun()
+                                if kids_err:
+                                    st.error(f"❌ {kids_err}")
+                                else:
+                                    sub_folders = [k for k in kids if k.get("mimeType") == "application/vnd.google-apps.folder"]
+                                    sub_files = [k for k in kids if k.get("mimeType") != "application/vnd.google-apps.folder"]
+                                    for sf in sub_folders:
+                                        if st.button(f"📁 {sf['name']}", key=f"camp_open_{cv}_{sf['id']}"):
+                                            bs["stack"].append({"id": sf["id"], "name": sf["name"]})
+                                            st.rerun()
+                                    if not sub_files:
+                                        st.caption("이 폴더에는 파일이 없어요." + (" 위의 폴더를 눌러 안으로 들어가 보세요." if sub_folders else ""))
+                                    else:
+                                        kid_by_id = {k["id"]: k for k in sub_files}
+                                        file_icon = lambda mt: "📊" if "spreadsheet" in (mt or "") else ("📝" if "document" in (mt or "") else "📄")
+                                        file_id = st.radio(
+                                            f"이 폴더 안의 파일 중 계약서를 골라주세요 ({len(sub_files)}개)", list(kid_by_id.keys()), index=None,
+                                            format_func=lambda kid: f"{file_icon(kid_by_id[kid].get('mimeType'))} {kid_by_id[kid]['name']}  ·  수정 {(kid_by_id[kid].get('modifiedTime') or '')[:10] or '-'}",
+                                            key=f"camp_file_pick_{cv}_{cur['id']}",
+                                        )
+                                        if file_id:
+                                            kf = kid_by_id[file_id]
+                                            drive_pick = {"id": kf["id"], "name": kf["name"], "link": kf.get("webViewLink"), "kind": "file"}
 
                 if st.button("등록 (4주 루틴 자동 생성)", type="primary", key=f"camp_new_submit_{cv}"):
                     if not camp_name.strip():
@@ -2251,6 +2306,7 @@ with tab_mywork:
                         st.session_state["camp_new_msg"] = msg
                         st.session_state["camp_new_ver"] = cv + 1
                         st.session_state.pop("camp_drive_result", None)
+                        st.session_state.pop("camp_browse", None)
                         refresh_sales()
                         st.rerun()
 
