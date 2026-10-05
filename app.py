@@ -453,6 +453,20 @@ def _drive_find_contracts(brand_name, campaign_name="", max_folders=400):
         return [], None, f"드라이브에서 찾는 중 문제가 생겼어요 ({type(e).__name__}: {e})"
 
 
+def _api_error_text(status, body):
+    """Claude API 오류를 직원이 이해할 수 있는 말로 바꾼다(원문도 같이 보여줘서 원인을 숨기지 않는다)."""
+    body = str(body or "")
+    if "credit balance is too low" in body:
+        return ("Anthropic API 크레딧이 부족해요. 코드 문제가 아니라 결제 문제예요 — "
+                "console.anthropic.com → Plans & Billing에서 이 API 키가 속한 조직의 크레딧을 충전해주세요. "
+                f"(원문: 코드 {status})")
+    if status == 401:
+        return f"ANTHROPIC_API_KEY가 올바르지 않아요 (코드 401): {body[:150]}"
+    if status == 429:
+        return f"요청이 너무 많아요. 잠시 후 다시 시도해주세요 (코드 429): {body[:150]}"
+    return f"Claude API 응답 오류 (코드 {status}): {body[:200]}"
+
+
 def _ai_infer_column_mapping(all_sheets):
     """본격적으로 전부 추출하기 전에, 열 구성을 어떻게 이해했는지 사람이 먼저 확인하게 한다
     (예: 'A열이 이름이 맞나요?'에 해당하는 사전 점검 단계)."""
@@ -485,7 +499,7 @@ def _ai_infer_column_mapping(all_sheets):
             timeout=30,
         )
         if res.status_code >= 300:
-            return None, f"API 오류 {res.status_code}: {res.text[:300]}"
+            return None, _api_error_text(res.status_code, res.text)
         text = "".join(b.get("text", "") for b in res.json().get("content", []) if b.get("type") == "text").strip()
         return text, None
     except Exception as e:
@@ -544,7 +558,7 @@ def _ai_extract_payment_rows(raw_df, existing_keys, batch_size=20, extra_hint=No
                 timeout=60,
             )
             if res.status_code >= 300:
-                report["errors"].append(f"Claude API 응답 오류 (코드 {res.status_code}): {res.text[:200]}")
+                report["errors"].append(_api_error_text(res.status_code, res.text))
                 skipped += len(chunk)
                 continue
             text = "".join(b.get("text", "") for b in res.json().get("content", []) if b.get("type") == "text").strip()
@@ -1870,7 +1884,7 @@ with tab_mywork:
         account_by_id = {a["id"]: a for a in all_sales_accounts}
         STATUS_OPTS_ACC = ["협상중", "계약완료", "운영중", "종료", "이탈"]
 
-        tab_cal, tab_acc, tab_issue, tab_camp = st.tabs(["📅 일정 한눈에보기", "🏢 계정 관리", "🐛 이슈", "🚀 캠페인·주차루틴"])
+        tab_reg, tab_cal, tab_acc, tab_issue, tab_camp = st.tabs(["📝 캠페인 등록", "📅 일정 한눈에보기", "🏢 계정 관리", "🐛 이슈", "🚀 캠페인·주차루틴"])
 
         # ── 📅 일정 한눈에보기 ──────────────────────────────────
         with tab_cal:
@@ -2018,124 +2032,146 @@ with tab_mywork:
                             st.success("저장 완료"); refresh_sales()
 
         # ── 🚀 캠페인·주차루틴 ──────────────────────────────────
-        with tab_camp:
+        with tab_reg:
             st.markdown("**캠페인 등록 → 4주 루틴 자동 생성**")
-            if not my_accounts:
-                st.caption("먼저 브랜드 계정을 등록해주세요.")
-            else:
-                with st.expander("🚀 새 캠페인 등록", expanded=True):
-                    cv = st.session_state.setdefault("camp_new_ver", 0)  # 등록 성공 후 입력칸을 비우려고 key에 붙이는 번호
-                    if st.session_state.get("camp_new_msg"):
-                        st.success(st.session_state.pop("camp_new_msg"))
-                    acc_names2 = {a["brand_name"]: a["id"] for a in my_accounts}
-                    camp_brand = st.selectbox("브랜드", list(acc_names2.keys()), key="camp_brand_pick")
-                    camp_name = st.text_input("캠페인명 *", placeholder="예: 9월 명동 오픈 캠페인", key=f"camp_new_name_{cv}")
-                    camp_open_date = st.date_input("캠페인 오픈일", value=date.today(), key=f"camp_new_open_{cv}")
-
-                    st.markdown("**📄 계약서** (선택) — 직접 올리거나, 구글드라이브에서 찾아올 수 있어요")
-                    cc1, cc2 = st.columns(2)
-                    camp_contract_file = cc1.file_uploader(
-                        "계약서 파일 올리기", type=["pdf", "docx", "png", "jpg", "jpeg"], key=f"camp_new_contract_file_{cv}",
+            with st.expander("🚀 새 캠페인 등록", expanded=True):
+                cv = st.session_state.setdefault("camp_new_ver", 0)  # 등록 성공 후 입력칸을 비우려고 key에 붙이는 번호
+                if st.session_state.get("camp_new_msg"):
+                    st.success(st.session_state.pop("camp_new_msg"))
+                acc_names2 = {a["brand_name"]: a["id"] for a in my_accounts}
+                NEW_BRAND = "➕ 새 브랜드 직접 입력"
+                camp_brand = st.selectbox("브랜드", list(acc_names2.keys()) + [NEW_BRAND], key="camp_brand_pick")
+                new_brand_name = ""
+                if camp_brand == NEW_BRAND:
+                    new_brand_name = st.text_input(
+                        "새 브랜드명 *", key=f"camp_new_brand_{cv}",
+                        help="등록하면 '🏢 계정 관리'에도 내 담당 브랜드로 자동 추가돼요.",
                     )
-                    cc2.caption("브랜드명(과 캠페인명)이 들어간 파일·폴더를 드라이브에서 찾아와요.")
-                    if cc2.button("🔍 구글드라이브에서 찾아오기", key="camp_new_drive_find", use_container_width=True):
-                        with st.spinner("구글드라이브를 훑는 중... (폴더가 많으면 시간이 좀 걸려요)"):
-                            _cands, _note, _err = _drive_find_contracts(camp_brand, camp_name)
-                        st.session_state["camp_drive_result"] = {"brand": camp_brand, "cands": _cands, "note": _note, "err": _err}
-                        st.session_state.pop(f"camp_drive_pick_{cv}", None)
+                    if not acc_names2:
+                        st.caption("아직 등록된 브랜드 계정이 없어서, 여기서 브랜드명을 쓰면 계정도 같이 만들어져요.")
+                camp_name = st.text_input("캠페인명 *", placeholder="예: 9월 명동 오픈 캠페인", key=f"camp_new_name_{cv}")
+                camp_open_date = st.date_input("캠페인 오픈일", value=date.today(), key=f"camp_new_open_{cv}")
 
-                    drive_res = st.session_state.get("camp_drive_result")
-                    drive_pick = None
-                    if drive_res:
-                        if drive_res["brand"] != camp_brand:
-                            st.caption("브랜드를 바꾸셨어요. 아래 결과는 이전 브랜드 기준이라, 다시 '찾아오기'를 눌러주세요.")
-                        elif drive_res["err"]:
-                            st.error(f"❌ {drive_res['err']}")
+                st.markdown("**📄 계약서** (선택) — 직접 올리거나, 구글드라이브에서 찾아올 수 있어요")
+                cc1, cc2 = st.columns(2)
+                camp_contract_file = cc1.file_uploader(
+                    "계약서 파일 올리기", type=["pdf", "docx", "png", "jpg", "jpeg"], key=f"camp_new_contract_file_{cv}",
+                )
+                cc2.caption("브랜드명(과 캠페인명)이 들어간 파일·폴더를 드라이브에서 찾아와요.")
+                if cc2.button("🔍 구글드라이브에서 찾아오기", key="camp_new_drive_find", use_container_width=True):
+                    with st.spinner("구글드라이브를 훑는 중... (폴더가 많으면 시간이 좀 걸려요)"):
+                        _cands, _note, _err = _drive_find_contracts(new_brand_name.strip() if camp_brand == NEW_BRAND else camp_brand, camp_name)
+                    st.session_state["camp_drive_result"] = {"brand": camp_brand if camp_brand != NEW_BRAND else new_brand_name.strip(), "cands": _cands, "note": _note, "err": _err}
+                    st.session_state.pop(f"camp_drive_pick_{cv}", None)
+
+                drive_res = st.session_state.get("camp_drive_result")
+                drive_pick = None
+                if drive_res:
+                    if drive_res["brand"] != (camp_brand if camp_brand != NEW_BRAND else new_brand_name.strip()):
+                        st.caption("브랜드를 바꾸셨어요. 아래 결과는 이전 브랜드 기준이라, 다시 '찾아오기'를 눌러주세요.")
+                    elif drive_res["err"]:
+                        st.error(f"❌ {drive_res['err']}")
+                    else:
+                        st.caption(drive_res["note"])
+                        if not drive_res["cands"]:
+                            st.warning("관련 파일을 못 찾았어요. 파일 이름이나 폴더 이름에 브랜드명이 들어 있는지 확인하시거나, 위에서 직접 올려주세요.")
                         else:
-                            st.caption(drive_res["note"])
-                            if not drive_res["cands"]:
-                                st.warning("관련 파일을 못 찾았어요. 파일 이름이나 폴더 이름에 브랜드명이 들어 있는지 확인하시거나, 위에서 직접 올려주세요.")
+                            by_id = {c["id"]: c for c in drive_res["cands"]}
+                            pick_id = st.radio(
+                                "찾은 파일 중 이 캠페인의 계약서를 골라주세요", list(by_id.keys()), index=None,
+                                format_func=lambda fid: f"{by_id[fid]['name']}  ·  {by_id[fid]['path'] or '(최상위)'}  ·  수정 {by_id[fid]['modified'] or '-'}",
+                                key=f"camp_drive_pick_{cv}",
+                            )
+                            drive_pick = by_id.get(pick_id)
+                            if drive_pick and drive_pick.get("link"):
+                                st.markdown(f"👉 [선택한 파일 미리 열어보기]({drive_pick['link']})")
+
+                if st.button("등록 (4주 루틴 자동 생성)", type="primary", key=f"camp_new_submit_{cv}"):
+                    if not camp_name.strip():
+                        st.error("캠페인명을 입력해주세요.")
+                    elif camp_brand == NEW_BRAND and not new_brand_name.strip():
+                        st.error("새 브랜드명을 입력해주세요.")
+                    else:
+                        if camp_brand == NEW_BRAND:
+                            nb = new_brand_name.strip()
+                            if nb in acc_names2:  # 이미 있는 이름이면 중복 생성하지 않고 그 계정을 쓴다
+                                target_account_id = acc_names2[nb]
                             else:
-                                by_id = {c["id"]: c for c in drive_res["cands"]}
-                                pick_id = st.radio(
-                                    "찾은 파일 중 이 캠페인의 계약서를 골라주세요", list(by_id.keys()), index=None,
-                                    format_func=lambda fid: f"{by_id[fid]['name']}  ·  {by_id[fid]['path'] or '(최상위)'}  ·  수정 {by_id[fid]['modified'] or '-'}",
-                                    key=f"camp_drive_pick_{cv}",
-                                )
-                                drive_pick = by_id.get(pick_id)
-                                if drive_pick and drive_pick.get("link"):
-                                    st.markdown(f"👉 [선택한 파일 미리 열어보기]({drive_pick['link']})")
-
-                    if st.button("등록 (4주 루틴 자동 생성)", type="primary", key=f"camp_new_submit_{cv}"):
-                        if not camp_name.strip():
-                            st.error("캠페인명을 입력해주세요.")
+                                target_account_id = SUPA.table("sales_accounts").insert({
+                                    "brand_name": nb, "assigned_to": my_name, "status": "운영중",
+                                }).execute().data[0]["id"]
+                            camp_brand_for_drive = nb
                         else:
-                            camp_res = SUPA.table("sales_campaigns").insert({
-                                "account_id": acc_names2[camp_brand], "campaign_name": camp_name.strip(),
-                                "open_date": camp_open_date.isoformat(), "created_by": my_name,
-                            }).execute()
-                            new_camp_id = camp_res.data[0]["id"]
-                            week_tasks = [{
-                                "campaign_id": new_camp_id, "week_number": wn, "task_title": wt,
-                                "task_description": wd, "due_date": (camp_open_date + timedelta(days=(wn - 1) * 7)).isoformat(),
-                            } for wn, wt, wd in WEEK_TEMPLATE]
-                            SUPA.table("sales_campaign_tasks").insert(week_tasks).execute()
-                            msg = f"캠페인 등록 완료! 1~4주차 루틴 {len(week_tasks)}개가 자동으로 만들어졌어요."
+                            target_account_id = acc_names2[camp_brand]
+                            camp_brand_for_drive = camp_brand
+                        camp_res = SUPA.table("sales_campaigns").insert({
+                            "account_id": target_account_id, "campaign_name": camp_name.strip(),
+                            "open_date": camp_open_date.isoformat(), "created_by": my_name,
+                        }).execute()
+                        new_camp_id = camp_res.data[0]["id"]
+                        week_tasks = [{
+                            "campaign_id": new_camp_id, "week_number": wn, "task_title": wt,
+                            "task_description": wd, "due_date": (camp_open_date + timedelta(days=(wn - 1) * 7)).isoformat(),
+                        } for wn, wt, wd in WEEK_TEMPLATE]
+                        SUPA.table("sales_campaign_tasks").insert(week_tasks).execute()
+                        msg = f"캠페인 등록 완료! 1~4주차 루틴 {len(week_tasks)}개가 자동으로 만들어졌어요."
 
-                            contract_url, contract_name = None, None
-                            if camp_contract_file is not None:  # 직접 올린 파일이 있으면 그걸 우선 사용
-                                try:
-                                    ext = os.path.splitext(camp_contract_file.name)[1].lower()
-                                    cpath = f"campaign/{new_camp_id}/{uuid.uuid4().hex[:8]}{ext}"
-                                    SUPA.storage.from_("contract-files").upload(
-                                        cpath, camp_contract_file.getvalue(),
-                                        {"content-type": camp_contract_file.type or "application/octet-stream"},
-                                    )
-                                    contract_url = f"{os.environ.get('SUPABASE_URL')}/storage/v1/object/public/contract-files/{cpath}"
-                                    contract_name = camp_contract_file.name
-                                except Exception as e:
-                                    st.warning(f"계약서 업로드는 실패했지만 캠페인은 등록됐어요 ({type(e).__name__}: {e})")
-                            elif drive_pick and drive_res and drive_res["brand"] == camp_brand:
-                                contract_url, contract_name = drive_pick.get("link"), drive_pick["name"]
-                            if contract_url:
-                                try:
-                                    SUPA.table("sales_campaigns").update({
-                                        "contract_url": contract_url, "contract_name": contract_name,
-                                    }).eq("id", new_camp_id).execute()
-                                    msg += f" 📄 계약서 연결: {contract_name}"
-                                except Exception as e:
-                                    st.warning(
-                                        "캠페인은 등록됐지만 계약서 링크를 저장하지 못했어요. DB에 계약서 칸(contract_url, contract_name)이 "
-                                        f"아직 없는 것 같아요 — 관리자에게 알려주세요. ({type(e).__name__}: {e})"
-                                    )
-                            st.session_state["camp_new_msg"] = msg
-                            st.session_state["camp_new_ver"] = cv + 1
-                            st.session_state.pop("camp_drive_result", None)
-                            refresh_sales()
-                            st.rerun()
-
-                my_account_ids_camp = {a["id"] for a in my_accounts}
-                my_campaigns = [c for c in load_sales_campaigns() if c["account_id"] in my_account_ids_camp]
-                if not my_campaigns:
-                    st.caption("등록된 캠페인이 없습니다.")
-                for c in my_campaigns:
-                    acc = account_by_id.get(c["account_id"], {})
-                    with st.expander(f"🚀 [{acc.get('brand_name', '?')}] {c['campaign_name']} · 오픈 {c['open_date']} · {c['status']}"):
-                        tasks = [t for t in load_sales_campaign_tasks() if t["campaign_id"] == c["id"]]
-                        if c.get("contract_url"):
-                            st.markdown(f"📄 계약서: [{c.get('contract_name') or '열기'}]({c['contract_url']})")
-                        for t in sorted(tasks, key=lambda x: x["week_number"]):
-                            with st.container(border=True):
-                                st.markdown(f"**{t['week_number']}주차 — {t['task_title']}** · 마감 {t.get('due_date') or '-'}")
-                                if t.get("task_description"):
-                                    st.caption(t["task_description"])
-                                new_tstatus = st.selectbox(
-                                    "상태", ["예정", "진행중", "완료"], index=["예정", "진행중", "완료"].index(t["status"]),
-                                    key=f"wtstatus_{t['id']}", label_visibility="collapsed",
+                        contract_url, contract_name = None, None
+                        if camp_contract_file is not None:  # 직접 올린 파일이 있으면 그걸 우선 사용
+                            try:
+                                ext = os.path.splitext(camp_contract_file.name)[1].lower()
+                                cpath = f"campaign/{new_camp_id}/{uuid.uuid4().hex[:8]}{ext}"
+                                SUPA.storage.from_("contract-files").upload(
+                                    cpath, camp_contract_file.getvalue(),
+                                    {"content-type": camp_contract_file.type or "application/octet-stream"},
                                 )
-                                if st.button("저장", key=f"wtsave_{t['id']}"):
-                                    SUPA.table("sales_campaign_tasks").update({"status": new_tstatus}).eq("id", t["id"]).execute()
-                                    st.success("저장 완료"); refresh_sales()
+                                contract_url = f"{os.environ.get('SUPABASE_URL')}/storage/v1/object/public/contract-files/{cpath}"
+                                contract_name = camp_contract_file.name
+                            except Exception as e:
+                                st.warning(f"계약서 업로드는 실패했지만 캠페인은 등록됐어요 ({type(e).__name__}: {e})")
+                        elif drive_pick and drive_res and drive_res["brand"] == camp_brand_for_drive:
+                            contract_url, contract_name = drive_pick.get("link"), drive_pick["name"]
+                        if contract_url:
+                            try:
+                                SUPA.table("sales_campaigns").update({
+                                    "contract_url": contract_url, "contract_name": contract_name,
+                                }).eq("id", new_camp_id).execute()
+                                msg += f" 📄 계약서 연결: {contract_name}"
+                            except Exception as e:
+                                st.warning(
+                                    "캠페인은 등록됐지만 계약서 링크를 저장하지 못했어요. DB에 계약서 칸(contract_url, contract_name)이 "
+                                    f"아직 없는 것 같아요 — 관리자에게 알려주세요. ({type(e).__name__}: {e})"
+                                )
+                        st.session_state["camp_new_msg"] = msg
+                        st.session_state["camp_new_ver"] = cv + 1
+                        st.session_state.pop("camp_drive_result", None)
+                        refresh_sales()
+                        st.rerun()
+
+        with tab_camp:
+            st.markdown("**등록된 캠페인 · 주차 루틴**")
+            my_account_ids_camp = {a["id"] for a in my_accounts}
+            my_campaigns = [c for c in load_sales_campaigns() if c["account_id"] in my_account_ids_camp]
+            if not my_campaigns:
+                st.caption("등록된 캠페인이 없습니다.")
+            for c in my_campaigns:
+                acc = account_by_id.get(c["account_id"], {})
+                with st.expander(f"🚀 [{acc.get('brand_name', '?')}] {c['campaign_name']} · 오픈 {c['open_date']} · {c['status']}"):
+                    tasks = [t for t in load_sales_campaign_tasks() if t["campaign_id"] == c["id"]]
+                    if c.get("contract_url"):
+                        st.markdown(f"📄 계약서: [{c.get('contract_name') or '열기'}]({c['contract_url']})")
+                    for t in sorted(tasks, key=lambda x: x["week_number"]):
+                        with st.container(border=True):
+                            st.markdown(f"**{t['week_number']}주차 — {t['task_title']}** · 마감 {t.get('due_date') or '-'}")
+                            if t.get("task_description"):
+                                st.caption(t["task_description"])
+                            new_tstatus = st.selectbox(
+                                "상태", ["예정", "진행중", "완료"], index=["예정", "진행중", "완료"].index(t["status"]),
+                                key=f"wtstatus_{t['id']}", label_visibility="collapsed",
+                            )
+                            if st.button("저장", key=f"wtsave_{t['id']}"):
+                                SUPA.table("sales_campaign_tasks").update({"status": new_tstatus}).eq("id", t["id"]).execute()
+                                st.success("저장 완료"); refresh_sales()
     elif my_role == "dev":
         st.markdown("**💻 개발 업무 관리** — 백로그 → 진행중 → 리뷰 → 완료 (칸반 방식)")
         st.caption("전세계 개발팀이 가장 많이 쓰는 방식이에요. 카드를 만들고 상태만 옮기면 됩니다.")
