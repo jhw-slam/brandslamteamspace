@@ -315,6 +315,144 @@ def _collect_sections(all_sheets):
     return sections
 
 
+_DRIVE_API = "https://www.googleapis.com/drive/v3/files"
+_CONTRACT_WORDS = ("계약", "contract", "agreement", "mou", "견적", "합의")
+
+
+def _drive_token():
+    """서비스계정(GOOGLE_SERVICE_ACCOUNT_JSON)으로 드라이브 읽기 전용 토큰을 받는다. (token, 서비스계정 이메일, 에러문구)"""
+    raw = os.environ.get("GOOGLE_SERVICE_ACCOUNT_JSON")
+    if not raw:
+        return None, None, "GOOGLE_SERVICE_ACCOUNT_JSON 환경변수가 이 서비스(brandslamteamspace)에 설정돼 있지 않아요. Railway Variables에 다른 서비스에서 쓰는 값을 복사해주세요."
+    try:
+        info = json.loads(raw)
+    except Exception as e:
+        return None, None, f"GOOGLE_SERVICE_ACCOUNT_JSON이 올바른 JSON이 아니에요 ({type(e).__name__}: {e}). 줄바꿈·따옴표가 깨졌는지 확인해주세요."
+    email = info.get("client_email")
+    try:
+        from google.oauth2 import service_account
+        from google.auth.transport.requests import Request
+        creds = service_account.Credentials.from_service_account_info(
+            info, scopes=["https://www.googleapis.com/auth/drive.readonly"])
+        creds.refresh(Request())
+        return creds.token, email, None
+    except ImportError:
+        return None, email, "google-auth 패키지가 설치돼 있지 않아요(requirements.txt 반영 후 재배포가 필요해요)."
+    except Exception as e:
+        return None, email, f"구글 인증에 실패했어요 ({type(e).__name__}: {e})"
+
+
+def _drive_q(text):
+    return str(text).replace("\\", "\\\\").replace("'", "\\'")
+
+
+def _drive_list(token, q, fields="id,name,mimeType,webViewLink,modifiedTime,parents", page_cap=5):
+    """드라이브 files.list를 페이지 끝까지(최대 page_cap쪽) 읽는다. 공유 드라이브 포함."""
+    out, page_token = [], None
+    for _ in range(page_cap):
+        params = {
+            "q": q, "fields": f"nextPageToken,files({fields})", "pageSize": 1000,
+            "supportsAllDrives": "true", "includeItemsFromAllDrives": "true", "corpora": "allDrives",
+        }
+        if page_token:
+            params["pageToken"] = page_token
+        res = requests.get(_DRIVE_API, params=params, headers={"Authorization": f"Bearer {token}"}, timeout=30)
+        if res.status_code != 200:
+            raise RuntimeError(f"드라이브 응답 오류 {res.status_code}: {res.text[:200]}")
+        data = res.json()
+        out.extend(data.get("files", []))
+        page_token = data.get("nextPageToken")
+        if not page_token:
+            break
+    return out
+
+
+def _drive_find_contracts(brand_name, campaign_name="", max_folders=400):
+    """DRIVE_FOLDER_ID(최상위 폴더) 아래 모든 하위 폴더를 훑어서, 브랜드 이름이 파일명/폴더명에 들어간 파일을 찾는다.
+    반환: (후보 목록, 안내문구, 에러문구). 후보: {'id','name','path','link','modified','score'}"""
+    root = os.environ.get("DRIVE_FOLDER_ID")
+    if not root:
+        return [], None, "DRIVE_FOLDER_ID 환경변수가 이 서비스에 설정돼 있지 않아요(최상위 폴더 ID)."
+    token, sa_email, err = _drive_token()
+    if err:
+        return [], None, err
+    try:
+        meta = requests.get(
+            f"{_DRIVE_API}/{root}", params={"fields": "id,name", "supportsAllDrives": "true"},
+            headers={"Authorization": f"Bearer {token}"}, timeout=30,
+        )
+        if meta.status_code in (403, 404):
+            return [], None, (
+                f"최상위 폴더({root})를 못 열었어요 (코드 {meta.status_code}). "
+                f"구글드라이브에서 그 폴더 **공유**에 서비스계정 이메일 `{sa_email}` 을(를) **뷰어**로 추가해주세요. "
+                "(크론의 드라이브 스캔이 0건이던 것도 같은 이유일 가능성이 높아요)")
+        if meta.status_code != 200:
+            return [], None, f"드라이브 응답 오류 {meta.status_code}: {meta.text[:200]}"
+
+        # 1) 하위 폴더 전체를 층별로 훑어서 {폴더ID: (이름, 부모ID)} 로 만든다
+        folders = {root: (meta.json().get("name", ""), None)}
+        level = [root]
+        while level and len(folders) < max_folders:
+            nxt = []
+            for i in range(0, len(level), 25):
+                parents = " or ".join(f"'{pid}' in parents" for pid in level[i:i + 25])
+                for f in _drive_list(token, f"({parents}) and trashed=false and mimeType='application/vnd.google-apps.folder'",
+                                     fields="id,name,parents"):
+                    if f["id"] not in folders:
+                        folders[f["id"]] = (f["name"], (f.get("parents") or [None])[0])
+                        nxt.append(f["id"])
+            level = nxt
+
+        def path_of(fid):
+            names, cur = [], fid
+            while cur in folders and len(names) < 12:
+                names.append(folders[cur][0]); cur = folders[cur][1]
+            return " / ".join(reversed(names))
+
+        brand = (brand_name or "").strip()
+        brand_l = brand.lower()
+        camp_l = (campaign_name or "").strip().lower()
+        # 2) 파일명에 브랜드가 들어간 파일 + 이름에 브랜드가 들어간 폴더 안의 모든 파일
+        found = {}
+        ids = list(folders)
+        brand_folder_ids = [fid for fid in ids if brand_l and brand_l in path_of(fid).lower()]
+        queries = []
+        for i in range(0, len(ids), 25):
+            parents = " or ".join(f"'{pid}' in parents" for pid in ids[i:i + 25])
+            if brand:
+                queries.append(f"({parents}) and trashed=false and mimeType!='application/vnd.google-apps.folder' and name contains '{_drive_q(brand)}'")
+        for i in range(0, len(brand_folder_ids), 25):
+            parents = " or ".join(f"'{pid}' in parents" for pid in brand_folder_ids[i:i + 25])
+            queries.append(f"({parents}) and trashed=false and mimeType!='application/vnd.google-apps.folder'")
+        for q in queries:
+            for f in _drive_list(token, q):
+                found[f["id"]] = f
+
+        cands = []
+        for f in found.values():
+            name_l = f["name"].lower()
+            parent = (f.get("parents") or [None])[0]
+            fpath = path_of(parent) if parent in folders else ""
+            score = 0
+            if any(w in name_l for w in _CONTRACT_WORDS) or any(w in fpath.lower() for w in _CONTRACT_WORDS):
+                score += 3
+            if brand_l and brand_l in name_l:
+                score += 2
+            if camp_l and camp_l in name_l:
+                score += 2
+            cands.append({
+                "id": f["id"], "name": f["name"], "path": fpath, "link": f.get("webViewLink"),
+                "modified": (f.get("modifiedTime") or "")[:10], "score": score,
+            })
+        cands.sort(key=lambda c: (c["score"], c["modified"]), reverse=True)
+        note = f"폴더 {len(folders)}개를 훑어서 '{brand}' 관련 파일 {len(cands)}개를 찾았어요."
+        if len(folders) >= max_folders:
+            note += f" (폴더가 많아서 앞 {max_folders}개까지만 훑었어요)"
+        return cands[:20], note, None
+    except Exception as e:
+        return [], None, f"드라이브에서 찾는 중 문제가 생겼어요 ({type(e).__name__}: {e})"
+
+
 def _ai_infer_column_mapping(all_sheets):
     """본격적으로 전부 추출하기 전에, 열 구성을 어떻게 이해했는지 사람이 먼저 확인하게 한다
     (예: 'A열이 이름이 맞나요?'에 해당하는 사전 점검 단계)."""
@@ -1886,13 +2024,49 @@ with tab_mywork:
                 st.caption("먼저 브랜드 계정을 등록해주세요.")
             else:
                 with st.expander("🚀 새 캠페인 등록", expanded=True):
-                    with st.form("new_campaign_form", clear_on_submit=True):
-                        acc_names2 = {a["brand_name"]: a["id"] for a in my_accounts}
-                        camp_brand = st.selectbox("브랜드", list(acc_names2.keys()), key="camp_brand_pick")
-                        camp_name = st.text_input("캠페인명 *", placeholder="예: 9월 명동 오픈 캠페인")
-                        camp_open_date = st.date_input("캠페인 오픈일", value=date.today(), key="camp_open_date")
-                        camp_submitted = st.form_submit_button("등록 (4주 루틴 자동 생성)", type="primary")
-                    if camp_submitted:
+                    cv = st.session_state.setdefault("camp_new_ver", 0)  # 등록 성공 후 입력칸을 비우려고 key에 붙이는 번호
+                    if st.session_state.get("camp_new_msg"):
+                        st.success(st.session_state.pop("camp_new_msg"))
+                    acc_names2 = {a["brand_name"]: a["id"] for a in my_accounts}
+                    camp_brand = st.selectbox("브랜드", list(acc_names2.keys()), key="camp_brand_pick")
+                    camp_name = st.text_input("캠페인명 *", placeholder="예: 9월 명동 오픈 캠페인", key=f"camp_new_name_{cv}")
+                    camp_open_date = st.date_input("캠페인 오픈일", value=date.today(), key=f"camp_new_open_{cv}")
+
+                    st.markdown("**📄 계약서** (선택) — 직접 올리거나, 구글드라이브에서 찾아올 수 있어요")
+                    cc1, cc2 = st.columns(2)
+                    camp_contract_file = cc1.file_uploader(
+                        "계약서 파일 올리기", type=["pdf", "docx", "png", "jpg", "jpeg"], key=f"camp_new_contract_file_{cv}",
+                    )
+                    cc2.caption("브랜드명(과 캠페인명)이 들어간 파일·폴더를 드라이브에서 찾아와요.")
+                    if cc2.button("🔍 구글드라이브에서 찾아오기", key="camp_new_drive_find", use_container_width=True):
+                        with st.spinner("구글드라이브를 훑는 중... (폴더가 많으면 시간이 좀 걸려요)"):
+                            _cands, _note, _err = _drive_find_contracts(camp_brand, camp_name)
+                        st.session_state["camp_drive_result"] = {"brand": camp_brand, "cands": _cands, "note": _note, "err": _err}
+                        st.session_state.pop(f"camp_drive_pick_{cv}", None)
+
+                    drive_res = st.session_state.get("camp_drive_result")
+                    drive_pick = None
+                    if drive_res:
+                        if drive_res["brand"] != camp_brand:
+                            st.caption("브랜드를 바꾸셨어요. 아래 결과는 이전 브랜드 기준이라, 다시 '찾아오기'를 눌러주세요.")
+                        elif drive_res["err"]:
+                            st.error(f"❌ {drive_res['err']}")
+                        else:
+                            st.caption(drive_res["note"])
+                            if not drive_res["cands"]:
+                                st.warning("관련 파일을 못 찾았어요. 파일 이름이나 폴더 이름에 브랜드명이 들어 있는지 확인하시거나, 위에서 직접 올려주세요.")
+                            else:
+                                by_id = {c["id"]: c for c in drive_res["cands"]}
+                                pick_id = st.radio(
+                                    "찾은 파일 중 이 캠페인의 계약서를 골라주세요", list(by_id.keys()), index=None,
+                                    format_func=lambda fid: f"{by_id[fid]['name']}  ·  {by_id[fid]['path'] or '(최상위)'}  ·  수정 {by_id[fid]['modified'] or '-'}",
+                                    key=f"camp_drive_pick_{cv}",
+                                )
+                                drive_pick = by_id.get(pick_id)
+                                if drive_pick and drive_pick.get("link"):
+                                    st.markdown(f"👉 [선택한 파일 미리 열어보기]({drive_pick['link']})")
+
+                    if st.button("등록 (4주 루틴 자동 생성)", type="primary", key=f"camp_new_submit_{cv}"):
                         if not camp_name.strip():
                             st.error("캠페인명을 입력해주세요.")
                         else:
@@ -1906,8 +2080,39 @@ with tab_mywork:
                                 "task_description": wd, "due_date": (camp_open_date + timedelta(days=(wn - 1) * 7)).isoformat(),
                             } for wn, wt, wd in WEEK_TEMPLATE]
                             SUPA.table("sales_campaign_tasks").insert(week_tasks).execute()
-                            st.success(f"캠페인 등록 완료! 1~4주차 루틴 {len(week_tasks)}개가 자동으로 만들어졌어요.")
+                            msg = f"캠페인 등록 완료! 1~4주차 루틴 {len(week_tasks)}개가 자동으로 만들어졌어요."
+
+                            contract_url, contract_name = None, None
+                            if camp_contract_file is not None:  # 직접 올린 파일이 있으면 그걸 우선 사용
+                                try:
+                                    ext = os.path.splitext(camp_contract_file.name)[1].lower()
+                                    cpath = f"campaign/{new_camp_id}/{uuid.uuid4().hex[:8]}{ext}"
+                                    SUPA.storage.from_("contract-files").upload(
+                                        cpath, camp_contract_file.getvalue(),
+                                        {"content-type": camp_contract_file.type or "application/octet-stream"},
+                                    )
+                                    contract_url = f"{os.environ.get('SUPABASE_URL')}/storage/v1/object/public/contract-files/{cpath}"
+                                    contract_name = camp_contract_file.name
+                                except Exception as e:
+                                    st.warning(f"계약서 업로드는 실패했지만 캠페인은 등록됐어요 ({type(e).__name__}: {e})")
+                            elif drive_pick and drive_res and drive_res["brand"] == camp_brand:
+                                contract_url, contract_name = drive_pick.get("link"), drive_pick["name"]
+                            if contract_url:
+                                try:
+                                    SUPA.table("sales_campaigns").update({
+                                        "contract_url": contract_url, "contract_name": contract_name,
+                                    }).eq("id", new_camp_id).execute()
+                                    msg += f" 📄 계약서 연결: {contract_name}"
+                                except Exception as e:
+                                    st.warning(
+                                        "캠페인은 등록됐지만 계약서 링크를 저장하지 못했어요. DB에 계약서 칸(contract_url, contract_name)이 "
+                                        f"아직 없는 것 같아요 — 관리자에게 알려주세요. ({type(e).__name__}: {e})"
+                                    )
+                            st.session_state["camp_new_msg"] = msg
+                            st.session_state["camp_new_ver"] = cv + 1
+                            st.session_state.pop("camp_drive_result", None)
                             refresh_sales()
+                            st.rerun()
 
                 my_account_ids_camp = {a["id"] for a in my_accounts}
                 my_campaigns = [c for c in load_sales_campaigns() if c["account_id"] in my_account_ids_camp]
@@ -1917,6 +2122,8 @@ with tab_mywork:
                     acc = account_by_id.get(c["account_id"], {})
                     with st.expander(f"🚀 [{acc.get('brand_name', '?')}] {c['campaign_name']} · 오픈 {c['open_date']} · {c['status']}"):
                         tasks = [t for t in load_sales_campaign_tasks() if t["campaign_id"] == c["id"]]
+                        if c.get("contract_url"):
+                            st.markdown(f"📄 계약서: [{c.get('contract_name') or '열기'}]({c['contract_url']})")
                         for t in sorted(tasks, key=lambda x: x["week_number"]):
                             with st.container(border=True):
                                 st.markdown(f"**{t['week_number']}주차 — {t['task_title']}** · 마감 {t.get('due_date') or '-'}")
