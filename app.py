@@ -621,6 +621,87 @@ def _render_month_calendar(events, year, month, today, max_chips=4):
     ), color_of
 
 
+def _month_add(y, m, n):
+    t = y * 12 + (m - 1) + n
+    return t // 12, t % 12 + 1
+
+
+def _forecast_next_month(accounts, campaigns, tasks, today):
+    """등록된 데이터만으로 '다음달 캠페인'을 규칙 기반으로 예측한다(추측 숫자를 만들지 않고, 근거를 함께 돌려준다).
+    반환: 계정별 행 목록. 상태: 확정(다음달 캠페인이 이미 등록됨) / 높음 / 중간 / 낮음."""
+    cy, cm = today.year, today.month
+    ny, nm = _month_add(cy, cm, 1)
+    camps_by_acc = {}
+    for c in campaigns:
+        if c.get("account_id") and c.get("open_date"):
+            camps_by_acc.setdefault(c["account_id"], []).append(c)
+    tasks_by_camp = {}
+    for t in tasks:
+        tasks_by_camp.setdefault(t["campaign_id"], []).append(t)
+
+    rows = []
+    for a in accounts:
+        if a.get("status") in ("종료", "이탈"):
+            continue
+        cs = sorted(camps_by_acc.get(a["id"], []), key=lambda c: str(c["open_date"]))
+        months = {(int(str(c["open_date"])[:4]), int(str(c["open_date"])[5:7])) for c in cs}
+        budget = float(a["monthly_budget"]) if a.get("monthly_budget") else None
+        renewal = date.fromisoformat(str(a["renewal_date"])[:10]) if a.get("renewal_date") else None
+        renewal_next = bool(renewal and (renewal.year, renewal.month) == (ny, nm))
+
+        # 이번 달(없으면 지난달)부터 거꾸로 연속으로 캠페인이 있던 달 수
+        start = (cy, cm) if (cy, cm) in months else _month_add(cy, cm, -1)
+        streak, cur = 0, start
+        while cur in months and streak < 12:
+            streak += 1
+            cur = _month_add(cur[0], cur[1], -1)
+        streak = streak if start in months else 0
+
+        last = cs[-1] if cs else None
+        pred_open = None
+        if last:
+            ld = date.fromisoformat(str(last["open_date"])[:10])
+            pred_open = date(ny, nm, min(ld.day, calendar.monthrange(ny, nm)[1]))
+        elif renewal_next:
+            pred_open = renewal
+
+        # 가장 최근 캠페인의 '다음달 견적서 발송(3주차)' · '다음달 계약 확정·입금(4주차)' 진행 상황
+        wk = {t["week_number"]: t["status"] for t in tasks_by_camp.get(last["id"], [])} if last else {}
+
+        registered = [c for c in cs if (int(str(c["open_date"])[:4]), int(str(c["open_date"])[5:7])) == (ny, nm)]
+        reasons = []
+        if registered:
+            level = "확정"
+            reasons.append(f"다음달 캠페인 {len(registered)}건 등록됨: " + ", ".join(c["campaign_name"] for c in registered))
+        else:
+            active = a.get("status") in ("운영중", "계약완료")
+            if active and streak >= 2:
+                level = "높음"; reasons.append(f"{streak}개월 연속 캠페인 진행")
+            elif active and (streak == 1 or renewal_next):
+                level = "중간"
+                if streak == 1:
+                    reasons.append("지난/이번 달 캠페인 진행 (연속 1개월)")
+            else:
+                level = "낮음"
+                reasons.append("협상 중" if a.get("status") == "협상중" else "최근 캠페인 기록이 없음")
+            if renewal_next:
+                reasons.append(f"다음달 갱신/온보딩일 {renewal.isoformat()}")
+            if wk.get(3) == "완료":
+                reasons.append("3주차 '익월 견적서 발송' 완료")
+            elif last and wk.get(3):
+                reasons.append(f"견적서 발송(3주차) {wk[3]}")
+        rows.append({
+            "brand": a["brand_name"], "level": level, "reason": " · ".join(reasons) or "-",
+            # 근거가 약하면(낮음) 예상 오픈일을 지어내지 않는다
+            "pred_open": None if level == "낮음" else pred_open,
+            "budget": budget, "budget_missing": budget is None,
+            "owner": a.get("assigned_to"),
+        })
+    order = {"확정": 0, "높음": 1, "중간": 2, "낮음": 3}
+    rows.sort(key=lambda r: (order[r["level"]], r["brand"]))
+    return rows
+
+
 def _api_error_text(status, body):
     """Claude API 오류를 직원이 이해할 수 있는 말로 바꾼다(원문도 같이 보여줘서 원인을 숨기지 않는다)."""
     body = str(body or "")
@@ -2052,7 +2133,7 @@ with tab_mywork:
         account_by_id = {a["id"]: a for a in all_sales_accounts}
         STATUS_OPTS_ACC = ["협상중", "계약완료", "운영중", "종료", "이탈"]
 
-        tab_reg, tab_big, tab_cal, tab_acc, tab_issue, tab_camp = st.tabs(["📝 캠페인 등록", "🗓️ 큰 캘린더", "📅 일정 한눈에보기", "🏢 계정 관리", "🐛 이슈", "🚀 캠페인·주차루틴"])
+        tab_reg, tab_big, tab_fc, tab_cal, tab_acc, tab_issue, tab_camp = st.tabs(["📝 캠페인 등록", "🗓️ 큰 캘린더", "🔮 다음달 예측", "📅 일정 한눈에보기", "🏢 계정 관리", "🐛 이슈", "🚀 캠페인·주차루틴"])
 
         # ── 📅 일정 한눈에보기 ──────────────────────────────────
         with tab_big:
@@ -2120,6 +2201,58 @@ with tab_mywork:
                         } for e in month_rows]), hide_index=True, use_container_width=True)
                     else:
                         st.caption("이번 달에는 일정이 없어요.")
+
+        with tab_fc:
+            _t = date.today()
+            _ny, _nm = _month_add(_t.year, _t.month, 1)
+            st.markdown(f"**{_ny}년 {_nm}월 캠페인 예측** — 등록된 캠페인·계정 정보만으로 계산해요. 근거가 없으면 만들어내지 않고 '낮음'으로 둡니다.")
+            fc_rows = _forecast_next_month(my_accounts, load_sales_campaigns(), load_sales_campaign_tasks(), _t)
+            confirmed = [r for r in fc_rows if r["level"] == "확정"]
+            high = [r for r in fc_rows if r["level"] == "높음"]
+            mid = [r for r in fc_rows if r["level"] == "중간"]
+            low = [r for r in fc_rows if r["level"] == "낮음"]
+            _sum = lambda rs: sum(r["budget"] or 0 for r in rs)
+            m1, m2, m3, m4 = st.columns(4)
+            m1.metric("✅ 확정(등록됨)", f"{len(confirmed)}건", f"₩{_sum(confirmed):,.0f}", delta_color="off")
+            m2.metric("🟢 가능성 높음", f"{len(high)}건", f"₩{_sum(high):,.0f}", delta_color="off")
+            m3.metric("🟡 가능성 중간", f"{len(mid)}건", f"₩{_sum(mid):,.0f}", delta_color="off")
+            m4.metric("🔴 낮음/불확실", f"{len(low)}건")
+            st.caption("금액은 '🏢 계정 관리'에 적힌 월 예산 기준이에요. 월 예산이 비어 있는 브랜드는 0원으로 계산돼요.")
+
+            if not fc_rows:
+                st.info("예측할 브랜드 계정이 아직 없어요. '🏢 계정 관리'에서 담당 브랜드를 등록하고, 캠페인을 등록하면 여기에 나타나요.")
+            elif not confirmed:
+                todo = [r["brand"] for r in high + mid]
+                st.error(
+                    f"⚠️ {_ny}년 {_nm}월에 확정된 캠페인이 아직 없어요. "
+                    + (f"지금 견적·계약을 챙겨야 할 브랜드: **{', '.join(todo)}**" if todo else "가능성이 높은 브랜드도 없어서, 신규 수주가 필요해요.")
+                )
+            elif not high and not mid:
+                st.success(f"{_ny}년 {_nm}월 캠페인 {len(confirmed)}건이 확정돼 있어요.")
+
+            if fc_rows:
+                icon = {"확정": "✅ 확정", "높음": "🟢 높음", "중간": "🟡 중간", "낮음": "🔴 낮음"}
+                st.dataframe(pd.DataFrame([{
+                    "상태": icon[r["level"]], "브랜드": r["brand"], "예상 오픈일": r["pred_open"].isoformat() if r["pred_open"] else "-",
+                    "월 예산": (f"₩{r['budget']:,.0f}" if r["budget"] else "미입력"), "근거": r["reason"], "담당": r["owner"],
+                } for r in fc_rows]), hide_index=True, use_container_width=True)
+                no_budget = [r["brand"] for r in fc_rows if r["budget_missing"] and r["level"] in ("확정", "높음", "중간")]
+                if no_budget:
+                    st.caption(f"💡 월 예산이 비어 있는 브랜드: {', '.join(no_budget)} — '🏢 계정 관리'에 적어두면 예상 매출이 정확해져요.")
+
+            # 최근 6개월 + 다음달 캠페인 수: '한 달 달리고 한 달 쉬는' 패턴이 있는지 한눈에 보기
+            _camps_all = [c for c in load_sales_campaigns() if c.get("account_id") in {a["id"] for a in my_accounts} and c.get("open_date")]
+            _cnt = {}
+            for c in _camps_all:
+                k = str(c["open_date"])[:7]
+                _cnt[k] = _cnt.get(k, 0) + 1
+            _months = [_month_add(_t.year, _t.month, i) for i in range(-5, 2)]
+            _labels = [f"{y}-{m:02d}" for y, m in _months]
+            _series = [_cnt.get(l, 0) for l in _labels]
+            _series[-1] = len(confirmed)  # 다음달은 '확정'만 센다
+            if sum(_series) > 0:
+                st.markdown("**월별 캠페인 시작 건수** (마지막 달 = 다음달 확정 건수)")
+                st.bar_chart(pd.DataFrame({"캠페인 수": _series}, index=_labels))
 
         with tab_cal:
             st.markdown("**다가오는 일정**")
