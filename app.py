@@ -1,6 +1,8 @@
 import os
 import io
 import re
+import html
+import calendar
 import json
 import uuid
 import base64
@@ -574,6 +576,49 @@ def _drive_children(folder_id):
     folders_ = sorted([i for i in items if is_folder(i)], key=lambda i: i["name"].lower())
     files_ = sorted([i for i in items if not is_folder(i)], key=lambda i: i.get("modifiedTime") or "", reverse=True)
     return folders_ + files_, None
+
+
+_CAL_COLORS = ["#4C78A8", "#F58518", "#54A24B", "#B279A2", "#E45756", "#72B7B2", "#EECA3B", "#9D755D"]
+
+
+def _render_month_calendar(events, year, month, today, max_chips=4):
+    """월 달력(HTML)을 만든다. events: [{'date','label','full','key','done'}]. 같은 날 일정은 캠페인 색으로 쌓여서 겹쳐 보인다."""
+    keys = sorted({e["key"] for e in events}, key=str)
+    color_of = {k: _CAL_COLORS[i % len(_CAL_COLORS)] for i, k in enumerate(keys)}
+    by_day = {}
+    for e in events:
+        by_day.setdefault(e["date"], []).append(e)
+    weeks = calendar.Calendar(firstweekday=6).monthdatescalendar(year, month)  # 일요일 시작
+    head = "".join(f"<th style='padding:6px;text-align:center;font-weight:600'>{d}</th>" for d in "일월화수목금토")
+    rows = []
+    for wk in weeks:
+        tds = []
+        for d in wk:
+            in_month = d.month == month
+            chips = []
+            for e in sorted(by_day.get(d, []), key=lambda x: (x["done"], str(x["key"])))[:max_chips]:
+                c = color_of[e["key"]]
+                deco = "text-decoration:line-through;opacity:.55;" if e["done"] else ""
+                chips.append(
+                    f"<div title='{html.escape(e['full'], quote=True)}' style='margin:2px 0;padding:1px 5px;border-radius:4px;"
+                    f"border-left:3px solid {c};background:{c}33;font-size:11px;line-height:1.35;white-space:nowrap;"
+                    f"overflow:hidden;text-overflow:ellipsis;{deco}'>{html.escape(e['label'])}</div>"
+                )
+            more = len(by_day.get(d, [])) - max_chips
+            if more > 0:
+                chips.append(f"<div style='font-size:11px;opacity:.7'>+{more}개 더</div>")
+            is_today = d == today
+            num_style = "font-weight:700;color:#fff;background:#E45756;border-radius:10px;padding:0 6px;" if is_today else ""
+            tds.append(
+                f"<td style='vertical-align:top;height:104px;padding:4px;border:1px solid rgba(128,128,128,.25);"
+                f"{'' if in_month else 'opacity:.35;'}'><div style='font-size:12px;margin-bottom:2px'>"
+                f"<span style='{num_style}'>{d.day}</span></div>{''.join(chips)}</td>"
+            )
+        rows.append("<tr>" + "".join(tds) + "</tr>")
+    return (
+        "<table style='width:100%;table-layout:fixed;border-collapse:collapse'>"
+        f"<thead><tr>{head}</tr></thead><tbody>{''.join(rows)}</tbody></table>"
+    ), color_of
 
 
 def _api_error_text(status, body):
@@ -2007,9 +2052,75 @@ with tab_mywork:
         account_by_id = {a["id"]: a for a in all_sales_accounts}
         STATUS_OPTS_ACC = ["협상중", "계약완료", "운영중", "종료", "이탈"]
 
-        tab_reg, tab_cal, tab_acc, tab_issue, tab_camp = st.tabs(["📝 캠페인 등록", "📅 일정 한눈에보기", "🏢 계정 관리", "🐛 이슈", "🚀 캠페인·주차루틴"])
+        tab_reg, tab_big, tab_cal, tab_acc, tab_issue, tab_camp = st.tabs(["📝 캠페인 등록", "🗓️ 큰 캘린더", "📅 일정 한눈에보기", "🏢 계정 관리", "🐛 이슈", "🚀 캠페인·주차루틴"])
 
         # ── 📅 일정 한눈에보기 ──────────────────────────────────
+        with tab_big:
+            st.markdown("**캠페인 일정 큰 캘린더** — 여러 캠페인이 같은 날 겹쳐도 색깔로 구분돼서 한눈에 보여요. (수정은 '🚀 캠페인·주차루틴' 탭에서)")
+            _camps = {c["id"]: c for c in load_sales_campaigns()}
+            _my_ids = {a["id"] for a in my_accounts}
+            cal_events = []
+            for t in load_sales_campaign_tasks():
+                camp = _camps.get(t["campaign_id"])
+                if not camp or camp["account_id"] not in _my_ids or not t.get("due_date"):
+                    continue
+                brand = account_by_id.get(camp["account_id"], {}).get("brand_name", "?")
+                cal_events.append({
+                    "date": date.fromisoformat(str(t["due_date"])[:10]), "label": f"{brand} {t['week_number']}주차",
+                    "full": f"[{brand}] {camp['campaign_name']} · {t['week_number']}주차 {t['task_title']} ({t['status']})",
+                    "key": camp["id"], "done": t["status"] == "완료", "brand": brand, "campaign": camp["campaign_name"],
+                })
+            for a in my_accounts:
+                if a.get("renewal_date"):
+                    cal_events.append({
+                        "date": date.fromisoformat(str(a["renewal_date"])[:10]), "label": f"🔁 {a['brand_name']} 갱신",
+                        "full": f"{a['brand_name']} 갱신/온보딩일", "key": f"renew-{a['id']}", "done": False,
+                        "brand": a["brand_name"], "campaign": "갱신/온보딩",
+                    })
+
+            today_d = date.today()
+            ym = st.session_state.setdefault("bigcal_ym", (today_d.year, today_d.month))
+            nv1, nv2, nv3, nv4 = st.columns([1, 1, 1, 4])
+            if nv1.button("◀ 이전 달", key="bigcal_prev", use_container_width=True):
+                y, m = st.session_state["bigcal_ym"]
+                st.session_state["bigcal_ym"] = (y - 1, 12) if m == 1 else (y, m - 1)
+                st.rerun()
+            if nv2.button("오늘", key="bigcal_today", use_container_width=True):
+                st.session_state["bigcal_ym"] = (today_d.year, today_d.month)
+                st.rerun()
+            if nv3.button("다음 달 ▶", key="bigcal_next", use_container_width=True):
+                y, m = st.session_state["bigcal_ym"]
+                st.session_state["bigcal_ym"] = (y + 1, 1) if m == 12 else (y, m + 1)
+                st.rerun()
+            cy, cm = st.session_state["bigcal_ym"]
+            nv4.markdown(f"### {cy}년 {cm}월")
+
+            all_brands = sorted({e["brand"] for e in cal_events})
+            f1, f2 = st.columns([3, 1])
+            pick_brands = f1.multiselect("브랜드 필터 (비우면 전체)", all_brands, key="bigcal_brands")
+            show_done = f2.checkbox("완료한 일정도 보기", value=True, key="bigcal_done")
+            shown = [e for e in cal_events if (not pick_brands or e["brand"] in pick_brands) and (show_done or not e["done"])]
+
+            cal_html, color_of = _render_month_calendar(shown, cy, cm, today_d)
+            st.markdown(cal_html, unsafe_allow_html=True)
+            if not shown:
+                st.caption("표시할 일정이 없어요. 캠페인을 등록하면 주차별 일정이 여기에 나타나요.")
+            else:
+                legend = "".join(
+                    f"<span style='display:inline-block;margin:2px 8px 2px 0;padding:1px 8px;border-radius:4px;border-left:3px solid {color_of[k]};"
+                    f"background:{color_of[k]}33;font-size:12px'>{html.escape(name)}</span>"
+                    for k, name in dict.fromkeys((e["key"], f"{e['brand']} · {e['campaign']}") for e in shown)
+                )
+                st.markdown(legend, unsafe_allow_html=True)
+                month_rows = sorted([e for e in shown if e["date"].year == cy and e["date"].month == cm], key=lambda e: e["date"])
+                with st.expander(f"이번 달 일정 목록 ({len(month_rows)}건)"):
+                    if month_rows:
+                        st.dataframe(pd.DataFrame([{
+                            "날짜": e["date"].isoformat(), "브랜드": e["brand"], "캠페인": e["campaign"], "내용": e["full"],
+                        } for e in month_rows]), hide_index=True, use_container_width=True)
+                    else:
+                        st.caption("이번 달에는 일정이 없어요.")
+
         with tab_cal:
             st.markdown("**다가오는 일정**")
             all_tasks = load_sales_campaign_tasks()
