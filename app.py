@@ -424,9 +424,11 @@ def _drive_list(token, q, fields="id,name,mimeType,webViewLink,modifiedTime,pare
     return out
 
 
-def _drive_find_contracts(brand_name, campaign_name="", max_folders=400, max_show=60):
+def _drive_find_contracts(brand_name, campaign_name="", max_folders=400, max_show=60,
+                          folder_words=("계약",), file_words=None, label="계약", month_hints=()):
     """DRIVE_FOLDER_ID(최상위 폴더) 아래 모든 하위 폴더를 훑어서, 이름에 '계약'이 들어간 폴더와 업체명이 들어간 폴더·파일을 찾는다.
     반환: (후보 목록, 안내문구, 에러문구). 후보: {'id','name','path','link','modified','score'}"""
+    file_words = file_words or _CONTRACT_WORDS
     root = os.environ.get("DRIVE_FOLDER_ID")
     if not root:
         return [], None, "DRIVE_FOLDER_ID 환경변수가 이 서비스에 설정돼 있지 않아요(최상위 폴더 ID)."
@@ -473,7 +475,7 @@ def _drive_find_contracts(brand_name, campaign_name="", max_folders=400, max_sho
             return list(reversed(names))
 
         def in_contract(fid):  # 이름에 '계약'이 들어간 폴더이거나 그 아래에 있는 폴더
-            return any("계약" in n for n in chain_names(fid))
+            return any(w in n.lower() for n in chain_names(fid) for w in folder_words)
 
         def brand_in_chain(fid):
             return bool(brand_n) and any(brand_n in _drive_norm(n) for n in chain_names(fid))
@@ -508,13 +510,15 @@ def _drive_find_contracts(brand_name, campaign_name="", max_folders=400, max_sho
                 score += 4
             if path_hit:
                 score += 2
-            if any(w in f["name"].lower() for w in _CONTRACT_WORDS):
+            if any(w in f["name"].lower() for w in file_words):
                 score += 1
+            if month_hints and any(h in _drive_norm(f["name"]) for h in month_hints):
+                score += 3  # 캠페인 월이 이름에 들어간 파일(예: '10월', '202610')
             if camp_n and camp_n in _drive_norm(f["name"]):
                 score += 2
             cands.append({
                 "id": f["id"], "name": f["name"], "path": fpath, "link": f.get("webViewLink"),
-                "modified": (f.get("modifiedTime") or "")[:10], "score": score, "kind": "file",
+                "modified": (f.get("modifiedTime") or "")[:10], "score": score, "kind": "file", "mime": f.get("mimeType"),
             })
         n_files = len(cands)
 
@@ -524,7 +528,7 @@ def _drive_find_contracts(brand_name, campaign_name="", max_folders=400, max_sho
             fname = folders[fid][0]
             if fid == root:
                 continue
-            is_contract = "계약" in fname
+            is_contract = any(w in fname.lower() for w in folder_words)
             is_brand = bool(brand_n) and brand_n in _drive_norm(fname)
             if not (is_contract or is_brand):
                 continue
@@ -541,7 +545,7 @@ def _drive_find_contracts(brand_name, campaign_name="", max_folders=400, max_sho
                 "link": f"https://drive.google.com/drive/folders/{fid}", "modified": "", "score": score, "kind": "folder",
             })
         cands.sort(key=lambda c: (c["score"], c["modified"]), reverse=True)
-        note = f"폴더 {len(folders)}개를 훑어서 '계약' 폴더 {n_contract_folders}개"
+        note = f"폴더 {len(folders)}개를 훑어서 '{label}' 폴더 {n_contract_folders}개"
         if brand:
             note += f", '{brand}' 폴더 {n_brand_folders}개, '{brand}' 관련 파일 {n_files}개를 찾았어요."
         else:
@@ -700,6 +704,337 @@ def _forecast_next_month(accounts, campaigns, tasks, today):
     order = {"확정": 0, "높음": 1, "중간": 2, "낮음": 3}
     rows.sort(key=lambda r: (order[r["level"]], r["brand"]))
     return rows
+
+
+_INVOICE_FOLDER_WORDS = ("인보이스", "invoice", "청구")
+_INVOICE_FILE_WORDS = ("인보이스", "invoice", "청구", "inv", "세금계산서", "거래명세")
+
+
+def _drive_find_invoices(brand_name, campaign_name="", open_date=None):
+    """브랜드·캠페인 월에 맞는 인보이스 후보를 드라이브에서 찾는다(파일명에 월이 있으면 가산점)."""
+    hints = ()
+    if open_date:
+        y, m = int(str(open_date)[:4]), int(str(open_date)[5:7])
+        hints = (f"{m}월", f"{y}{m:02d}", f"{y % 100:02d}{m:02d}", f"{m:02d}월")
+    return _drive_find_contracts(
+        brand_name, campaign_name, folder_words=_INVOICE_FOLDER_WORDS, file_words=_INVOICE_FILE_WORDS,
+        label="인보이스", month_hints=tuple(_drive_norm(h) for h in hints),
+    )
+
+
+_AMOUNT_RX = re.compile(
+    r"(?<![\w.])(?:[₩$]\s*)?\d{1,3}(?:,\d{3})+(?:\.\d{1,2})?(?![\d])"
+    r"|(?<![\w.])[₩$]\s*\d+(?:\.\d{1,2})?"
+    r"|(?<![\w.,])\d{5,}(?:\.\d{1,2})?(?![\d])"
+    r"|(?<![\w.,])\d+\.\d{2}(?![\d])"
+)
+_AMOUNT_KEYS = [  # (우선순위, 줄에 들어 있는 단어) — 숫자가 작을수록 '최종 청구금액'에 가깝다
+    (1, re.compile(r"합계\s*금액|총\s*청구\s*금액|청구\s*금액|총\s*합계|grand\s*total|total\s*due|amount\s*due|balance\s*due", re.I)),
+    (2, re.compile(r"합계|총\s*금액|총액|total\s*amount|total", re.I)),
+    (3, re.compile(r"공급\s*가액|supply\s*amount|sub\s*total|소계", re.I)),
+]
+_INV_NO_RX = re.compile(
+    r"(?:invoice\s*(?:no\.?|number|#)|인보이스\s*(?:번호|no\.?)|청구서\s*번호|문서\s*번호|거래명세서\s*번호)\s*[:：#]?\s*([A-Za-z0-9][A-Za-z0-9\-_/]{2,30})",
+    re.I,
+)
+
+
+def _to_amount(raw):
+    num = re.sub(r"[^\d.]", "", raw)
+    try:
+        return float(num) if num else None
+    except ValueError:
+        return None
+
+
+def _doc_text(data, name):
+    """PDF·엑셀·워드 파일에서 글자를 뽑는다. 이미지(스캔)는 글자를 못 읽으므로 빈 문자열."""
+    low = (name or "").lower()
+    try:
+        if low.endswith(".pdf") or data[:4] == b"%PDF":
+            from pypdf import PdfReader
+            reader = PdfReader(io.BytesIO(data))
+            return "\n".join((pg.extract_text() or "") for pg in reader.pages[:6])
+        if low.endswith((".xlsx", ".xlsm")) or data[:2] == b"PK" and not low.endswith(".docx"):
+            sheets = pd.read_excel(io.BytesIO(data), sheet_name=None, header=None, dtype=str)
+            return "\n".join("  ".join(str(v) for v in row if str(v) != "nan") for df in sheets.values() for row in df.values.tolist())
+        if low.endswith(".docx"):
+            import zipfile
+            with zipfile.ZipFile(io.BytesIO(data)) as z:
+                xml = z.read("word/document.xml").decode("utf-8", "ignore")
+            return re.sub(r"<[^>]+>", " ", xml.replace("</w:p>", "\n"))
+    except Exception:
+        return ""
+    return ""
+
+
+def _extract_invoice_fields(data, name):
+    """인보이스 파일에서 금액 후보·번호·통화를 읽는다. 결제 정보는 추측하지 않는다:
+    금액 후보가 여러 개거나 통화가 불확실하면 '확정하지 않고' 후보만 돌려줘서 사람이 고르게 한다."""
+    text = _doc_text(data, name)
+    out = {"text_found": bool(text.strip()), "amounts": [], "amount": None, "currency": None, "number": None, "note": ""}
+    if not out["text_found"]:
+        out["note"] = "파일에서 글자를 읽지 못했어요(스캔·이미지일 수 있어요). 금액과 번호는 직접 입력해주세요."
+        m = re.search(r"(INV[-_]?\d[A-Za-z0-9\-]*)", name or "", re.I)
+        out["number"] = m.group(1) if m else None
+        return out
+    lines = [ln.strip() for ln in text.splitlines() if ln.strip()]
+    found = []  # (우선순위, 값, 줄)
+    for i, ln in enumerate(lines):
+        for prio, rx in _AMOUNT_KEYS:
+            if rx.search(ln):
+                nums = _AMOUNT_RX.findall(ln) or (_AMOUNT_RX.findall(lines[i + 1])[:1] if i + 1 < len(lines) else [])
+                for raw in nums:
+                    v = _to_amount(raw)
+                    if v:
+                        found.append((prio, v, ln))
+                break
+    if found:
+        best = min(f[0] for f in found)
+        top_vals = list(dict.fromkeys(f[1] for f in found if f[0] == best))
+        others = [f[1] for f in found if f[0] != best and f[1] not in top_vals]
+        out["amounts"] = (top_vals + list(dict.fromkeys(others)))[:5]
+        if len(top_vals) == 1:
+            out["amount"] = top_vals[0]
+        else:
+            out["note"] = "금액 후보가 여러 개 보여요. 맞는 금액을 골라주세요."
+        ctx = " ".join(f[2] for f in found if f[0] == best)
+    else:
+        ctx = text
+        out["note"] = "금액을 찾지 못했어요. 직접 입력해주세요."
+    krw = bool(re.search(r"₩|원|KRW", ctx))
+    usd = bool(re.search(r"\$|USD", ctx, re.I))
+    if krw != usd:
+        out["currency"] = "KRW" if krw else "USD"
+    else:
+        krw_all, usd_all = bool(re.search(r"₩|KRW|[가-힣]원", text)), bool(re.search(r"\$|USD", text, re.I))
+        if krw_all != usd_all:
+            out["currency"] = "KRW" if krw_all else "USD"
+    m = _INV_NO_RX.search(text) or re.search(r"(INV[-_]?\d[A-Za-z0-9\-]*)", name or "", re.I)
+    out["number"] = m.group(1) if m else None
+    return out
+
+
+@st.cache_data(ttl=600, show_spinner=False)
+def _drive_invoice_autofill(file_id, mime, name):
+    """드라이브 파일을 내려받아 금액·번호를 읽는다. 반환: (읽은 결과 또는 None, 에러문구)"""
+    token, _email, err = _drive_token()
+    if err:
+        return None, err
+    try:
+        if (mime or "").startswith("application/vnd.google-apps."):
+            export = "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet" if "spreadsheet" in mime else "application/pdf"
+            res = requests.get(f"{_DRIVE_API}/{file_id}/export", params={"mimeType": export},
+                               headers={"Authorization": f"Bearer {token}"}, timeout=60)
+            name = name + (".xlsx" if "spreadsheet" in mime else ".pdf")
+        else:
+            res = requests.get(f"{_DRIVE_API}/{file_id}", params={"alt": "media", "supportsAllDrives": "true"},
+                               headers={"Authorization": f"Bearer {token}"}, timeout=60)
+        if res.status_code != 200:
+            return None, _drive_http_error(res, "인보이스 파일")
+        if len(res.content) > 15 * 1024 * 1024:
+            return None, "파일이 15MB보다 커서 자동으로 읽지 않았어요. 금액과 번호를 직접 입력해주세요."
+        return _extract_invoice_fields(res.content, name), None
+    except Exception as e:
+        return None, f"파일을 읽는 중 문제가 생겼어요 ({type(e).__name__}: {e})"
+
+
+def _drive_picker_ui(ns, res, brand_now, empty_msg):
+    """드라이브 검색 결과를 화면에 보여주고, 사용자가 고른 '파일'을 돌려준다(없으면 None).
+    폴더를 고르면 이 화면 안에서 안의 폴더·파일을 탐색한다. 위젯 key는 ns로 구분."""
+    if not res:
+        return None
+    if res["brand"] != brand_now:
+        st.caption("브랜드를 바꾸셨어요. 아래 결과는 이전 브랜드 기준이라, 다시 '찾기'를 눌러주세요.")
+        return None
+    if res["err"]:
+        st.error(f"❌ {res['err']}")
+        return None
+    st.caption(res["note"])
+    if not res["cands"]:
+        st.warning(empty_msg)
+        return None
+    by_id = {c["id"]: c for c in res["cands"]}
+    pick_id = st.radio(
+        "찾은 폴더·파일 중 골라주세요 (폴더를 고르면 안의 파일이 아래에 나와요)", list(by_id.keys()), index=None,
+        format_func=lambda fid: (
+            f"📁 {by_id[fid]['name']}  ·  {by_id[fid]['path'] or '(최상위)'}  ·  폴더" if by_id[fid].get("kind") == "folder"
+            else f"📄 {by_id[fid]['name']}  ·  {by_id[fid]['path'] or '(최상위)'}  ·  수정 {by_id[fid]['modified'] or '-'}"
+        ),
+        key=f"{ns}_pick",
+    )
+    pick = by_id.get(pick_id)
+    if not pick or pick.get("kind") != "folder":
+        return pick
+    bs = st.session_state.get(f"{ns}_browse")
+    if not bs or bs["root"] != pick_id:
+        bs = {"root": pick_id, "stack": [{"id": pick_id, "name": pick["name"]}]}
+        st.session_state[f"{ns}_browse"] = bs
+    cur = bs["stack"][-1]
+    st.markdown("📂 **" + " › ".join(x["name"] for x in bs["stack"]) + "**")
+    kids, kids_err = _drive_children(cur["id"])
+    if len(bs["stack"]) > 1 and st.button("⬆ 상위 폴더로", key=f"{ns}_up"):
+        bs["stack"].pop()
+        st.rerun()
+    if kids_err:
+        st.error(f"❌ {kids_err}")
+        return None
+    sub_folders = [k for k in kids if k.get("mimeType") == "application/vnd.google-apps.folder"]
+    sub_files = [k for k in kids if k.get("mimeType") != "application/vnd.google-apps.folder"]
+    for sf in sub_folders:
+        if st.button(f"📁 {sf['name']}", key=f"{ns}_open_{sf['id']}"):
+            bs["stack"].append({"id": sf["id"], "name": sf["name"]})
+            st.rerun()
+    if not sub_files:
+        st.caption("이 폴더에는 파일이 없어요." + (" 위의 폴더를 눌러 안으로 들어가 보세요." if sub_folders else ""))
+        return None
+    kid_by_id = {k["id"]: k for k in sub_files}
+    icon = lambda mt: "📊" if "spreadsheet" in (mt or "") else ("📝" if "document" in (mt or "") else "📄")
+    file_id = st.radio(
+        f"이 폴더 안의 파일 중 골라주세요 ({len(sub_files)}개)", list(kid_by_id.keys()), index=None,
+        format_func=lambda kid: f"{icon(kid_by_id[kid].get('mimeType'))} {kid_by_id[kid]['name']}  ·  수정 {(kid_by_id[kid].get('modifiedTime') or '')[:10] or '-'}",
+        key=f"{ns}_file_{cur['id']}",
+    )
+    if not file_id:
+        return None
+    kf = kid_by_id[file_id]
+    return {"id": kf["id"], "name": kf["name"], "link": kf.get("webViewLink"), "kind": "file", "mime": kf.get("mimeType")}
+
+
+def _render_invoice_section(c, brand, can_edit, my_name, refresh):
+    """캠페인 하나의 '최종 인보이스' 영역. 첨부·교체·브랜드 승인은 담당자(can_edit)만, 나머지는 보기만.
+    드라이브에서 자동으로 찾아 금액·번호를 채우되, 금액/통화는 사람이 확인해야 저장된다."""
+    cid = c["id"]
+    ns = f"inv_{cid}"
+    has_inv = bool(c.get("invoice_url"))
+    st.markdown("**📑 최종 인보이스** (브랜드 승인용)")
+    if has_inv:
+        parts = [f"[{c.get('invoice_name') or '인보이스'}]({c['invoice_url']})"]
+        if c.get("invoice_number"):
+            parts.append(f"번호 {c['invoice_number']}")
+        if c.get("invoice_amount") is not None:
+            amt = float(c["invoice_amount"])
+            parts.append(f"금액 {c.get('invoice_currency') or ''} {amt:,.0f}" if amt == int(amt) else f"금액 {c.get('invoice_currency') or ''} {amt:,.2f}")
+        if c.get("invoice_attached_by"):
+            parts.append(f"첨부 {c['invoice_attached_by']} · {str(c.get('invoice_attached_at') or '')[:10]}")
+        st.markdown(" · ".join(parts))
+    else:
+        st.caption("아직 첨부되지 않았어요." + ("" if can_edit else " 담당자(김선재)가 최종본을 첨부해요."))
+
+    # 브랜드 승인: 인보이스가 있어야만 처리할 수 있다
+    if c.get("brand_approved_at"):
+        st.success(f"✅ 브랜드 승인 완료 ({c['brand_approved_at']})")
+        if can_edit and st.button("승인 취소", key=f"{ns}_unapprove"):
+            try:
+                SUPA.table("sales_campaigns").update({"brand_approved_at": None}).eq("id", cid).execute()
+            except Exception as e:
+                st.error(f"저장하지 못했어요 ({type(e).__name__}: {e})")
+            else:
+                refresh()
+    elif not has_inv:
+        st.caption("🔒 인보이스를 첨부해야 '브랜드 승인 완료' 처리를 할 수 있어요.")
+    elif can_edit:
+        if st.button("✅ 브랜드 승인 완료 처리", key=f"{ns}_approve"):
+            try:
+                SUPA.table("sales_campaigns").update({"brand_approved_at": date.today().isoformat()}).eq("id", cid).execute()
+            except Exception as e:
+                st.error(f"저장하지 못했어요 ({type(e).__name__}: {e})")
+            else:
+                refresh()
+    else:
+        st.caption("브랜드 승인을 기다리는 중이에요.")
+
+    if not can_edit:
+        return
+    if has_inv and not st.checkbox("📎 인보이스 교체하기", key=f"{ns}_replace"):
+        return
+    with st.container(border=True):
+        up = st.file_uploader("파일 올리기 (PDF·엑셀·워드·이미지)", type=["pdf", "xlsx", "docx", "png", "jpg", "jpeg"], key=f"{ns}_file")
+        if st.button("🔍 드라이브에서 이 캠페인 인보이스 자동 찾기", key=f"{ns}_find", use_container_width=True):
+            with st.spinner("구글드라이브를 훑는 중..."):
+                _cands, _note, _err = _drive_find_invoices(brand, c["campaign_name"], c.get("open_date"))
+            st.session_state[f"{ns}_res"] = {"brand": brand, "cands": _cands, "note": _note, "err": _err}
+            st.session_state.pop(f"{ns}_pick", None)
+            st.session_state.pop(f"{ns}_browse", None)
+        picked = _drive_picker_ui(
+            ns, st.session_state.get(f"{ns}_res"), brand,
+            "'인보이스' 폴더도, 브랜드명이 들어간 파일도 못 찾았어요. 위에서 직접 올려주세요.",
+        )
+        source = None  # (식별자, 파일이름, 링크 또는 None, 읽은 결과, 에러)
+        if up is not None:
+            sig = f"up:{up.name}:{up.size}"
+            if st.session_state.get(f"{ns}_sig") != sig:
+                st.session_state[f"{ns}_parsed"] = (_extract_invoice_fields(up.getvalue(), up.name), None)
+        elif picked:
+            sig = f"dr:{picked['id']}"
+            if st.session_state.get(f"{ns}_sig") != sig:
+                st.session_state[f"{ns}_parsed"] = _drive_invoice_autofill(picked["id"], picked.get("mime"), picked["name"])
+        else:
+            sig = None
+        if sig is None:
+            return
+        parsed, perr = st.session_state.get(f"{ns}_parsed", (None, None))
+        if st.session_state.get(f"{ns}_sig") != sig:  # 새 파일을 골랐을 때만 입력칸을 자동으로 채운다
+            st.session_state[f"{ns}_sig"] = sig
+            st.session_state[f"{ns}_no"] = (parsed or {}).get("number") or ""
+            cur0 = (parsed or {}).get("currency")
+            st.session_state[f"{ns}_cur"] = cur0 if cur0 in ("KRW", "USD") else None
+            amts = (parsed or {}).get("amounts") or []
+            opts = [f"{a:,.0f}" if a == int(a) else f"{a:,.2f}" for a in amts] + ["직접 입력"]
+            st.session_state[f"{ns}_amt_opts"] = (opts, amts)
+            st.session_state[f"{ns}_amt_pick"] = opts[0] if (parsed or {}).get("amount") else None
+            st.session_state[f"{ns}_amt"] = 0.0
+        if perr:
+            st.warning(f"자동으로 읽지 못했어요: {perr}")
+        elif parsed and parsed.get("note"):
+            st.info(parsed["note"])
+        elif parsed:
+            st.success("🤖 파일에서 번호·금액을 읽어 채웠어요. 맞는지 확인하고 저장하세요.")
+        opts, amts = st.session_state.get(f"{ns}_amt_opts", (["직접 입력"], []))
+        n1, n2 = st.columns(2)
+        inv_no = n1.text_input("인보이스 번호", key=f"{ns}_no")
+        inv_cur = n2.selectbox("통화 (확인 필수)", ["KRW", "USD"], index=None, placeholder="선택", key=f"{ns}_cur")
+        amt_pick = st.radio("청구 금액", opts, index=None, horizontal=True, key=f"{ns}_amt_pick")
+        final_amt = None
+        if amt_pick == "직접 입력":
+            v = st.number_input("금액 직접 입력", min_value=0.0, step=1000.0, format="%.2f", key=f"{ns}_amt")
+            final_amt = v or None
+        elif amt_pick:
+            final_amt = amts[opts.index(amt_pick)]
+        if st.button("📌 이 인보이스로 확정", type="primary", key=f"{ns}_save"):
+            if not final_amt or not inv_cur:
+                st.error("청구 금액과 통화를 확인해서 선택해주세요. (결제 정보는 자동으로 확정하지 않아요)")
+            else:
+                url = name = None
+                try:
+                    if up is not None:
+                        ext = os.path.splitext(up.name)[1].lower()
+                        path = f"invoice/{cid}/{uuid.uuid4().hex[:8]}{ext}"
+                        SUPA.storage.from_("contract-files").upload(
+                            path, up.getvalue(), {"content-type": up.type or "application/octet-stream"},
+                        )
+                        url = f"{os.environ.get('SUPABASE_URL')}/storage/v1/object/public/contract-files/{path}"
+                        name = up.name
+                    else:
+                        url, name = picked.get("link"), picked["name"]
+                except Exception as e:
+                    st.error(f"파일을 저장하지 못했어요 ({type(e).__name__}: {e})")
+                    return
+                try:
+                    SUPA.table("sales_campaigns").update({
+                        "invoice_url": url, "invoice_name": name, "invoice_number": inv_no.strip() or None,
+                        "invoice_amount": final_amt, "invoice_currency": inv_cur,
+                        "invoice_attached_by": my_name, "invoice_attached_at": datetime.utcnow().isoformat() + "Z",
+                    }).eq("id", cid).execute()
+                except Exception as e:
+                    st.error(
+                        "인보이스를 저장하지 못했어요. DB에 인보이스 칸(migrations/20261006_sales_campaigns_invoice_columns.sql)이 "
+                        f"적용돼 있는지 확인해주세요. ({type(e).__name__}: {e})"
+                    )
+                    return
+                for k in ("res", "sig", "parsed", "amt_opts"):
+                    st.session_state.pop(f"{ns}_{k}", None)
+                refresh()
 
 
 def _api_error_text(status, body):
@@ -898,6 +1233,7 @@ def refresh():
 my_name = st.selectbox("내 이름", STAFF_NAMES, key="my_name")
 ROLE_MAP = {"김선재": "sales", "곽재선": "influencer", "구정회": "dev", "이단우": "china_ops", "가상인턴": "sales"}  # 가상인턴=테스트 계정(세일즈 화면 시험용)
 my_role = ROLE_MAP.get(my_name)
+INVOICE_EDITORS = {"김선재", "가상인턴"}  # 최종 인보이스를 첨부·교체하고 브랜드 승인 처리를 할 수 있는 사람(나머지는 보기만, 가상인턴=테스트)
 
 
 st.markdown("""
@@ -2429,66 +2765,14 @@ with tab_mywork:
                     with st.spinner("구글드라이브를 훑는 중... (폴더가 많으면 시간이 좀 걸려요)"):
                         _cands, _note, _err = _drive_find_contracts(new_brand_name.strip() if camp_brand == NEW_BRAND else camp_brand, camp_name)
                     st.session_state["camp_drive_result"] = {"brand": camp_brand if camp_brand != NEW_BRAND else new_brand_name.strip(), "cands": _cands, "note": _note, "err": _err}
-                    st.session_state.pop(f"camp_drive_pick_{cv}", None)
-                    st.session_state.pop("camp_browse", None)
+                    st.session_state.pop(f"camp_{cv}_pick", None)
+                    st.session_state.pop(f"camp_{cv}_browse", None)
 
                 drive_res = st.session_state.get("camp_drive_result")
-                drive_pick = None
-                if drive_res:
-                    if drive_res["brand"] != (camp_brand if camp_brand != NEW_BRAND else new_brand_name.strip()):
-                        st.caption("브랜드를 바꾸셨어요. 아래 결과는 이전 브랜드 기준이라, 다시 '찾아오기'를 눌러주세요.")
-                    elif drive_res["err"]:
-                        st.error(f"❌ {drive_res['err']}")
-                    else:
-                        st.caption(drive_res["note"])
-                        if not drive_res["cands"]:
-                            st.warning("'계약서'가 들어간 폴더도, 브랜드명이 들어간 파일도 못 찾았어요. 폴더·파일 이름을 확인하시거나, 위에서 직접 올려주세요.")
-                        else:
-                            by_id = {c["id"]: c for c in drive_res["cands"]}
-                            pick_id = st.radio(
-                                "찾은 폴더·파일 중 골라주세요 (폴더를 고르면 안의 파일이 아래에 나와요)", list(by_id.keys()), index=None,
-                                format_func=lambda fid: (
-                                        f"📁 {by_id[fid]['name']}  ·  {by_id[fid]['path'] or '(최상위)'}  ·  폴더" if by_id[fid].get("kind") == "folder"
-                                        else f"📄 {by_id[fid]['name']}  ·  {by_id[fid]['path'] or '(최상위)'}  ·  수정 {by_id[fid]['modified'] or '-'}"
-                                    ),
-                                key=f"camp_drive_pick_{cv}",
-                            )
-                            drive_pick = by_id.get(pick_id)
-                            if drive_pick and drive_pick.get("kind") == "folder":
-                                # 폴더를 고르면 이 화면 안에서 그 안의 폴더·파일을 보여주고, 파일을 고르게 한다
-                                bs = st.session_state.get("camp_browse")
-                                if not bs or bs["root"] != pick_id:
-                                    bs = {"root": pick_id, "stack": [{"id": pick_id, "name": drive_pick["name"]}]}
-                                    st.session_state["camp_browse"] = bs
-                                cur = bs["stack"][-1]
-                                st.markdown("📂 **" + " › ".join(x["name"] for x in bs["stack"]) + "**")
-                                kids, kids_err = _drive_children(cur["id"])
-                                drive_pick = None  # 폴더 자체가 아니라, 폴더 안에서 고른 파일만 계약서로 연결한다
-                                if len(bs["stack"]) > 1 and st.button("⬆ 상위 폴더로", key=f"camp_up_{cv}"):
-                                    bs["stack"].pop()
-                                    st.rerun()
-                                if kids_err:
-                                    st.error(f"❌ {kids_err}")
-                                else:
-                                    sub_folders = [k for k in kids if k.get("mimeType") == "application/vnd.google-apps.folder"]
-                                    sub_files = [k for k in kids if k.get("mimeType") != "application/vnd.google-apps.folder"]
-                                    for sf in sub_folders:
-                                        if st.button(f"📁 {sf['name']}", key=f"camp_open_{cv}_{sf['id']}"):
-                                            bs["stack"].append({"id": sf["id"], "name": sf["name"]})
-                                            st.rerun()
-                                    if not sub_files:
-                                        st.caption("이 폴더에는 파일이 없어요." + (" 위의 폴더를 눌러 안으로 들어가 보세요." if sub_folders else ""))
-                                    else:
-                                        kid_by_id = {k["id"]: k for k in sub_files}
-                                        file_icon = lambda mt: "📊" if "spreadsheet" in (mt or "") else ("📝" if "document" in (mt or "") else "📄")
-                                        file_id = st.radio(
-                                            f"이 폴더 안의 파일 중 계약서를 골라주세요 ({len(sub_files)}개)", list(kid_by_id.keys()), index=None,
-                                            format_func=lambda kid: f"{file_icon(kid_by_id[kid].get('mimeType'))} {kid_by_id[kid]['name']}  ·  수정 {(kid_by_id[kid].get('modifiedTime') or '')[:10] or '-'}",
-                                            key=f"camp_file_pick_{cv}_{cur['id']}",
-                                        )
-                                        if file_id:
-                                            kf = kid_by_id[file_id]
-                                            drive_pick = {"id": kf["id"], "name": kf["name"], "link": kf.get("webViewLink"), "kind": "file"}
+                drive_pick = _drive_picker_ui(
+                    f"camp_{cv}", drive_res, camp_brand if camp_brand != NEW_BRAND else new_brand_name.strip(),
+                    "'계약'이 들어간 폴더도, 브랜드명이 들어간 파일도 못 찾았어요. 폴더·파일 이름을 확인하시거나, 위에서 직접 올려주세요.",
+                )
 
                 if st.button("등록 (4주 루틴 자동 생성)", type="primary", key=f"camp_new_submit_{cv}"):
                     if not camp_name.strip():
@@ -2550,7 +2834,6 @@ with tab_mywork:
                         st.session_state["camp_new_msg"] = msg
                         st.session_state["camp_new_ver"] = cv + 1
                         st.session_state.pop("camp_drive_result", None)
-                        st.session_state.pop("camp_browse", None)
                         refresh_sales()
                         st.rerun()
 
@@ -2562,10 +2845,16 @@ with tab_mywork:
                 st.caption("등록된 캠페인이 없습니다.")
             for c in my_campaigns:
                 acc = account_by_id.get(c["account_id"], {})
-                with st.expander(f"🚀 [{acc.get('brand_name', '?')}] {c['campaign_name']} · 오픈 {c['open_date']} · {c['status']}"):
+                _open_d = date.fromisoformat(str(c["open_date"])[:10])
+                inv_warn = (not c.get("invoice_url")) and c["status"] != "완료" and date.today() >= _open_d + timedelta(days=14)
+                with st.expander(
+                    f"🚀 [{acc.get('brand_name', '?')}] {c['campaign_name']} · 오픈 {c['open_date']} · {c['status']}"
+                    + ("  ⚠️ 인보이스 미첨부" if inv_warn else "") + ("  ✅ 브랜드 승인" if c.get("brand_approved_at") else "")
+                ):
                     tasks = [t for t in load_sales_campaign_tasks() if t["campaign_id"] == c["id"]]
                     if c.get("contract_url"):
                         st.markdown(f"📄 계약서: [{c.get('contract_name') or '열기'}]({c['contract_url']})")
+                    _render_invoice_section(c, acc.get("brand_name", ""), my_name in INVOICE_EDITORS, my_name, refresh_sales)
                     for t in sorted(tasks, key=lambda x: x["week_number"]):
                         with st.container(border=True):
                             st.markdown(f"**{t['week_number']}주차 — {t['task_title']}** · 마감 {t.get('due_date') or '-'}")
