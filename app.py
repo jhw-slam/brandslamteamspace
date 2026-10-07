@@ -949,92 +949,104 @@ def _render_invoice_section(c, brand, can_edit, my_name, refresh):
     if has_inv and not st.checkbox("📎 인보이스 교체하기", key=f"{ns}_replace"):
         return
     with st.container(border=True):
-        up = st.file_uploader("파일 올리기 (PDF·엑셀·워드·이미지)", type=["pdf", "xlsx", "docx", "png", "jpg", "jpeg"], key=f"{ns}_file")
-        if st.button("🔍 드라이브에서 이 캠페인 인보이스 자동 찾기", key=f"{ns}_find", use_container_width=True):
-            with st.spinner("구글드라이브를 훑는 중..."):
-                _cands, _note, _err = _drive_find_invoices(brand, c["campaign_name"], c.get("open_date"))
-            st.session_state[f"{ns}_res"] = {"brand": brand, "cands": _cands, "note": _note, "err": _err}
-            st.session_state.pop(f"{ns}_pick", None)
-            st.session_state.pop(f"{ns}_browse", None)
-        picked = _drive_picker_ui(
-            ns, st.session_state.get(f"{ns}_res"), brand,
-            "'인보이스' 폴더도, 브랜드명이 들어간 파일도 못 찾았어요. 위에서 직접 올려주세요.",
-        )
-        source = None  # (식별자, 파일이름, 링크 또는 None, 읽은 결과, 에러)
-        if up is not None:
-            sig = f"up:{up.name}:{up.size}"
-            if st.session_state.get(f"{ns}_sig") != sig:
-                st.session_state[f"{ns}_parsed"] = (_extract_invoice_fields(up.getvalue(), up.name), None)
-        elif picked:
-            sig = f"dr:{picked['id']}"
-            if st.session_state.get(f"{ns}_sig") != sig:
-                st.session_state[f"{ns}_parsed"] = _drive_invoice_autofill(picked["id"], picked.get("mime"), picked["name"])
-        else:
-            sig = None
-        if sig is None:
+        data = _invoice_input_ui(ns, brand, c["campaign_name"], c.get("open_date"))
+        if data is None:
             return
-        parsed, perr = st.session_state.get(f"{ns}_parsed", (None, None))
-        if st.session_state.get(f"{ns}_sig") != sig:  # 새 파일을 골랐을 때만 입력칸을 자동으로 채운다
-            st.session_state[f"{ns}_sig"] = sig
-            st.session_state[f"{ns}_no"] = (parsed or {}).get("number") or ""
-            cur0 = (parsed or {}).get("currency")
-            st.session_state[f"{ns}_cur"] = cur0 if cur0 in ("KRW", "USD") else None
-            amts = (parsed or {}).get("amounts") or []
-            opts = [f"{a:,.0f}" if a == int(a) else f"{a:,.2f}" for a in amts] + ["직접 입력"]
-            st.session_state[f"{ns}_amt_opts"] = (opts, amts)
-            st.session_state[f"{ns}_amt_pick"] = opts[0] if (parsed or {}).get("amount") else None
-            st.session_state[f"{ns}_amt"] = 0.0
-        if perr:
-            st.warning(f"자동으로 읽지 못했어요: {perr}")
-        elif parsed and parsed.get("note"):
-            st.info(parsed["note"])
-        elif parsed:
-            st.success("🤖 파일에서 번호·금액을 읽어 채웠어요. 맞는지 확인하고 저장하세요.")
-        opts, amts = st.session_state.get(f"{ns}_amt_opts", (["직접 입력"], []))
-        n1, n2 = st.columns(2)
-        inv_no = n1.text_input("인보이스 번호", key=f"{ns}_no")
-        inv_cur = n2.selectbox("통화 (확인 필수)", ["KRW", "USD"], index=None, placeholder="선택", key=f"{ns}_cur")
-        amt_pick = st.radio("청구 금액", opts, index=None, horizontal=True, key=f"{ns}_amt_pick")
-        final_amt = None
-        if amt_pick == "직접 입력":
-            v = st.number_input("금액 직접 입력", min_value=0.0, step=1000.0, format="%.2f", key=f"{ns}_amt")
-            final_amt = v or None
-        elif amt_pick:
-            final_amt = amts[opts.index(amt_pick)]
         if st.button("📌 이 인보이스로 확정", type="primary", key=f"{ns}_save"):
-            if not final_amt or not inv_cur:
+            if not data["amount"] or not data["currency"]:
                 st.error("청구 금액과 통화를 확인해서 선택해주세요. (결제 정보는 자동으로 확정하지 않아요)")
-            else:
-                url = name = None
-                try:
-                    if up is not None:
-                        ext = os.path.splitext(up.name)[1].lower()
-                        path = f"invoice/{cid}/{uuid.uuid4().hex[:8]}{ext}"
-                        SUPA.storage.from_("contract-files").upload(
-                            path, up.getvalue(), {"content-type": up.type or "application/octet-stream"},
-                        )
-                        url = f"{os.environ.get('SUPABASE_URL')}/storage/v1/object/public/contract-files/{path}"
-                        name = up.name
-                    else:
-                        url, name = picked.get("link"), picked["name"]
-                except Exception as e:
-                    st.error(f"파일을 저장하지 못했어요 ({type(e).__name__}: {e})")
-                    return
-                try:
-                    SUPA.table("sales_campaigns").update({
-                        "invoice_url": url, "invoice_name": name, "invoice_number": inv_no.strip() or None,
-                        "invoice_amount": final_amt, "invoice_currency": inv_cur,
-                        "invoice_attached_by": my_name, "invoice_attached_at": datetime.utcnow().isoformat() + "Z",
-                    }).eq("id", cid).execute()
-                except Exception as e:
-                    st.error(
-                        "인보이스를 저장하지 못했어요. DB에 인보이스 칸(migrations/20261006_sales_campaigns_invoice_columns.sql)이 "
-                        f"적용돼 있는지 확인해주세요. ({type(e).__name__}: {e})"
-                    )
-                    return
-                for k in ("res", "sig", "parsed", "amt_opts"):
-                    st.session_state.pop(f"{ns}_{k}", None)
-                refresh()
+                return
+            try:
+                url, name = _invoice_store_file(data, cid)
+            except Exception as e:
+                st.error(f"파일을 저장하지 못했어요 ({type(e).__name__}: {e})")
+                return
+            try:
+                SUPA.table("sales_campaigns").update(_invoice_columns(data, url, name, my_name)).eq("id", cid).execute()
+            except Exception as e:
+                st.error(
+                    "인보이스를 저장하지 못했어요. DB에 인보이스 칸(migrations/20261006_sales_campaigns_invoice_columns.sql)이 "
+                    f"적용돼 있는지 확인해주세요. ({type(e).__name__}: {e})"
+                )
+                return
+            for k in ("res", "sig", "parsed", "amt_opts"):
+                st.session_state.pop(f"{ns}_{k}", None)
+            refresh()
+
+
+def _invoice_input_ui(ns, brand, campaign_name, open_date):
+    """인보이스 입력 화면(파일 올리기 또는 드라이브 자동 찾기 → 번호·금액·통화 자동 채우기).
+    파일을 고르기 전이면 None, 고른 뒤면 {'up','picked','number','currency','amount'}를 돌려준다.
+    금액·통화는 사람이 확인해서 고르게 하고(결제 정보는 추측하지 않음), 저장은 호출한 쪽에서 한다."""
+    up = st.file_uploader("파일 올리기 (PDF·엑셀·워드·이미지)", type=["pdf", "xlsx", "docx", "png", "jpg", "jpeg"], key=f"{ns}_file")
+    if st.button("🔍 드라이브에서 이 캠페인 인보이스 자동 찾기", key=f"{ns}_find", use_container_width=True):
+        with st.spinner("구글드라이브를 훑는 중..."):
+            _cands, _note, _err = _drive_find_invoices(brand, campaign_name, open_date)
+        st.session_state[f"{ns}_res"] = {"brand": brand, "cands": _cands, "note": _note, "err": _err}
+        st.session_state.pop(f"{ns}_pick", None)
+        st.session_state.pop(f"{ns}_browse", None)
+    picked = _drive_picker_ui(
+        ns, st.session_state.get(f"{ns}_res"), brand,
+        "'인보이스' 폴더도, 브랜드명이 들어간 파일도 못 찾았어요. 위에서 직접 올려주세요.",
+    )
+    if up is not None:
+        sig = f"up:{up.name}:{up.size}"
+        if st.session_state.get(f"{ns}_sig") != sig:
+            st.session_state[f"{ns}_parsed"] = (_extract_invoice_fields(up.getvalue(), up.name), None)
+    elif picked:
+        sig = f"dr:{picked['id']}"
+        if st.session_state.get(f"{ns}_sig") != sig:
+            st.session_state[f"{ns}_parsed"] = _drive_invoice_autofill(picked["id"], picked.get("mime"), picked["name"])
+    else:
+        return None
+    parsed, perr = st.session_state.get(f"{ns}_parsed", (None, None))
+    if st.session_state.get(f"{ns}_sig") != sig:  # 새 파일을 골랐을 때만 입력칸을 자동으로 채운다
+        st.session_state[f"{ns}_sig"] = sig
+        st.session_state[f"{ns}_no"] = (parsed or {}).get("number") or ""
+        cur0 = (parsed or {}).get("currency")
+        st.session_state[f"{ns}_cur"] = cur0 if cur0 in ("KRW", "USD") else None
+        amts = (parsed or {}).get("amounts") or []
+        opts = [f"{a:,.0f}" if a == int(a) else f"{a:,.2f}" for a in amts] + ["직접 입력"]
+        st.session_state[f"{ns}_amt_opts"] = (opts, amts)
+        st.session_state[f"{ns}_amt_pick"] = opts[0] if (parsed or {}).get("amount") else None
+        st.session_state[f"{ns}_amt"] = 0.0
+    if perr:
+        st.warning(f"자동으로 읽지 못했어요: {perr}")
+    elif parsed and parsed.get("note"):
+        st.info(parsed["note"])
+    elif parsed:
+        st.success("🤖 파일에서 번호·금액을 읽어 채웠어요. 맞는지 확인해주세요.")
+    opts, amts = st.session_state.get(f"{ns}_amt_opts", (["직접 입력"], []))
+    n1, n2 = st.columns(2)
+    inv_no = n1.text_input("인보이스 번호", key=f"{ns}_no")
+    inv_cur = n2.selectbox("통화 (확인 필수)", ["KRW", "USD"], index=None, placeholder="선택", key=f"{ns}_cur")
+    amt_pick = st.radio("청구 금액", opts, index=None, horizontal=True, key=f"{ns}_amt_pick")
+    final_amt = None
+    if amt_pick == "직접 입력":
+        v = st.number_input("금액 직접 입력", min_value=0.0, step=1000.0, format="%.2f", key=f"{ns}_amt")
+        final_amt = v or None
+    elif amt_pick:
+        final_amt = amts[opts.index(amt_pick)]
+    return {"up": up, "picked": picked, "number": inv_no.strip() or None, "currency": inv_cur, "amount": final_amt}
+
+
+def _invoice_store_file(data, folder_id):
+    """고른 인보이스의 (링크, 파일이름). 직접 올린 파일이면 Supabase에 저장하고, 드라이브에서 골랐으면 드라이브 링크를 쓴다."""
+    up = data["up"]
+    if up is not None:
+        ext = os.path.splitext(up.name)[1].lower()
+        path = f"invoice/{folder_id}/{uuid.uuid4().hex[:8]}{ext}"
+        SUPA.storage.from_("contract-files").upload(path, up.getvalue(), {"content-type": up.type or "application/octet-stream"})
+        return f"{os.environ.get('SUPABASE_URL')}/storage/v1/object/public/contract-files/{path}", up.name
+    return data["picked"].get("link"), data["picked"]["name"]
+
+
+def _invoice_columns(data, url, name, my_name):
+    return {
+        "invoice_url": url, "invoice_name": name, "invoice_number": data["number"],
+        "invoice_amount": data["amount"], "invoice_currency": data["currency"],
+        "invoice_attached_by": my_name, "invoice_attached_at": datetime.utcnow().isoformat() + "Z",
+    }
 
 
 REQ_STATUSES = ["요청", "확인", "진행중", "완료", "보류"]
@@ -3435,6 +3447,8 @@ with tab_mywork:
                 cv = st.session_state.setdefault("camp_new_ver", 0)  # 등록 성공 후 입력칸을 비우려고 key에 붙이는 번호
                 if st.session_state.get("camp_new_msg"):
                     st.success(st.session_state.pop("camp_new_msg"))
+                if st.session_state.get("camp_new_warn"):
+                    st.warning(st.session_state.pop("camp_new_warn"))
                 acc_names2 = {a["brand_name"]: a["id"] for a in my_accounts}
                 NEW_BRAND = "➕ 새 브랜드 직접 입력"
                 camp_brand = st.selectbox("브랜드", list(acc_names2.keys()) + [NEW_BRAND], key="camp_brand_pick")
@@ -3468,11 +3482,21 @@ with tab_mywork:
                     "'계약'이 들어간 폴더도, 브랜드명이 들어간 파일도 못 찾았어요. 폴더·파일 이름을 확인하시거나, 위에서 직접 올려주세요.",
                 )
 
+                inv_data = None
+                if my_name in INVOICE_EDITORS:  # 최종 인보이스는 담당자(김선재)만 첨부
+                    st.markdown("**📑 최종 인보이스** (선택) — 계약서와 같이 올릴 수 있어요. 브랜드 승인 때는 꼭 필요하니, 지금 없으면 등록 후 캠페인 목록에서 첨부해도 돼요.")
+                    inv_data = _invoice_input_ui(
+                        f"reginv_{cv}", camp_brand if camp_brand != NEW_BRAND else new_brand_name.strip(),
+                        camp_name.strip(), camp_open_date.isoformat(),
+                    )
+
                 if st.button("등록 (4주 루틴 자동 생성)", type="primary", key=f"camp_new_submit_{cv}"):
                     if not camp_name.strip():
                         st.error("캠페인명을 입력해주세요.")
                     elif camp_brand == NEW_BRAND and not new_brand_name.strip():
                         st.error("새 브랜드명을 입력해주세요.")
+                    elif inv_data and (not inv_data["amount"] or not inv_data["currency"]):
+                        st.error("인보이스의 청구 금액과 통화를 확인해서 선택해주세요. (결제 정보는 자동으로 확정하지 않아요) — 인보이스를 나중에 첨부하려면 위 인보이스 파일 선택을 비워주세요.")
                     else:
                         if camp_brand == NEW_BRAND:
                             nb = new_brand_name.strip()
@@ -3496,6 +3520,7 @@ with tab_mywork:
                             "task_description": wd, "due_date": (camp_open_date + timedelta(days=(wn - 1) * 7)).isoformat(),
                         } for wn, wt, wd in WEEK_TEMPLATE]
                         SUPA.table("sales_campaign_tasks").insert(week_tasks).execute()
+                        warns = []  # 일부 저장 실패 안내(화면이 새로고침돼도 보이게 모아서 다음 화면에 표시)
                         msg = f"캠페인 등록 완료! 1~4주차 루틴 {len(week_tasks)}개가 자동으로 만들어졌어요."
 
                         contract_url, contract_name = None, None
@@ -3510,7 +3535,7 @@ with tab_mywork:
                                 contract_url = f"{os.environ.get('SUPABASE_URL')}/storage/v1/object/public/contract-files/{cpath}"
                                 contract_name = camp_contract_file.name
                             except Exception as e:
-                                st.warning(f"계약서 업로드는 실패했지만 캠페인은 등록됐어요 ({type(e).__name__}: {e})")
+                                warns.append(f"계약서 업로드는 실패했지만 캠페인은 등록됐어요 ({type(e).__name__}: {e})")
                         elif drive_pick and drive_res and drive_res["brand"] == camp_brand_for_drive:
                             contract_url = drive_pick.get("link")
                             contract_name = f"📁 {drive_pick['name']}" if drive_pick.get("kind") == "folder" else drive_pick["name"]
@@ -3521,11 +3546,22 @@ with tab_mywork:
                                 }).eq("id", new_camp_id).execute()
                                 msg += f" 📄 계약서 연결: {contract_name}"
                             except Exception as e:
-                                st.warning(
+                                warns.append(
                                     "캠페인은 등록됐지만 계약서 링크를 저장하지 못했어요. DB에 계약서 칸(contract_url, contract_name)이 "
                                     f"아직 없는 것 같아요 — 관리자에게 알려주세요. ({type(e).__name__}: {e})"
                                 )
+                        if inv_data:
+                            try:
+                                inv_url, inv_name = _invoice_store_file(inv_data, new_camp_id)
+                                SUPA.table("sales_campaigns").update(_invoice_columns(inv_data, inv_url, inv_name, my_name)).eq("id", new_camp_id).execute()
+                                msg += f" 📑 인보이스 연결: {inv_name}"
+                            except Exception as e:
+                                warns.append(
+                                    "캠페인은 등록됐지만 인보이스를 저장하지 못했어요. 캠페인 목록에서 다시 첨부해주세요. "
+                                    f"({type(e).__name__}: {e})"
+                                )
                         st.session_state["camp_new_msg"] = msg
+                        st.session_state["camp_new_warn"] = "\n\n".join(warns) or None
                         st.session_state["camp_new_ver"] = cv + 1
                         st.session_state.pop("camp_drive_result", None)
                         refresh_sales()
