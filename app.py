@@ -1596,6 +1596,203 @@ def _flash(msg):
     st.session_state["flash_msg"] = msg
 
 
+@st.cache_data(ttl=15)
+def load_hub_data():
+    """모든 브랜드의 캠페인·주차루틴(캘린더용). 반환: (계정, 캠페인, 주차루틴, 에러문구)"""
+    try:
+        accs = SUPA.table("sales_accounts").select("id,brand_name,assigned_to,status").execute().data
+        camps = SUPA.table("sales_campaigns").select("*").order("open_date", desc=True).limit(300).execute().data
+        tasks = SUPA.table("sales_campaign_tasks").select("*").limit(2000).execute().data
+        return accs, camps, tasks, None
+    except Exception as e:
+        return [], [], [], f"{type(e).__name__}: {e}"
+
+
+@st.cache_data(ttl=10)
+def load_hub_comments():
+    try:
+        return SUPA.table("team_comments").select("*").in_("target_type", ["campaign", "date"]).order("created_at").limit(3000).execute().data
+    except Exception:
+        return []
+
+
+def _post_hub_comment(target_type, target_id, target_date, author, text, up):
+    """캘린더 댓글(+파일 첨부)을 저장한다. 반환: 에러 문구(성공하면 None)"""
+    text = (text or "").strip()
+    if not text and up is None:
+        return "내용을 쓰거나 파일을 첨부해주세요."
+    if up is not None and up.size > 20 * 1024 * 1024:
+        return "파일은 20MB까지 첨부할 수 있어요."
+    url = name = None
+    try:
+        if up is not None:
+            ext = os.path.splitext(up.name)[1].lower()
+            path = f"comments/{target_id or target_date or 'misc'}/{uuid.uuid4().hex[:8]}{ext}"
+            SUPA.storage.from_("contract-files").upload(path, up.getvalue(), {"content-type": up.type or "application/octet-stream"})
+            url = f"{os.environ.get('SUPABASE_URL')}/storage/v1/object/public/contract-files/{path}"
+            name = up.name
+        SUPA.table("team_comments").insert({
+            "target_type": target_type, "target_id": target_id, "target_date": target_date,
+            "author": author, "body": text or "(파일 첨부)", "attachment_url": url, "attachment_name": name,
+        }).execute()
+    except Exception as e:
+        return f"저장하지 못했어요 ({type(e).__name__}: {e})"
+    load_hub_comments.clear()
+    return None
+
+
+def _render_hub_thread(ns, target_type, target_id, target_date, my_name, heading, hint):
+    """의견·댓글·파일 첨부 영역. 누구나 남기고, 결정 버튼('남기기')을 눌러야만 저장된다."""
+    cm = [c for c in load_hub_comments() if c["target_type"] == target_type and (
+        (target_id and c.get("target_id") == target_id) or (target_date and str(c.get("target_date"))[:10] == target_date))]
+    st.markdown(f"**{heading}** ({len(cm)})")
+    if not cm:
+        st.caption(hint)
+    for c in cm:
+        st.markdown(f"**{c['author']}** · {str(c['created_at'])[:16].replace('T', ' ')}")
+        st.write(c["body"])
+        if c.get("attachment_url"):
+            st.markdown(f"📎 [{c.get('attachment_name') or '첨부파일'}]({c['attachment_url']})")
+    v = st.session_state.get(f"{ns}_v", 0)  # 저장 후 입력칸을 비우려고 key에 붙이는 번호
+    with st.form(f"{ns}_form"):
+        txt = st.text_area("의견·댓글", key=f"{ns}_txt_{v}", height=80, placeholder=hint)
+        up = st.file_uploader("파일 첨부 (선택, 20MB까지)", key=f"{ns}_up_{v}")
+        sent = st.form_submit_button("💬 남기기")
+    if sent:
+        err = _post_hub_comment(target_type, target_id, target_date, my_name, txt, up)
+        if err:
+            st.error(err)
+        else:
+            st.session_state[f"{ns}_v"] = v + 1
+            _flash("남겼어요.")
+            st.rerun()
+
+
+_TASK_ICON = {"예정": "⚪", "진행중": "🟠", "완료": "✅"}
+
+
+def _render_campaign_hub(ns, my_name, can_see_amounts, mine_filter=False):
+    """모든 직원이 보는 캠페인 캘린더: 월 달력 + 앞으로 7일 일정 + 캠페인 상세 + 의견·댓글·파일 첨부 + 날짜별 의견.
+    캠페인은 세일즈(김선재)가 등록하고, 여기서는 보기 + 의견 남기기만 한다. 금액은 can_see_amounts일 때만 보여준다."""
+    accs, camps, tasks, err = load_hub_data()
+    if err:
+        st.error(f"❌ 캠페인 정보를 불러오지 못했어요 ({err})")
+        return
+    acc_by = {a["id"]: a for a in accs}
+    today = _today_kst()
+    if mine_filter:
+        mine = st.checkbox("내 담당 브랜드 캠페인만 보기", value=True, key=f"{ns}_mine")
+        camps = [c for c in camps if not mine or acc_by.get(c.get("account_id"), {}).get("assigned_to") == my_name]
+    camp_by = {c["id"]: c for c in camps}
+    brand_of = lambda c: acc_by.get(c.get("account_id"), {}).get("brand_name", "?")
+
+    events = []
+    for c in camps:
+        if c.get("open_date"):
+            events.append({"date": date.fromisoformat(str(c["open_date"])[:10]), "label": f"🚀 {brand_of(c)} 시작",
+                           "full": f"[{brand_of(c)}] {c['campaign_name']} 시작", "key": c["id"], "done": False,
+                           "brand": brand_of(c), "campaign": c["campaign_name"]})
+    for t in tasks:
+        c = camp_by.get(t["campaign_id"])
+        if not c or not t.get("due_date"):
+            continue
+        events.append({"date": date.fromisoformat(str(t["due_date"])[:10]), "label": f"{brand_of(c)} {t['week_number']}주차",
+                       "full": f"[{brand_of(c)}] {c['campaign_name']} · {t['week_number']}주차 {t['task_title']} ({t['status']})",
+                       "key": c["id"], "done": t["status"] == "완료", "brand": brand_of(c), "campaign": c["campaign_name"]})
+
+    ym_key = f"{ns}_ym"
+    ym = st.session_state.setdefault(ym_key, (today.year, today.month))
+    n1, n2, n3, n4 = st.columns([1, 1, 1, 4])
+    if n1.button("◀ 이전 달", key=f"{ns}_prev", use_container_width=True):
+        y, m = st.session_state[ym_key]
+        st.session_state[ym_key] = (y - 1, 12) if m == 1 else (y, m - 1)
+        st.rerun()
+    if n2.button("오늘", key=f"{ns}_today", use_container_width=True):
+        st.session_state[ym_key] = (today.year, today.month)
+        st.rerun()
+    if n3.button("다음 달 ▶", key=f"{ns}_next", use_container_width=True):
+        y, m = st.session_state[ym_key]
+        st.session_state[ym_key] = (y + 1, 1) if m == 12 else (y, m + 1)
+        st.rerun()
+    cy, cm_ = st.session_state[ym_key]
+    n4.markdown(f"### {cy}년 {cm_}월")
+    if not events:
+        st.info("아직 등록된 캠페인이 없어요. 김선재님이 캠페인을 등록하면 여기에 나타나요.")
+    cal_html, color_of = _render_month_calendar(events, cy, cm_, today)
+    st.markdown(cal_html, unsafe_allow_html=True)
+    if events:
+        legend = "".join(
+            f"<span style='display:inline-block;margin:2px 8px 2px 0;padding:1px 8px;border-radius:4px;border-left:3px solid {color_of[k]};"
+            f"background:{color_of[k]}33;font-size:12px'>{html.escape(name)}</span>"
+            for k, name in dict.fromkeys((e["key"], f"{e['brand']} · {e['campaign']}") for e in events)
+        )
+        st.markdown(legend, unsafe_allow_html=True)
+
+    # 앞으로 7일: 내가 바로 챙길 일
+    soon = sorted([e for e in events if today <= e["date"] <= today + timedelta(days=7) and not e["done"]], key=lambda e: e["date"])
+    st.markdown("**📌 앞으로 7일 일정**")
+    if not soon:
+        st.caption("앞으로 7일 안에 예정된 캠페인 일정이 없어요.")
+    else:
+        week_by_key = {}
+        for t in tasks:
+            week_by_key[(t["campaign_id"], t["week_number"])] = t
+        rows = []
+        for e in soon:
+            rows.append({"날짜": e["date"].isoformat(), "요일": _WEEKDAY_KO[e["date"].weekday()], "브랜드": e["brand"],
+                         "캠페인": e["campaign"], "일정": e["full"].split("] ", 1)[-1].split(" · ", 1)[-1],
+                         "확인": "🎯 인플루언서팀" if e["label"].startswith("🚀") or _task_is_influencer(e, tasks) else ""})
+        st.dataframe(pd.DataFrame(rows), hide_index=True, use_container_width=True)
+
+    if not camps:
+        return
+    st.markdown("---")
+    ordered = sorted(camps, key=lambda c: abs((date.fromisoformat(str(c["open_date"])[:10]) - today).days))
+    ids = [c["id"] for c in ordered]
+    sel_id = st.selectbox(
+        "캠페인 고르기 — 상세·의견·파일", ids, key=f"{ns}_sel",
+        format_func=lambda i: f"{brand_of(camp_by[i])} · {camp_by[i]['campaign_name']} · 오픈 {camp_by[i]['open_date']}",
+    )
+    c = camp_by[sel_id]
+    st.markdown(f"### 🚀 {brand_of(c)} · {c['campaign_name']}")
+    owner = acc_by.get(c.get("account_id"), {}).get("assigned_to") or "-"
+    st.caption(f"오픈 {c['open_date']} · 담당 {owner} · {c.get('status') or ''}")
+    if c.get("brand_approved_at"):
+        st.success(f"✅ 브랜드 승인 완료 ({c['brand_approved_at']})")
+    for t in sorted([t for t in tasks if t["campaign_id"] == sel_id], key=lambda t: t["week_number"]):
+        st.markdown(f"{_TASK_ICON.get(t['status'], '⚪')} **{t['week_number']}주차 · {t['task_title']}** — 마감 {t.get('due_date') or '-'} · {t['status']}")
+        if t.get("task_description"):
+            st.caption(t["task_description"])
+    docs = []
+    if c.get("contract_url"):
+        docs.append(f"📄 [계약서]({c['contract_url']})" if can_see_amounts else "📄 계약서 등록됨")
+    if c.get("invoice_url"):
+        inv = f"📑 인보이스 등록됨" + (f" · 번호 {c['invoice_number']}" if c.get("invoice_number") else "")
+        if can_see_amounts:
+            inv = f"📑 [인보이스]({c['invoice_url']})" + (f" · 번호 {c['invoice_number']}" if c.get("invoice_number") else "")
+            if c.get("invoice_amount") is not None:
+                inv += f" · {c.get('invoice_currency') or ''} {float(c['invoice_amount']):,.0f}"
+        docs.append(inv)
+    if docs:
+        st.markdown("  ·  ".join(docs))
+
+    st.markdown("---")
+    _render_hub_thread(f"{ns}_c_{sel_id}", "campaign", sel_id, None, my_name, "💬 이 캠페인에 대한 의견·댓글·파일",
+                       "예: 인플루언서 후보 리스트 공유드려요 / 방문 일정은 이렇게 잡을게요")
+    st.markdown("---")
+    pick_d = st.date_input("📅 특정 날짜에 의견 남기기", value=today, key=f"{ns}_pickdate")
+    _render_hub_thread(f"{ns}_d_{pick_d.isoformat()}", "date", None, pick_d.isoformat(), my_name,
+                       f"{pick_d.isoformat()} ({_WEEKDAY_KO[pick_d.weekday()]}) 의견", "이 날짜에 공유할 내용을 남겨주세요")
+
+
+def _task_is_influencer(e, tasks):
+    """그 일정이 인플루언서 섭외·매칭이 필요한 단계인지(주차 루틴 설명에 '인플루언서'가 있으면 곧 인플루언서팀 업무)."""
+    for t in tasks:
+        if t["campaign_id"] == e["key"] and f"{t['week_number']}주차" in e["label"]:
+            return "인플루언서" in f"{t.get('task_title') or ''} {t.get('task_description') or ''}"
+    return False
+
+
 def _api_error_text(status, body):
     """Claude API 오류를 직원이 이해할 수 있는 말로 바꾼다(원문도 같이 보여줘서 원인을 숨기지 않는다)."""
     body = str(body or "")
@@ -2238,6 +2435,18 @@ with tab_log:
 
 
 with tab_campaign:
+    # ══════════════════════════════════════════════════════════
+    # 🗓️ 캠페인 캘린더 — 모든 직원이 보는 화면(김선재님이 등록한 캠페인이 그대로 보임)
+    # ══════════════════════════════════════════════════════════
+    st.subheader("🗓️ 캠페인 캘린더")
+    st.caption(
+        "김선재님이 등록한 모든 브랜드 캠페인이 여기에 보여요. 날짜를 보고 내가 챙길 일을 파악하고, "
+        "아래에서 캠페인을 골라 의견·댓글·파일로 참여해주세요."
+    )
+    _render_campaign_hub("hubcamp", my_name, my_name in INVOICE_EDITORS)
+    st.divider()
+    st.markdown("## 🤝 인플루언서 매칭 현황")
+    st.caption("캠페인에 맞는 인플루언서를 찾고 배치한 내용을 관리해요. 구글시트로 한 번에 올릴 수도 있어요.")
     # ══════════════════════════════════════════════════════════
     # 📥 구글시트로 일괄 등록
     # ══════════════════════════════════════════════════════════
@@ -3175,70 +3384,8 @@ with tab_mywork:
 
         # ── 📅 일정 한눈에보기 ──────────────────────────────────
         with tab_big:
-            st.markdown("**캠페인 일정 큰 캘린더** — 여러 캠페인이 같은 날 겹쳐도 색깔로 구분돼서 한눈에 보여요. (수정은 '🚀 캠페인·주차루틴' 탭에서)")
-            _camps = {c["id"]: c for c in load_sales_campaigns()}
-            _my_ids = {a["id"] for a in my_accounts}
-            cal_events = []
-            for t in load_sales_campaign_tasks():
-                camp = _camps.get(t["campaign_id"])
-                if not camp or camp["account_id"] not in _my_ids or not t.get("due_date"):
-                    continue
-                brand = account_by_id.get(camp["account_id"], {}).get("brand_name", "?")
-                cal_events.append({
-                    "date": date.fromisoformat(str(t["due_date"])[:10]), "label": f"{brand} {t['week_number']}주차",
-                    "full": f"[{brand}] {camp['campaign_name']} · {t['week_number']}주차 {t['task_title']} ({t['status']})",
-                    "key": camp["id"], "done": t["status"] == "완료", "brand": brand, "campaign": camp["campaign_name"],
-                })
-            for a in my_accounts:
-                if a.get("renewal_date"):
-                    cal_events.append({
-                        "date": date.fromisoformat(str(a["renewal_date"])[:10]), "label": f"🔁 {a['brand_name']} 갱신",
-                        "full": f"{a['brand_name']} 갱신/온보딩일", "key": f"renew-{a['id']}", "done": False,
-                        "brand": a["brand_name"], "campaign": "갱신/온보딩",
-                    })
-
-            today_d = date.today()
-            ym = st.session_state.setdefault("bigcal_ym", (today_d.year, today_d.month))
-            nv1, nv2, nv3, nv4 = st.columns([1, 1, 1, 4])
-            if nv1.button("◀ 이전 달", key="bigcal_prev", use_container_width=True):
-                y, m = st.session_state["bigcal_ym"]
-                st.session_state["bigcal_ym"] = (y - 1, 12) if m == 1 else (y, m - 1)
-                st.rerun()
-            if nv2.button("오늘", key="bigcal_today", use_container_width=True):
-                st.session_state["bigcal_ym"] = (today_d.year, today_d.month)
-                st.rerun()
-            if nv3.button("다음 달 ▶", key="bigcal_next", use_container_width=True):
-                y, m = st.session_state["bigcal_ym"]
-                st.session_state["bigcal_ym"] = (y + 1, 1) if m == 12 else (y, m + 1)
-                st.rerun()
-            cy, cm = st.session_state["bigcal_ym"]
-            nv4.markdown(f"### {cy}년 {cm}월")
-
-            all_brands = sorted({e["brand"] for e in cal_events})
-            f1, f2 = st.columns([3, 1])
-            pick_brands = f1.multiselect("브랜드 필터 (비우면 전체)", all_brands, key="bigcal_brands")
-            show_done = f2.checkbox("완료한 일정도 보기", value=True, key="bigcal_done")
-            shown = [e for e in cal_events if (not pick_brands or e["brand"] in pick_brands) and (show_done or not e["done"])]
-
-            cal_html, color_of = _render_month_calendar(shown, cy, cm, today_d)
-            st.markdown(cal_html, unsafe_allow_html=True)
-            if not shown:
-                st.caption("표시할 일정이 없어요. 캠페인을 등록하면 주차별 일정이 여기에 나타나요.")
-            else:
-                legend = "".join(
-                    f"<span style='display:inline-block;margin:2px 8px 2px 0;padding:1px 8px;border-radius:4px;border-left:3px solid {color_of[k]};"
-                    f"background:{color_of[k]}33;font-size:12px'>{html.escape(name)}</span>"
-                    for k, name in dict.fromkeys((e["key"], f"{e['brand']} · {e['campaign']}") for e in shown)
-                )
-                st.markdown(legend, unsafe_allow_html=True)
-                month_rows = sorted([e for e in shown if e["date"].year == cy and e["date"].month == cm], key=lambda e: e["date"])
-                with st.expander(f"이번 달 일정 목록 ({len(month_rows)}건)"):
-                    if month_rows:
-                        st.dataframe(pd.DataFrame([{
-                            "날짜": e["date"].isoformat(), "브랜드": e["brand"], "캠페인": e["campaign"], "내용": e["full"],
-                        } for e in month_rows]), hide_index=True, use_container_width=True)
-                    else:
-                        st.caption("이번 달에는 일정이 없어요.")
+            st.caption("모든 직원의 '📋 캠페인' 탭에도 똑같이 보여요. 여기서 등록한 캠페인과 인보이스가 그대로 반영됩니다.")
+            _render_campaign_hub("hubsales", my_name, True, mine_filter=True)
 
         with tab_fc:
             _t = date.today()
@@ -3658,6 +3805,9 @@ with tab_mywork:
                             refresh_dev()
 
     elif my_role == "influencer":
+        st.markdown("**🗓️ 캠페인 캘린더** — 내가 매칭해야 할 캠페인 일정을 바로 확인하세요")
+        with st.container(border=True):
+            _render_campaign_hub("hubwork", my_name, False)
         st.markdown("**🌟 인플루언서 파트너십 관리**")
         st.caption("인플루언서 마케터들이 흔히 쓰는 방식 — 티어(나노/마이크로/미드/메가)별로 관계 상태를 관리합니다.")
         with st.expander("📚 참고: 왜 '관계 상태'로 관리하나?"):
@@ -3740,6 +3890,9 @@ with tab_mywork:
             st.bar_chart(pd.Series(tier_counts))
 
     elif my_role == "china_ops":
+        st.markdown("**🗓️ 캠페인 캘린더** — 내가 매칭해야 할 캠페인 일정을 바로 확인하세요")
+        with st.container(border=True):
+            _render_campaign_hub("hubwork", my_name, False)
         st.markdown("**🇨🇳 중국 마케팅 운영**")
         st.caption("알바 캐스팅 퍼널 — 지원 → 웨비나초대 → 테스트완료 → 채용 → 활성 단계로 관리합니다.")
 

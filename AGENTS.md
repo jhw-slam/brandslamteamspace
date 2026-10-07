@@ -63,12 +63,14 @@
 - 직원/업무: `okr_org`, `okr_items`(is_recurring=KPI, due_date), `daily_activity_log`, `assigned_tasks`, `data_completeness_prompts`, `ai_drafted_updates`, `kpi_alignment_suggestions`, `kpi_data_sources`, `company_vision`
 - 역할별 도구: `sales_accounts/issues/campaigns/campaign_tasks/meeting_alerts`, `dev_tasks`, `influencer_pool`, `casting_funnel`
 - 휴가: `leave_profiles`(입사일·연 부여일수 기본 15, 본인이 최초 1회 입력·수정은 DB에서), `leave_requests`(연차 8h·반차 4h·반반차 2h, 취소는 canceled_at). 입사 1년 미만=월 1일씩 발생분만, 1년 이상=올해 15일 자유 사용. 둘 다 RLS 켜짐
-- 팀 협업: `team_requests`(요청 게시판: 요청자·담당자·마감·상태, 마감 지나면 홈에 ⚠️ 처리요망), `team_comments`(댓글, target_type=request/campaign/account/date). 둘 다 RLS 켜짐(서비스 키로만 접근)
+- 팀 협업: `team_requests`(요청 게시판: 요청자·담당자·마감·상태, 마감 지나면 홈에 ⚠️ 처리요망), `team_comments`(댓글, target_type=request/campaign/account/date, 파일 첨부 attachment_url/name). 둘 다 RLS 켜짐(서비스 키로만 접근)
 - 재무: `bank_transactions`(dedup_hash 유니크), `bankda_*`, `cash_events`, `fin_*`, `tax_invoices`, `fin_cash_forecasts`(예정입출금 신고), `payment_requests`(인플루언서 송금: 통화·페이팔/안내메일 분리·dedup_key·batch_id·report_complete)
 - 메일/드라이브: `email_log`, `drive_file_index`, `drive_scan_log`, `meetings`
 - ⚠️ `drive_*`, `campaigns`, `brands`, `sales_brands`, `sales_revenue_monthly`, `assistant_notifications` 등은 다른 세션에서 만들어진 것으로 보임 — 사용 전 스키마와 쓰임 확인.
 
 ## 8. 알려진 미해결 / 확인 필요
+- **캠페인 흐름(10/7 대표 지시)**: 김선재가 `🧰 내 업무 → 📝 캠페인 등록`에서 캠페인(+계약서·인보이스)을 등록하면 → 모든 직원의 `📋 캠페인` 탭 위쪽 **캠페인 캘린더**에 보이고(곽재선·이단우는 `🧰 내 업무`에도), 캘린더 아래에서 의견·댓글·파일첨부로 참여한다(`_render_campaign_hub`). `📋 캠페인` 탭 아래쪽은 기존 '인플루언서 매칭 현황'(배치 관리·구글시트 일괄 등록). 인보이스 금액·링크는 담당자(김선재)만 보임.
+- **캠페인 흐름 2단계(미구현, 결정·샘플 필요)**: ① 인보이스의 서비스 항목(품목·수량)을 읽어 캠페인 '해줘야 할 서비스'로 저장 ② 서비스를 충족하는 인플루언서 매칭 목표·진행률(배치를 캠페인에 연결) ③ 직원 전체 '구글시트 연동' 활성화.
 - 크론의 Google Drive 서비스계정 스캔(`kpi_context_sync.py`)이 결과 0건. (대화형 Claude의 Drive 커넥터는 정상 → 서로 다른 경로.) 근본 원인 미확정.
 - 원칙상 "재무 완료 상태는 은행거래 매칭으로만" 인데, 현재 `payment_requests`엔 수동 "송금완료 처리" 버튼이 있음. 둘의 정합성 정리 필요.
 - `support_chat_staff` 테이블 RLS 비활성(보안): `ALTER TABLE public.support_chat_staff ENABLE ROW LEVEL SECURITY;` 및 정책 설계 필요.
