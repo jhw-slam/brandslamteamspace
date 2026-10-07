@@ -1253,6 +1253,220 @@ def _render_request_board(rows, my_name, today):
                 st.button("남기기", key=f"req_cmt_btn_{rid}", on_click=_post_request_comment, args=(rid, ckey, my_name))
 
 
+LEAVE_HOURS = {"연차": 8, "반차": 4, "반반차": 2}  # 1일 = 8시간, 반차 = 4시간, 반반차 = 2시간
+LEAVE_SLOTS = {"반차": ["오전", "오후"], "반반차": ["오전 앞", "오전 뒤", "오후 앞", "오후 뒤"]}
+_SLOT_QUARTERS = {"오전": {1, 2}, "오후": {3, 4}, "오전 앞": {1}, "오전 뒤": {2}, "오후 앞": {3}, "오후 뒤": {4}}
+
+
+def _leave_quarters(kind, slot):
+    """하루를 4등분(2시간씩)했을 때 이 휴가가 차지하는 칸. 같은 날 겹치는지 확인할 때 쓴다."""
+    return {1, 2, 3, 4} if kind == "연차" else set(_SLOT_QUARTERS.get(slot or "", set()))
+
+
+def _fmt_days(hours):
+    """시간 → 일수 문자열(소수점 활용). 94시간 → '11.75', 120시간 → '15', 2시간 → '0.25'"""
+    return f"{hours / 8:.2f}".rstrip("0").rstrip(".")
+
+
+def _add_months(d, n):
+    y, m = divmod(d.year * 12 + (d.month - 1) + n, 12)
+    return date(y, m + 1, min(d.day, calendar.monthrange(y, m + 1)[1]))
+
+
+def _full_months(hire, today):
+    """입사일부터 오늘까지 꽉 채운 개월 수."""
+    m = (today.year - hire.year) * 12 + (today.month - hire.month) - (1 if today.day < hire.day else 0)
+    return max(0, m)
+
+
+def _leave_d(v):
+    return v if isinstance(v, date) and not isinstance(v, datetime) else date.fromisoformat(str(v)[:10])
+
+
+def _leave_balance(hire, annual_days, leaves, today):
+    """잔여 휴가 계산. leaves = 취소되지 않은 휴가 기록들(leave_date, hours).
+    - 입사 1년 미만: 매달 1일씩 발생한 만큼만(입사 후 누적 사용분과 비교)
+    - 입사 1년 이상: 올해(1/1~12/31) 연 annual_days일을 자유롭게(올해 사용분과 비교)
+    사용 = 오늘까지 쓴 것, 예약 = 앞으로 쓸 것. 남은 = 부여 − 사용 − 예약."""
+    months = _full_months(hire, today)
+    probation = months < 12
+    if probation:
+        granted = min(float(annual_days), float(months)) * 8
+        scope = [x for x in leaves if _leave_d(x["leave_date"]) >= hire]
+    else:
+        granted = float(annual_days) * 8
+        scope = [x for x in leaves if _leave_d(x["leave_date"]).year == today.year]
+    used = sum(float(x["hours"]) for x in scope if _leave_d(x["leave_date"]) <= today)
+    booked = sum(float(x["hours"]) for x in scope if _leave_d(x["leave_date"]) > today)
+    return {
+        "probation": probation, "months": months, "granted_h": granted, "used_h": used, "booked_h": booked,
+        "remaining_h": granted - used - booked,
+        "next_accrual": _add_months(hire, months + 1) if probation and months < 12 else None,
+    }
+
+
+def _leave_validate(hire, annual_days, leaves, new_items, today):
+    """새로 신청하는 휴가(new_items=[(날짜, 종류, 시간대)])가 가능한지 차례로 확인한다. 안 되면 이유 문구, 되면 None."""
+    existing = list(leaves)
+    for d, kind, slot in new_items:
+        if d.weekday() >= 5:
+            return f"{d.isoformat()}은(는) 주말이라 신청할 수 없어요."
+        if d < hire:
+            return f"입사일({hire.isoformat()}) 이전 날짜는 신청할 수 없어요."
+        if d.year < today.year and _full_months(hire, today) >= 12:
+            return "작년 이전 날짜는 등록할 수 없어요."
+        if d > today + timedelta(days=400):
+            return "너무 먼 날짜예요. 1년 이내로 신청해주세요."
+        taken = set()
+        for x in existing:
+            if _leave_d(x["leave_date"]) == d:
+                taken |= _leave_quarters(x["kind"], x.get("slot"))
+        if taken & _leave_quarters(kind, slot):
+            return f"{d.isoformat()}에는 이미 겹치는 휴가({'/'.join(sorted(map(str, taken)))}칸)가 있어요."
+        hours = LEAVE_HOURS[kind]
+        if d.year == today.year or _full_months(hire, today) < 12:
+            bal = _leave_balance(hire, annual_days, existing, today)
+        else:  # 내년 날짜: 내년 한 해 기준으로 확인
+            bal = _leave_balance(hire, annual_days, existing, date(d.year, 1, 1))
+        if hours > bal["remaining_h"] + 1e-9:
+            extra = " (입사 1년 미만은 매달 1일씩 발생한 만큼만 쓸 수 있어요)" if bal["probation"] else ""
+            return f"남은 휴가가 부족해요 — 남은 {_fmt_days(max(0, bal['remaining_h']))}일, 신청 {_fmt_days(hours)}일.{extra}"
+        existing.append({"leave_date": d, "kind": kind, "slot": slot, "hours": hours})
+    return None
+
+
+_WEEKDAY_KO = "월화수목금토일"
+
+
+def _leave_label(x):
+    return f"{x['kind']}" + (f" {x['slot']}" if x.get("slot") else "")
+
+
+def _render_leave_page(my_name, today):
+    """개인별 휴가 신청. 연차(8시간)·반차(4시간)·반반차(2시간)를 자유롭게 쓰고, 남은 휴가를 소수점 일수로 보여준다."""
+    st.caption("1일 = 8시간 · 반차 = 4시간(0.5일) · 반반차 = 2시간(0.25일). 남은 휴가는 소수점 일수로 보여드려요.")
+    if st.session_state.get("leave_flash"):
+        st.success(st.session_state.pop("leave_flash"))
+    try:
+        prof_rows = SUPA.table("leave_profiles").select("*").eq("person", my_name).execute().data
+        my_leaves = [x for x in SUPA.table("leave_requests").select("*").eq("person", my_name).order("leave_date").execute().data
+                     if not x.get("canceled_at")]
+    except Exception as e:
+        st.error(f"❌ 휴가 정보를 불러오지 못했어요 ({type(e).__name__}: {e}). DB에 leave_profiles / leave_requests 테이블이 있는지 확인해주세요.")
+        return
+
+    if not prof_rows:
+        st.info("처음 한 번만 **입사일**을 입력해주세요. 입사일로 쓸 수 있는 휴가를 계산해요. 잘못 입력했다면 대표님께 알려주세요(이 화면에서는 고칠 수 없어요).")
+        hd = st.date_input("입사일", value=None, min_value=date(2000, 1, 1), max_value=today, key="leave_hire")
+        if st.button("입사일 저장", key="leave_hire_save", type="primary"):
+            if not hd:
+                st.error("입사일을 선택해주세요.")
+            else:
+                try:
+                    SUPA.table("leave_profiles").insert({"person": my_name, "hire_date": hd.isoformat()}).execute()
+                except Exception as e:
+                    st.error(f"저장하지 못했어요 ({type(e).__name__}: {e})")
+                else:
+                    st.session_state["leave_flash"] = f"입사일({hd.isoformat()})을 저장했어요."
+                    st.rerun()
+        return
+
+    prof = prof_rows[0]
+    hire, annual = _leave_d(prof["hire_date"]), float(prof["annual_days"])
+    bal = _leave_balance(hire, annual, my_leaves, today)
+    h = lambda v: f"{v:g}시간"
+    m1, m2, m3, m4 = st.columns(4)
+    m1.metric("지금까지 발생" if bal["probation"] else f"{today.year}년 부여", f"{_fmt_days(bal['granted_h'])}일", h(bal["granted_h"]), delta_color="off")
+    m2.metric("사용", f"{_fmt_days(bal['used_h'])}일", h(bal["used_h"]), delta_color="off")
+    m3.metric("예약(앞으로)", f"{_fmt_days(bal['booked_h'])}일", h(bal["booked_h"]), delta_color="off")
+    m4.metric("✅ 남은 휴가", f"{_fmt_days(max(0, bal['remaining_h']))}일", h(max(0, bal["remaining_h"])), delta_color="off")
+    if bal["probation"]:
+        st.caption(
+            f"입사 {bal['months']}개월차(입사일 {hire.isoformat()}) — 입사 1년 전까지는 매달 1일씩 발생한 만큼 쓸 수 있어요. "
+            f"다음 발생일: {bal['next_accrual'].isoformat()}"
+        )
+    else:
+        st.caption(f"입사 1년이 지나서 올해({today.year}.1.1~12.31) {_fmt_days(annual * 8)}일을 월 제한 없이 자유롭게 쓸 수 있어요.")
+
+    st.markdown("#### 휴가 쓰기")
+    kind_label = st.radio("종류", ["연차 (1일)", "반차 (0.5일)", "반반차 (0.25일)"], horizontal=True, key="leave_kind")
+    kind = kind_label.split(" ")[0]
+    c1, c2 = st.columns(2)
+    d1 = c1.date_input("날짜", value=today, key="leave_d1")
+    multi = kind == "연차" and c2.checkbox("여러 날 이어서 쓰기", key="leave_multi")
+    slot = None
+    if kind != "연차":
+        slot = c2.selectbox("시간대", LEAVE_SLOTS[kind], key=f"leave_slot_{kind}")
+    d2 = d1
+    if multi:
+        d2 = st.date_input("마지막 날", value=d1, min_value=d1, key="leave_d2")
+        st.caption("주말은 자동으로 빼요. 공휴일은 직접 빼주세요.")
+    memo = st.text_input("메모 (선택)", key="leave_memo", placeholder="예: 병원 / 가족 행사")
+    days = [d1 + timedelta(days=i) for i in range((d2 - d1).days + 1)]
+    items = [(d, kind, slot) for d in days if d.weekday() < 5] if multi else [(d1, kind, slot)]
+    err = "선택한 기간이 모두 주말이에요." if not items else _leave_validate(hire, annual, my_leaves, items, today)
+    total_h = sum(LEAVE_HOURS[k] for _d, k, _s in items)
+    if err:
+        st.warning(err)
+    else:
+        after = bal["remaining_h"] - total_h
+        st.caption(f"이번 신청 {_fmt_days(total_h)}일({total_h}시간) → 신청 후 남는 휴가 **{_fmt_days(after)}일** ({after:g}시간)")
+    if st.button("🏖️ 휴가 쓰기", type="primary", key="leave_submit", disabled=bool(err)):
+        rows = [{"person": my_name, "leave_date": d.isoformat(), "kind": k, "slot": sl, "hours": LEAVE_HOURS[k], "memo": memo.strip() or None}
+                for d, k, sl in items]
+        try:
+            SUPA.table("leave_requests").insert(rows).execute()
+        except Exception as e:
+            st.error(f"저장하지 못했어요 ({type(e).__name__}: {e})")
+        else:
+            st.session_state["leave_flash"] = f"휴가를 등록했어요: {_fmt_days(total_h)}일 ({items[0][0].isoformat()}" + (f" ~ {items[-1][0].isoformat()}" if len(items) > 1 else "") + ")"
+            st.rerun()
+
+    st.markdown("#### 내 휴가 기록")
+    upcoming = sorted([x for x in my_leaves if _leave_d(x["leave_date"]) >= today], key=lambda x: str(x["leave_date"]))
+    past = sorted([x for x in my_leaves if _leave_d(x["leave_date"]) < today], key=lambda x: str(x["leave_date"]), reverse=True)
+    if not upcoming:
+        st.caption("예약된 휴가가 없어요.")
+    for x in upcoming:
+        d = _leave_d(x["leave_date"])
+        r1, r2 = st.columns([5, 1])
+        r1.markdown(f"📅 **{d.isoformat()} ({_WEEKDAY_KO[d.weekday()]})** · {_leave_label(x)} · {_fmt_days(float(x['hours']))}일" + (f" · {x['memo']}" if x.get("memo") else ""))
+        if r2.button("취소", key=f"leave_cancel_{x['id']}", use_container_width=True):
+            try:
+                SUPA.table("leave_requests").update({"canceled_at": datetime.utcnow().isoformat() + "Z"}).eq("id", x["id"]).eq("person", my_name).execute()
+            except Exception as e:
+                st.error(f"취소하지 못했어요 ({type(e).__name__}: {e})")
+            else:
+                st.session_state["leave_flash"] = f"{d.isoformat()} {_leave_label(x)} 휴가를 취소했어요. 남은 휴가에 다시 반영했어요."
+                st.rerun()
+    if past:
+        with st.expander(f"지난 휴가 {len(past)}건"):
+            st.dataframe(pd.DataFrame([{
+                "날짜": _leave_d(x["leave_date"]).isoformat(), "종류": _leave_label(x), "일수": _fmt_days(float(x["hours"])), "메모": x.get("memo") or "",
+            } for x in past]), hide_index=True, use_container_width=True)
+
+    # 팀 휴가: 누가 언제 쉬는지(메모는 보여주지 않는다)
+    st.markdown("#### 🗓️ 팀 휴가 (이번 달 ~ 다음 달)")
+    start = today.replace(day=1)
+    end = _add_months(start, 2) - timedelta(days=1)
+    try:
+        team = [x for x in SUPA.table("leave_requests").select("person,leave_date,kind,slot,hours,canceled_at")
+                .gte("leave_date", start.isoformat()).lte("leave_date", end.isoformat()).order("leave_date").execute().data
+                if not x.get("canceled_at")]
+    except Exception:
+        team = []
+    today_off = [x["person"] for x in team if _leave_d(x["leave_date"]) == today]
+    if today_off:
+        st.info("🏖️ 오늘 휴가: " + ", ".join(f"{x['person']}({_leave_label(x)})" for x in team if _leave_d(x["leave_date"]) == today))
+    if not team:
+        st.caption("이번 달~다음 달에 등록된 팀 휴가가 없어요.")
+    else:
+        st.dataframe(pd.DataFrame([{
+            "날짜": _leave_d(x["leave_date"]).isoformat(), "요일": _WEEKDAY_KO[_leave_d(x["leave_date"]).weekday()],
+            "이름": x["person"], "종류": _leave_label(x), "일수": _fmt_days(float(x["hours"])),
+        } for x in team]), hide_index=True, use_container_width=True)
+
+
 def _api_error_text(status, body):
     """Claude API 오류를 직원이 이해할 수 있는 말로 바꾼다(원문도 같이 보여줘서 원인을 숨기지 않는다)."""
     body = str(body or "")
@@ -1489,9 +1703,9 @@ div[data-testid="stVerticalBlockBorderWrapper"] {
 _req_rows, _req_err = load_team_requests()
 _req_today = _today_kst()
 _my_overdue = sum(1 for r in _req_rows if r["assignee"] == my_name and _req_days_overdue(r, _req_today))
-tab_home, tab_okr, tab_log, tab_campaign, tab_finance, tab_mywork, tab_board, tab_summary, tab_org = st.tabs([
+tab_home, tab_okr, tab_log, tab_campaign, tab_finance, tab_mywork, tab_board, tab_leave, tab_summary, tab_org = st.tabs([
     "🏠 홈", "🎯 목표", "📝 오늘 기록", "📋 캠페인", "💰 재무", "🧰 내 업무",
-    "📮 요청 게시판" + (f" ⚠️{_my_overdue}" if _my_overdue else ""), "📊 요약", "🏢 조직도",
+    "📮 요청 게시판" + (f" ⚠️{_my_overdue}" if _my_overdue else ""), "🏖️ 휴가", "📊 요약", "🏢 조직도",
 ])
 
 with tab_home:
@@ -3297,6 +3511,11 @@ with tab_board:
         st.error(f"❌ 게시판을 불러오지 못했어요 ({_req_err}). DB에 team_requests 테이블이 있는지 확인해주세요.")
     else:
         _render_request_board(_req_rows, my_name, _req_today)
+
+
+with tab_leave:
+    st.subheader(f"🏖️ {my_name}님의 휴가")
+    _render_leave_page(my_name, _req_today)
 
 
 with tab_summary:

@@ -58,6 +58,7 @@
 ## 7. DB 주요 테이블 (public)
 - 직원/업무: `okr_org`, `okr_items`(is_recurring=KPI, due_date), `daily_activity_log`, `assigned_tasks`, `data_completeness_prompts`, `ai_drafted_updates`, `kpi_alignment_suggestions`, `kpi_data_sources`, `company_vision`
 - 역할별 도구: `sales_accounts/issues/campaigns/campaign_tasks/meeting_alerts`, `dev_tasks`, `influencer_pool`, `casting_funnel`
+- 휴가: `leave_profiles`(입사일·연 부여일수 기본 15, 본인이 최초 1회 입력·수정은 DB에서), `leave_requests`(연차 8h·반차 4h·반반차 2h, 취소는 canceled_at). 입사 1년 미만=월 1일씩 발생분만, 1년 이상=올해 15일 자유 사용. 둘 다 RLS 켜짐
 - 팀 협업: `team_requests`(요청 게시판: 요청자·담당자·마감·상태, 마감 지나면 홈에 ⚠️ 처리요망), `team_comments`(댓글, target_type=request/campaign/account/date). 둘 다 RLS 켜짐(서비스 키로만 접근)
 - 재무: `bank_transactions`(dedup_hash 유니크), `bankda_*`, `cash_events`, `fin_*`, `tax_invoices`, `fin_cash_forecasts`(예정입출금 신고), `payment_requests`(인플루언서 송금: 통화·페이팔/안내메일 분리·dedup_key·batch_id·report_complete)
 - 메일/드라이브: `email_log`, `drive_file_index`, `drive_scan_log`, `meetings`
