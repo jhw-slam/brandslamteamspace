@@ -1793,6 +1793,66 @@ def _task_is_influencer(e, tasks):
     return False
 
 
+@st.cache_data(ttl=30)
+def load_match_campaigns():
+    """송금(콘텐츠 비용)과 연결할 캠페인 목록. 반환: ([{'id','label','brand','campaign','open_date'}], 에러문구)"""
+    try:
+        accs = {a["id"]: a["brand_name"] for a in SUPA.table("sales_accounts").select("id,brand_name").execute().data}
+        camps = SUPA.table("sales_campaigns").select("id,account_id,campaign_name,open_date").order("open_date", desc=True).limit(300).execute().data
+    except Exception as e:
+        return [], f"{type(e).__name__}: {e}"
+    out = []
+    for c in camps:
+        brand = accs.get(c["account_id"], "?")
+        out.append({"id": c["id"], "brand": brand, "campaign": c["campaign_name"], "open_date": str(c["open_date"])[:10],
+                    "label": f"{brand} · {c['campaign_name']} · 오픈 {str(c['open_date'])[:10]}"})
+    return out, None
+
+
+def _suggest_campaign_ids(brand_text, camps):
+    """파일에 적힌 브랜드 글자(콤마 구분)와 이름이 같은 캠페인이 '정확히 1개'인 브랜드만 미리 골라준다(추천일 뿐, 사람이 확인).
+    같은 브랜드에 캠페인이 여럿이면 어느 달 것인지 모르므로 비워둔다."""
+    picks = []
+    for b in re.split(r"[,/]", str(brand_text or "")):
+        key = _drive_norm(b)
+        if not key:
+            continue
+        hit = [c["id"] for c in camps if _drive_norm(c["brand"]) == key]
+        if len(hit) == 1:
+            picks.append(hit[0])
+    return picks
+
+
+def _split_payment_ratio(amount, n):
+    """한 송금(콘텐츠 비용)을 n개 캠페인에 균등 배분한다. [(비율, 금액)] — 합이 정확히 1, 정확히 amount가 되게 마지막에 나머지를 붙인다."""
+    amount = float(amount or 0)
+    out, used_r, used_a = [], 0.0, 0.0
+    for i in range(n):
+        if i == n - 1:
+            r, a = round(1 - used_r, 6), round(amount - used_a, 2)
+        else:
+            r, a = round(1 / n, 6), round(amount / n, 2)
+        used_r += r
+        used_a += a
+        out.append((r, a))
+    return out
+
+
+def _save_payment_matches(payment_id, amount, currency, campaign_ids, my_name):
+    """송금과 캠페인의 연결을 저장한다(균등 배분). 반환: 에러 문구(성공이면 None)"""
+    ids = list(dict.fromkeys(campaign_ids or []))
+    if not ids:
+        return "연결할 캠페인을 하나 이상 선택해주세요."
+    rows = [{"payment_request_id": payment_id, "campaign_id": cid, "ratio": r, "allocated_amount": a,
+             "currency": currency or "KRW", "matched_by": my_name}
+            for cid, (r, a) in zip(ids, _split_payment_ratio(amount, len(ids)))]
+    try:
+        SUPA.table("payment_request_campaigns").insert(rows).execute()
+    except Exception as e:
+        return f"캠페인 연결을 저장하지 못했어요 ({type(e).__name__}: {e})"
+    return None
+
+
 def _api_error_text(status, body):
     """Claude API 오류를 직원이 이해할 수 있는 말로 바꾼다(원문도 같이 보여줘서 원인을 숨기지 않는다)."""
     body = str(body or "")
@@ -3094,12 +3154,15 @@ with tab_finance:
     if st.session_state.get("payment_extract_msg") and pay_preview:
         st.success(st.session_state["payment_extract_msg"])
     if pay_preview:
-        REQUIRED_FIELDS = ["influencer_name", "amount", "payment_method_raw", "content_link", "id_doc_link", "scheduled_date", "brand_names"]
+        REQUIRED_FIELDS = ["influencer_name", "amount", "payment_method_raw", "content_link", "id_doc_link", "scheduled_date", "campaign_ids"]
         FIELD_LABEL = {
             "influencer_name": "이름", "amount": "금액", "payment_method_raw": "결제수단",
             "content_link": "콘텐츠링크", "id_doc_link": "신분증링크", "scheduled_date": "송금예정일",
-            "brand_names": "참여 브랜드",
+            "campaign_ids": "매칭 캠페인",
         }
+        match_camps, match_err = load_match_campaigns()
+        camp_label_by_id = {c["id"]: c["label"] for c in match_camps}
+        camp_by_id = {c["id"]: c for c in match_camps}
 
         def _missing_fields(r):
             return [f for f in REQUIRED_FIELDS if not r.get(f)]
@@ -3142,11 +3205,22 @@ with tab_finance:
                     if "payment_method_raw" in missing:
                         r["payment_method_raw"] = st.text_input("결제수단(은행명+계좌번호 또는 PayPal 이메일)", key=f"fix_pm_{_pv}_{idx}") or None
                         r["paypal_email"] = _extract_email(r["payment_method_raw"])
-                    if "brand_names" in missing:
-                        r["brand_names"] = st.text_input(
-                            "참여 브랜드 (콤마로 여러개 가능)", key=f"fix_brands_{_pv}_{idx}",
-                            placeholder="예: 브랜드A, 브랜드B",
-                        ) or None
+                    # 이 콘텐츠에 노출된 캠페인(김선재님이 등록한 캠페인)을 선택 — 여러 개 가능. 마진율 계산의 기준이 돼요.
+                    if match_camps:
+                        r["campaign_ids"] = st.multiselect(
+                            "이 콘텐츠에 노출된 캠페인 * (여러 개 선택 가능)", [c["id"] for c in match_camps],
+                            default=[i for i in (r.get("campaign_ids") or _suggest_campaign_ids(r.get("brand_names"), match_camps)) if i in camp_label_by_id],
+                            format_func=lambda i: camp_label_by_id.get(i, i), key=f"campaigns_{_pv}_{idx}",
+                            help="이 콘텐츠 비용은 선택한 캠페인에 균등하게 나뉘어 마진 계산에 쓰여요. 파일에 적힌 브랜드는 참고용으로 미리 골라드려요.",
+                        )
+                        if len(r["campaign_ids"]) > 1 and r.get("amount"):
+                            r_amt = float(r["amount"]) / len(r["campaign_ids"])
+                            st.caption(f"📊 {len(r['campaign_ids'])}개 캠페인에 균등 배분 → 캠페인당 약 {r_amt:,.0f} ({r.get('currency') or 'KRW'})")
+                    elif match_err:
+                        st.error(f"캠페인 목록을 불러오지 못했어요 ({match_err})")
+                    else:
+                        r["campaign_ids"] = []
+                        st.error("등록된 캠페인이 없어요. 먼저 김선재님이 `📝 캠페인 등록`에서 캠페인을 등록해야 송금을 연결할 수 있어요.")
 
                     _curs = ["KRW", "USD", "EUR", "GBP", "JPY"]
                     r["currency"] = c2.selectbox(
@@ -3203,7 +3277,9 @@ with tab_finance:
             st.markdown("**🧾 최종 확인표** — 아래 내용 그대로 저장돼요.")
             st.dataframe(pd.DataFrame([{
                 "이름": r.get("influencer_name"), "금액": f"{float(r.get('amount') or 0):,.0f}", "통화": r.get("currency", "KRW"),
-                "결제수단": r.get("payment_method_raw"), "참여 브랜드": r.get("brand_names"), "송금예정일": r.get("scheduled_date"),
+                "결제수단": r.get("payment_method_raw"),
+                "매칭 캠페인": " / ".join(camp_label_by_id.get(i, "?").split(" · 오픈")[0] for i in r.get("campaign_ids") or []),
+                "송금예정일": r.get("scheduled_date"),
                 "콘텐츠링크": r.get("content_link"),
             } for r in valid_rows]), hide_index=True, use_container_width=True)
 
@@ -3255,8 +3331,10 @@ with tab_finance:
                     batch_id = str(uuid.uuid4())
                     all_brands, saved_keys, save_err = set(), set(), None
                     for r in valid_rows:
+                        camp_ids = r.get("campaign_ids") or []
+                        row_brands = list(dict.fromkeys(camp_by_id[i]["brand"] for i in camp_ids if i in camp_by_id))
                         try:
-                            SUPA.table("payment_requests").insert({
+                            ins = SUPA.table("payment_requests").insert({
                                 "influencer_name": r.get("influencer_name"),
                                 "paypal_email": r.get("paypal_email"), "notification_email": r.get("notification_email"),
                                 "amount": r.get("amount"),
@@ -3265,20 +3343,26 @@ with tab_finance:
                                 "tiktok_url": r.get("tiktok_url"), "instagram_url": r.get("instagram_url"),
                                 "payment_method_raw": r.get("payment_method_raw"),
                                 "content_link": r.get("content_link"), "id_doc_link": r.get("id_doc_link"),
-                                "contract_link": r.get("contract_link"), "brand_names": r.get("brand_names"),
+                                "contract_link": r.get("contract_link"), "brand_names": ", ".join(row_brands) or r.get("brand_names"),
                                 "id_doc_confirmed": r.get("id_doc_confirmed"), "contract_confirmed": r.get("contract_confirmed"),
                                 "currency": r.get("currency", "KRW"), "expense_proposal_url": r.get("expense_proposal_url"),
                                 "dedup_key": r.get("dedup_key"), "double_checked": True, "batch_id": batch_id,
                                 "payment_destination_verified": True, "report_complete": True,
                                 "submitted_by": my_name,
                             }).execute()
+                            # 캠페인 연결이 없으면 마진 계산에서 빠지므로, 연결 저장에 실패하면 이 송금도 저장하지 않는다
+                            link_err = _save_payment_matches(ins.data[0]["id"], r.get("amount"), r.get("currency", "KRW"), camp_ids, my_name)
+                            if link_err:
+                                try:
+                                    SUPA.table("payment_requests").delete().eq("id", ins.data[0]["id"]).execute()
+                                except Exception as e2:
+                                    link_err += f" (이미 저장된 송금을 되돌리지도 못했어요: {type(e2).__name__} — 관리자에게 알려주세요)"
+                                raise RuntimeError(link_err)
                         except Exception as e:
                             save_err = f"'{r.get('influencer_name')}' 저장 중 오류 ({type(e).__name__}: {e})"
                             break
                         saved_keys.add(r.get("dedup_key"))
-                        for b in (r.get("brand_names") or "").split(","):
-                            if b.strip():
-                                all_brands.add(b.strip())
+                        all_brands.update(row_brands)
 
                     if saved_keys:
                         # 마진율 관리를 위해 구정회에게 지출포인트 공유 (DB 저장 + 할일로 알림) — 합계는 '실제로 저장된 건' 기준
@@ -3316,13 +3400,41 @@ with tab_finance:
     )
     if my_pending_payments:
         st.markdown(f"**💸 내가 등록한 송금요청 — 재확인용 ({len(my_pending_payments)}건, 대표님 처리 대기중)**")
+        _pid_list = [p["id"] for p in my_pending_payments]
+        try:
+            _links = SUPA.table("payment_request_campaigns").select("payment_request_id,campaign_id,allocated_amount").in_("payment_request_id", _pid_list).execute().data
+        except Exception:
+            _links = []
+        _mc, _ = load_match_campaigns()
+        _mc_label = {c["id"]: c["label"].split(" · 오픈")[0] for c in _mc}
+        _linked_by_pid = {}
+        for lk in _links:
+            _linked_by_pid.setdefault(lk["payment_request_id"], []).append(lk["campaign_id"])
         confirm_df = pd.DataFrame([{
             "이름": p["influencer_name"], "금액": f"₩{float(p['amount']):,.0f}" if p.get("amount") else "-",
             "예정일": p.get("scheduled_date") or "-",
+            "매칭 캠페인": " / ".join(_mc_label.get(i, "?") for i in _linked_by_pid.get(p["id"], [])) or "⚠️ 미매칭",
             "콘텐츠링크": "✅" if p.get("content_link") else "⚠️ 없음",
             "신분증": "✅" if p.get("id_doc_link") else "⚠️ 없음",
         } for p in my_pending_payments])
         st.dataframe(confirm_df, hide_index=True, use_container_width=True)
+        _unmatched = [p for p in my_pending_payments if p["id"] not in _linked_by_pid]
+        if _unmatched:
+            st.warning(f"⚠️ 캠페인이 연결되지 않은 송금 {len(_unmatched)}건 — 연결해야 마진율 계산에 반영돼요. 아래에서 선택하고 저장해주세요.")
+            for p in _unmatched:
+                with st.form(f"pay_match_form_{p['id']}"):
+                    pick = st.multiselect(
+                        f"{p['influencer_name']} (₩{float(p.get('amount') or 0):,.0f}) — 노출된 캠페인", [c["id"] for c in _mc],
+                        format_func=lambda i: _mc_label.get(i, i), key=f"pay_match_{p['id']}",
+                    )
+                    match_saved = st.form_submit_button("캠페인 연결 저장")
+                if match_saved:
+                    err = _save_payment_matches(p["id"], p.get("amount"), p.get("currency") or "KRW", pick, my_name)
+                    if err:
+                        st.error(err)
+                    else:
+                        _flash(f"{p['influencer_name']} 송금을 {len(pick)}개 캠페인에 연결했어요.")
+                        st.rerun()
         st.caption("내용이 틀렸으면 구글시트 수정 후 다시 불러와서 등록해주세요. 송금 완료 처리는 대표님이 재무캘린더에서 하시면 자동으로 알림 메일이 나가요.")
 
 

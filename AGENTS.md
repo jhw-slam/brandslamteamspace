@@ -62,6 +62,7 @@
 ## 7. DB 주요 테이블 (public)
 - 직원/업무: `okr_org`, `okr_items`(is_recurring=KPI, due_date), `daily_activity_log`, `assigned_tasks`, `data_completeness_prompts`, `ai_drafted_updates`, `kpi_alignment_suggestions`, `kpi_data_sources`, `company_vision`
 - 역할별 도구: `sales_accounts/issues/campaigns/campaign_tasks/meeting_alerts`, `dev_tasks`, `influencer_pool`, `casting_funnel`
+- **마진율의 뼈대(10/7 대표 지시)**: 매출 = 김선재가 캠페인별로 올리는 인보이스(`sales_campaigns.invoice_amount/currency`), 비용 = 곽재선이 올리는 콘텐츠별 인플루언서 송금(`payment_requests.amount`). 둘을 잇는 것이 `payment_request_campaigns`(송금 1건 ↔ 캠페인 N개, 비용은 `ratio`/`allocated_amount`로 균등 배분). **송금 등록 때 캠페인 선택은 필수**(없으면 등록 불가, 연결 저장 실패 시 송금도 되돌림). 마진 = 캠페인 매출 − 그 캠페인에 배분된 비용. 통화가 다르면(KRW/USD) 환산 필요 — 환율은 추측하지 않음. 마진율 화면은 아직 미구현.
 - 휴가: `leave_profiles`(입사일·연 부여일수 기본 15, 본인이 최초 1회 입력·수정은 DB에서), `leave_requests`(연차 8h·반차 4h·반반차 2h, 취소는 canceled_at). 입사 1년 미만=월 1일씩 발생분만, 1년 이상=올해 15일 자유 사용. 둘 다 RLS 켜짐
 - 팀 협업: `team_requests`(요청 게시판: 요청자·담당자·마감·상태, 마감 지나면 홈에 ⚠️ 처리요망), `team_comments`(댓글, target_type=request/campaign/account/date, 파일 첨부 attachment_url/name). 둘 다 RLS 켜짐(서비스 키로만 접근)
 - 재무: `bank_transactions`(dedup_hash 유니크), `bankda_*`, `cash_events`, `fin_*`, `tax_invoices`, `fin_cash_forecasts`(예정입출금 신고), `payment_requests`(인플루언서 송금: 통화·페이팔/안내메일 분리·dedup_key·batch_id·report_complete)
