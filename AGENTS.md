@@ -58,6 +58,7 @@
 ## 7. DB 주요 테이블 (public)
 - 직원/업무: `okr_org`, `okr_items`(is_recurring=KPI, due_date), `daily_activity_log`, `assigned_tasks`, `data_completeness_prompts`, `ai_drafted_updates`, `kpi_alignment_suggestions`, `kpi_data_sources`, `company_vision`
 - 역할별 도구: `sales_accounts/issues/campaigns/campaign_tasks/meeting_alerts`, `dev_tasks`, `influencer_pool`, `casting_funnel`
+- 팀 협업: `team_requests`(요청 게시판: 요청자·담당자·마감·상태, 마감 지나면 홈에 ⚠️ 처리요망), `team_comments`(댓글, target_type=request/campaign/account/date). 둘 다 RLS 켜짐(서비스 키로만 접근)
 - 재무: `bank_transactions`(dedup_hash 유니크), `bankda_*`, `cash_events`, `fin_*`, `tax_invoices`, `fin_cash_forecasts`(예정입출금 신고), `payment_requests`(인플루언서 송금: 통화·페이팔/안내메일 분리·dedup_key·batch_id·report_complete)
 - 메일/드라이브: `email_log`, `drive_file_index`, `drive_scan_log`, `meetings`
 - ⚠️ `drive_*`, `campaigns`, `brands`, `sales_brands`, `sales_revenue_monthly`, `assistant_notifications` 등은 다른 세션에서 만들어진 것으로 보임 — 사용 전 스키마와 쓰임 확인.
@@ -68,3 +69,5 @@
 - `support_chat_staff` 테이블 RLS 비활성(보안): `ALTER TABLE public.support_chat_staff ENABLE ROW LEVEL SECURITY;` 및 정책 설계 필요.
 - 지출기안서 링크는 현재 선택사항. 추후 승인 플로우에서 필수화 예정.
 - 직원이 실제로 쓰는 시트/양식이 제각각이라 송금정보 읽기 정확도는 계속 개선 대상.
+- 처리요망 알림 메일 `scripts/send_overdue_digest.py`(마감 지난 요청을 담당자 본인에게 하루 1통): 아직 Railway Cron 서비스로 등록 안 됨(`0 0 * * 1-5`, UTC). 등록 전에는 홈의 ⚠️ 표시만 동작. 먼저 `--dry-run`으로 확인.
+- 요청 게시판의 '마감 지나면 팀 전체에 알림'과 주간 팀 메일은 보류(대표님이 결정 후 진행). 대표용 메뉴는 `brandslamContract` 레포에서 대표님이 직접 관리.

@@ -1037,6 +1037,222 @@ def _render_invoice_section(c, brand, can_edit, my_name, refresh):
                 refresh()
 
 
+REQ_STATUSES = ["요청", "확인", "진행중", "완료", "보류"]
+REQ_PRIORITIES = ["낮음", "보통", "높음", "긴급"]
+REQ_PRIO_ICON = {"낮음": "⚪", "보통": "🔵", "높음": "🟠", "긴급": "🔴"}
+
+
+def _today_kst():
+    return (datetime.utcnow() + timedelta(hours=9)).date()  # 서버는 UTC라서 한국 날짜로 맞춘다
+
+
+@st.cache_data(ttl=10)
+def load_team_requests():
+    """요청 게시판 글 전체(최근 500건). 반환: (목록, 에러문구). 테이블이 없어도 앱이 죽지 않게 에러를 돌려준다."""
+    try:
+        return SUPA.table("team_requests").select("*").order("created_at", desc=True).limit(500).execute().data, None
+    except Exception as e:
+        return [], f"{type(e).__name__}: {e}"
+
+
+@st.cache_data(ttl=10)
+def load_request_comments():
+    try:
+        return SUPA.table("team_comments").select("*").eq("target_type", "request").order("created_at").limit(2000).execute().data
+    except Exception:
+        return []
+
+
+@st.cache_data(ttl=60)
+def load_board_campaigns():
+    """요청에 연결할 캠페인 목록 [(id, '브랜드 · 캠페인명')]. 세일즈 데이터가 없거나 실패해도 빈 목록."""
+    try:
+        accs = {a["id"]: a["brand_name"] for a in SUPA.table("sales_accounts").select("id,brand_name").execute().data}
+        camps = SUPA.table("sales_campaigns").select("id,account_id,campaign_name,open_date").order("open_date", desc=True).limit(100).execute().data
+        return [(c["id"], f"{accs.get(c['account_id'], '?')} · {c['campaign_name']}") for c in camps]
+    except Exception:
+        return []
+
+
+def _req_open(r):
+    return r.get("status") not in ("완료", "보류")
+
+
+def _req_days_overdue(r, today):
+    """마감이 지났고 아직 끝나지 않았으면 며칠 지났는지(아니면 0)."""
+    if not r.get("due_date") or not _req_open(r):
+        return 0
+    return max(0, (today - date.fromisoformat(str(r["due_date"])[:10])).days)
+
+
+def _render_my_request_banner(rows, my_name, today):
+    """내 홈 화면 맨 위: 마감 지난 요청은 ⚠️ 처리요망, 새 요청은 📬로 알려준다."""
+    mine = [r for r in rows if r["assignee"] == my_name and _req_open(r)]
+    od = sorted([r for r in mine if _req_days_overdue(r, today)], key=lambda r: -_req_days_overdue(r, today))
+    new = [r for r in mine if r["status"] == "요청" and not _req_days_overdue(r, today)]
+    if od:
+        lines = "".join(f"\n- {r['title']} (요청: {r['requester']} · 마감 {_req_days_overdue(r, today)}일 지남)" for r in od[:5])
+        more = f"\n- 외 {len(od) - 5}건" if len(od) > 5 else ""
+        st.warning(f"⚠️ **처리요망 {len(od)}건** — 마감이 지난 요청이에요. '📮 요청 게시판'에서 처리해주세요.{lines}{more}")
+    if new:
+        st.info(f"📬 새 요청 {len(new)}건이 있어요: " + ", ".join(r["title"] for r in new[:3]) + (" …" if len(new) > 3 else ""))
+    asked = [r for r in rows if r["requester"] == my_name and r["assignee"] != my_name and _req_days_overdue(r, today)]
+    if asked:
+        st.caption(f"📤 내가 올린 요청 중 마감이 지난 건 {len(asked)}건: " + ", ".join(f"{r['title']}({r['assignee']})" for r in asked[:3]))
+
+
+def _post_request_comment(req_id, key, author):
+    txt = (st.session_state.get(key) or "").strip()
+    if not txt:
+        return
+    try:
+        SUPA.table("team_comments").insert({"target_type": "request", "target_id": req_id, "author": author, "body": txt}).execute()
+    except Exception as e:
+        st.session_state["req_flash_err"] = f"댓글을 저장하지 못했어요 ({type(e).__name__}: {e})"
+        return
+    st.session_state[key] = ""  # 입력칸 비우기(콜백 안에서만 가능)
+    load_request_comments.clear()
+
+
+def _render_request_board(rows, my_name, today):
+    """요청 게시판: 모두에게 보이고, 담당자는 상태를 바꾸고, 요청한 사람은 내용을 고치고, 누구나 댓글을 단다."""
+    if st.session_state.get("req_flash"):
+        st.success(st.session_state.pop("req_flash"))
+    if st.session_state.get("req_flash_err"):
+        st.error(st.session_state.pop("req_flash_err"))
+    camps = load_board_campaigns()
+    camp_label = {cid: lab for cid, lab in camps}
+
+    with st.expander("➕ 새 요청 올리기", expanded=not rows):
+        with st.form("new_request_form", clear_on_submit=True):
+            title = st.text_input("제목 *", placeholder="예: 10월 닥터리앤장 포스팅 일정 확인 부탁드려요")
+            body = st.text_area("자세한 내용", height=90)
+            f1, f2, f3 = st.columns(3)
+            assignee = f1.selectbox("담당자 *", STAFF_NAMES, index=None, placeholder="누구에게 요청하나요?")
+            due = f2.date_input("마감일", value=None)
+            prio = f3.selectbox("우선순위", REQ_PRIORITIES, index=1)
+            related = st.selectbox("관련 캠페인 (선택)", ["(연결 안 함)"] + [lab for _cid, lab in camps])
+            submitted = st.form_submit_button("📮 요청 올리기", type="primary")
+        if submitted:
+            if not title.strip() or not assignee:
+                st.error("제목과 담당자를 입력해주세요.")
+            elif due and due < today:
+                st.error("마감일이 이미 지났어요. 오늘 이후 날짜로 정해주세요.")
+            else:
+                row = {"requester": my_name, "assignee": assignee, "title": title.strip(), "body": body.strip() or None,
+                       "due_date": due.isoformat() if due else None, "priority": prio}
+                if related != "(연결 안 함)":
+                    row["related_type"] = "campaign"
+                    row["related_id"] = next(cid for cid, lab in camps if lab == related)
+                try:
+                    SUPA.table("team_requests").insert(row).execute()
+                except Exception as e:
+                    st.error(f"요청을 저장하지 못했어요 ({type(e).__name__}: {e})")
+                else:
+                    load_team_requests.clear()
+                    st.session_state["req_flash"] = f"요청을 올렸어요. {assignee}님 홈에 📬로 표시돼요."
+                    st.rerun()
+
+    v1, v2 = st.columns([3, 1])
+    view = v1.radio("보기", ["전체", "나에게 온 요청", "내가 올린 요청", "⚠️ 처리요망만"], horizontal=True, key="req_view")
+    show_closed = v2.checkbox("완료·보류도 보기", key="req_closed")
+    shown = [r for r in rows if show_closed or _req_open(r)]
+    if view == "나에게 온 요청":
+        shown = [r for r in shown if r["assignee"] == my_name]
+    elif view == "내가 올린 요청":
+        shown = [r for r in shown if r["requester"] == my_name]
+    elif view == "⚠️ 처리요망만":
+        shown = [r for r in shown if _req_days_overdue(r, today)]
+    prio_rank = {p: i for i, p in enumerate(reversed(REQ_PRIORITIES))}
+    shown.sort(key=lambda r: (not _req_days_overdue(r, today), str(r.get("due_date") or "9999"), prio_rank.get(r["priority"], 9)))
+    if not shown:
+        st.caption("보여드릴 요청이 없어요.")
+        return
+    comments = load_request_comments()
+    by_req = {}
+    for c in comments:
+        by_req.setdefault(c["target_id"], []).append(c)
+
+    for r in shown:
+        rid = r["id"]
+        od = _req_days_overdue(r, today)
+        with st.container(border=True):
+            st.markdown(f"{REQ_PRIO_ICON.get(r['priority'], '🔵')} **{r['title']}**  ·  `{r['status']}`")
+            when = f"⚠️ **처리요망** · 마감 {od}일 지남 ({r['due_date']})" if od else (f"📅 마감 {r['due_date']}" if r.get("due_date") else "마감 없음")
+            st.markdown(f"{r['requester']} → **{r['assignee']}**  ·  {when}  ·  올린 날 {str(r['created_at'])[:10]}")
+            if r.get("body"):
+                st.write(r["body"])
+            if r.get("related_type") == "campaign" and r.get("related_id") in camp_label:
+                st.caption(f"🔗 관련 캠페인: {camp_label[r['related_id']]}")
+
+            if my_name == r["assignee"]:
+                s1, s2 = st.columns([2, 1])
+                new_status = s1.selectbox("상태", REQ_STATUSES, index=REQ_STATUSES.index(r["status"]), key=f"req_status_{rid}")
+                log_it = False
+                if new_status == "완료" and r["status"] != "완료":
+                    log_it = st.checkbox("오늘 업무기록에도 남기기", value=True, key=f"req_log_{rid}")
+                if s2.button("상태 저장", key=f"req_save_{rid}", use_container_width=True) and new_status != r["status"]:
+                    now_iso = datetime.utcnow().isoformat() + "Z"
+                    try:
+                        SUPA.table("team_requests").update({
+                            "status": new_status, "updated_at": now_iso,
+                            "completed_at": now_iso if new_status == "완료" else None,
+                        }).eq("id", rid).execute()
+                        if log_it:
+                            SUPA.table("daily_activity_log").insert({
+                                "staff_name": my_name, "note": f"[요청 완료] {r['title']} (요청: {r['requester']})",
+                            }).execute()
+                    except Exception as e:
+                        st.error(f"저장하지 못했어요 ({type(e).__name__}: {e})")
+                    else:
+                        load_team_requests.clear()
+                        st.session_state["req_flash"] = f"'{r['title']}' 상태를 {new_status}(으)로 바꿨어요." + (" 업무기록에도 남겼어요." if log_it else "")
+                        st.rerun()
+            else:
+                st.caption(f"상태 변경은 담당자({r['assignee']})만 할 수 있어요. 댓글은 누구나 남길 수 있어요.")
+
+            if my_name == r["requester"]:  # 요청한 사람만 내용 수정·삭제 (담당자와 같은 사람이어도 됨)
+                with st.expander("✏️ 내용 수정 / 삭제"):
+                    e_title = st.text_input("제목", value=r["title"], key=f"req_et_{rid}")
+                    e_body = st.text_area("내용", value=r.get("body") or "", key=f"req_eb_{rid}")
+                    g1, g2, g3 = st.columns(3)
+                    e_assignee = g1.selectbox("담당자", STAFF_NAMES, index=STAFF_NAMES.index(r["assignee"]) if r["assignee"] in STAFF_NAMES else 0, key=f"req_ea_{rid}")
+                    e_due = g2.date_input("마감일", value=date.fromisoformat(str(r["due_date"])[:10]) if r.get("due_date") else None, key=f"req_ed_{rid}")
+                    e_prio = g3.selectbox("우선순위", REQ_PRIORITIES, index=REQ_PRIORITIES.index(r["priority"]), key=f"req_ep_{rid}")
+                    if st.button("수정 저장", key=f"req_es_{rid}") and e_title.strip():
+                        try:
+                            SUPA.table("team_requests").update({
+                                "title": e_title.strip(), "body": e_body.strip() or None, "assignee": e_assignee,
+                                "due_date": e_due.isoformat() if e_due else None, "priority": e_prio,
+                                "updated_at": datetime.utcnow().isoformat() + "Z",
+                            }).eq("id", rid).execute()
+                        except Exception as e:
+                            st.error(f"저장하지 못했어요 ({type(e).__name__}: {e})")
+                        else:
+                            load_team_requests.clear()
+                            st.session_state["req_flash"] = "요청 내용을 고쳤어요."
+                            st.rerun()
+                    if st.checkbox("이 요청을 삭제할게요", key=f"req_dc_{rid}") and st.button("🗑 삭제", key=f"req_del_{rid}"):
+                        try:
+                            SUPA.table("team_comments").delete().eq("target_type", "request").eq("target_id", rid).execute()
+                            SUPA.table("team_requests").delete().eq("id", rid).execute()
+                        except Exception as e:
+                            st.error(f"삭제하지 못했어요 ({type(e).__name__}: {e})")
+                        else:
+                            load_team_requests.clear(); load_request_comments.clear()
+                            st.session_state["req_flash"] = "요청을 삭제했어요."
+                            st.rerun()
+
+            cm = by_req.get(rid, [])
+            with st.expander(f"💬 댓글 {len(cm)}개"):
+                for c in cm:
+                    st.markdown(f"**{c['author']}** · {str(c['created_at'])[:16].replace('T', ' ')}")
+                    st.write(c["body"])
+                ckey = f"req_cmt_{rid}"
+                st.text_input("댓글 달기", key=ckey, placeholder="확인했어요 / 이 부분은 이렇게 할게요")
+                st.button("남기기", key=f"req_cmt_btn_{rid}", on_click=_post_request_comment, args=(rid, ckey, my_name))
+
+
 def _api_error_text(status, body):
     """Claude API 오류를 직원이 이해할 수 있는 말로 바꾼다(원문도 같이 보여줘서 원인을 숨기지 않는다)."""
     body = str(body or "")
@@ -1270,11 +1486,19 @@ div[data-testid="stVerticalBlockBorderWrapper"] {
 </style>
 """, unsafe_allow_html=True)
 
-tab_home, tab_okr, tab_log, tab_campaign, tab_finance, tab_mywork, tab_summary, tab_org = st.tabs([
-    "🏠 홈", "🎯 목표", "📝 오늘 기록", "📋 캠페인", "💰 재무", "🧰 내 업무", "📊 요약", "🏢 조직도",
+_req_rows, _req_err = load_team_requests()
+_req_today = _today_kst()
+_my_overdue = sum(1 for r in _req_rows if r["assignee"] == my_name and _req_days_overdue(r, _req_today))
+tab_home, tab_okr, tab_log, tab_campaign, tab_finance, tab_mywork, tab_board, tab_summary, tab_org = st.tabs([
+    "🏠 홈", "🎯 목표", "📝 오늘 기록", "📋 캠페인", "💰 재무", "🧰 내 업무",
+    "📮 요청 게시판" + (f" ⚠️{_my_overdue}" if _my_overdue else ""), "📊 요약", "🏢 조직도",
 ])
 
 with tab_home:
+    # ── 📮 요청 게시판: 마감 지난 요청(⚠️ 처리요망)·새 요청 ──
+    if not _req_err:
+        _render_my_request_banner(_req_rows, my_name, _req_today)
+
     # ── 📋 채워주세요! (30분마다 도는 완성도 체크가 찾아낸 빈 정보) ──
     open_prompts = (
         SUPA.table("data_completeness_prompts")
@@ -3061,6 +3285,18 @@ with tab_mywork:
 
     else:
         st.caption("이 이름에는 아직 맞춤 도구가 없어요. 필요하시면 말씀해주세요 — 바로 만들어드릴게요.")
+
+
+with tab_board:
+    st.subheader("📮 요청 게시판")
+    st.caption(
+        "팀원끼리 서로 요청하는 곳이에요. 모두에게 보이고, 담당자는 상태를 바꾸고, 요청한 사람은 내용을 고쳐요. "
+        "마감이 지나면 담당자 홈에 ⚠️ 처리요망이 뜨고, 평일 아침에 모아서 메일이 가요."
+    )
+    if _req_err:
+        st.error(f"❌ 게시판을 불러오지 못했어요 ({_req_err}). DB에 team_requests 테이블이 있는지 확인해주세요.")
+    else:
+        _render_request_board(_req_rows, my_name, _req_today)
 
 
 with tab_summary:
