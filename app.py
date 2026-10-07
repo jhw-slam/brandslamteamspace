@@ -2240,27 +2240,33 @@ if _nav == "home":
         sales_alerts = load_home_sales_alerts(my_name)
         if sales_alerts:
             st.info(f"📼 **담당하시는 업체 관련 회의가 있었어요** — {len(sales_alerts)}건 (등록된 업체명이 언급된 회의만 보여드려요)")
-            for al in sales_alerts:
-                with st.container(border=True):
-                    when = al["meeting_date"][:10] if al.get("meeting_date") else ""
-                    st.markdown(f"**[{al['brand_matched']}]** {al.get('meeting_title') or ''} · {when}")
-                    if al.get("summary_snippet"):
-                        st.caption(al["summary_snippet"])
-                    ac1, ac2 = st.columns(2)
-                    if ac1.button("✅ 업무보고에 반영해주세요", key=f"reflect_meeting_{al['id']}", use_container_width=True):
-                        SUPA.table("ai_drafted_updates").insert({
-                            "person": my_name, "source": "meeting", "source_ref": str(al["meeting_id"]),
-                            "target_table": "sales_accounts",
-                            "draft_content": f"[{al['brand_matched']}] 관련 회의 내용: {al.get('summary_snippet') or ''}",
-                        }).execute()
-                        SUPA.table("sales_meeting_alerts").update({"status": "reflected"}).eq("id", al["id"]).execute()
-                        _flash("반영 요청 접수! 위 'AI가 준비해둔 내용'에서 곧 확인하실 수 있어요.")
-                        _clear_home_caches()
-                        st.rerun()
-                    if ac2.button("그냥 참고만 할게요", key=f"dismiss_meeting_{al['id']}", use_container_width=True):
-                        SUPA.table("sales_meeting_alerts").update({"status": "dismissed"}).eq("id", al["id"]).execute()
-                        _clear_home_caches()
-                        st.rerun()
+            _SNIP = 90  # 카드에는 앞부분만, 나머지는 '더보기'
+            for _row_start in range(0, len(sales_alerts), 3):  # 와이드 화면에 카드 3개씩
+                for _col, al in zip(st.columns(3), sales_alerts[_row_start:_row_start + 3]):
+                    with _col.container(border=True):
+                        when = al["meeting_date"][:10] if al.get("meeting_date") else ""
+                        st.markdown(f"**[{al['brand_matched']}]** {al.get('meeting_title') or ''}")
+                        st.caption(when)
+                        snip = al.get("summary_snippet") or ""
+                        if snip:
+                            st.caption(snip if len(snip) <= _SNIP else snip[:_SNIP].rstrip() + "…")
+                            if len(snip) > _SNIP:
+                                with st.expander("더보기"):
+                                    st.write(snip)
+                        if st.button("✅ 업무보고에 반영", key=f"reflect_meeting_{al['id']}", use_container_width=True):
+                            SUPA.table("ai_drafted_updates").insert({
+                                "person": my_name, "source": "meeting", "source_ref": str(al["meeting_id"]),
+                                "target_table": "sales_accounts",
+                                "draft_content": f"[{al['brand_matched']}] 관련 회의 내용: {al.get('summary_snippet') or ''}",
+                            }).execute()
+                            SUPA.table("sales_meeting_alerts").update({"status": "reflected"}).eq("id", al["id"]).execute()
+                            _flash("반영 요청 접수! 위 'AI가 준비해둔 내용'에서 곧 확인하실 수 있어요.")
+                            _clear_home_caches()
+                            st.rerun()
+                        if st.button("참고만 할게요", key=f"dismiss_meeting_{al['id']}", use_container_width=True):
+                            SUPA.table("sales_meeting_alerts").update({"status": "dismissed"}).eq("id", al["id"]).execute()
+                            _clear_home_caches()
+                            st.rerun()
 
     # ── 🧭 내 KPI 데이터 정렬 제안 (kpi_gap만 — 본인 데이터라 바로 처리) ──
     my_kpi_gaps = load_home_kpi_gaps(my_name)
