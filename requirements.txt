@@ -3,3 +3,7 @@ supabase>=2.6
 pandas>=2.0
 requests>=2.31
 openpyxl>=3.1
+
+Pillow>=10.0
+google-auth>=2.30
+pypdf>=4.0

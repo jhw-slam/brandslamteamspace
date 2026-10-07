@@ -1,6 +1,8 @@
 import os
 import io
 import re
+import html
+import calendar
 import json
 import uuid
 import base64
@@ -171,12 +173,1320 @@ def _extract_email(text):
     return m.group(0) if m else None
 
 
+def _google_file_id(url):
+    """구글시트/드라이브 링크에서 파일 ID를 뽑는다. (id, 종류) — 종류: 'sheet' | 'drive' | 'published' | None"""
+    url = (url or "").strip()
+    if "/spreadsheets/d/e/" in url:
+        return None, "published"
+    m = re.search(r"/spreadsheets/d/([\w-]+)", url)
+    if m:
+        return m.group(1), "sheet"
+    m = re.search(r"drive\.google\.com/file/d/([\w-]+)", url) or re.search(r"[?&]id=([\w-]+)", url)
+    if m:
+        return m.group(1), "drive"
+    return None, None
+
+
+def _fetch_google_sheet(url):
+    """구글시트 링크를 읽어 {탭이름: DataFrame}으로 돌려준다.
+    실패하면 (None, 원인제목, 해결방법)을 돌려줘서 화면에 그대로 보여줄 수 있게 한다."""
+    file_id, kind = _google_file_id(url)
+    if kind == "published":
+        return None, "'웹에 게시' 링크는 읽을 수 없어요", (
+            "구글시트 **주소창의 링크**(…/spreadsheets/d/…/edit)를 복사해서 붙여넣어주세요. "
+            "'파일 → 공유 → 웹에 게시'로 만든 링크는 지원하지 않아요.")
+    if not file_id:
+        return None, "구글시트 링크가 아닌 것 같아요", (
+            "브라우저 주소창의 링크(https://docs.google.com/spreadsheets/d/…)를 그대로 복사해서 붙여넣어주세요.")
+
+    perm_title = "권한 문제예요 — 저희 쪽에서 이 시트를 열 수 없어요"
+    perm_fix = (
+        "구글시트 우측 상단 **'공유' → '일반 액세스'를 '링크가 있는 모든 사용자' + '뷰어'**로 바꿔주세요. "
+        "'회사 이름(조직) 내 사용자'로만 열어두면 외부 서버에서는 읽을 수 없습니다. "
+        "공유가 어렵다면 시트를 **엑셀(.xlsx)로 다운로드해서 아래 '파일로 올리기'**를 쓰셔도 돼요.")
+
+    def _get(u):
+        return requests.get(u, timeout=30, headers={"User-Agent": "Mozilla/5.0"}, allow_redirects=True)
+
+    try:
+        urls = []
+        if kind == "sheet":
+            urls.append(f"https://docs.google.com/spreadsheets/d/{file_id}/export?format=xlsx")
+        urls.append(f"https://drive.google.com/uc?export=download&id={file_id}")  # 드라이브에 올린 엑셀 파일용
+        content, last_status = None, None
+        for u in urls:
+            res = _get(u)
+            last_status = res.status_code
+            host_login = "accounts.google.com" in res.url
+            if res.status_code == 200 and res.content[:2] == b"PK" and not host_login:
+                content = res.content
+                break
+            if res.status_code in (401, 403) or host_login or (res.status_code == 200 and b"<html" in res.content[:500].lower()):
+                last_status = 403  # 로그인 페이지로 튕기면 비공개라는 뜻 (코드는 200으로 와서 헷갈림)
+                break
+            if res.status_code == 404:
+                break
+            # 400 등: 다음 주소(드라이브 직접 다운로드)로 재시도
+        if content is None:
+            if last_status in (401, 403):
+                return None, perm_title, perm_fix
+            if last_status == 404:
+                return None, "시트를 찾을 수 없어요", "링크가 잘렸거나 삭제된 시트일 수 있어요. 주소를 다시 복사해주세요."
+            return None, f"구글 응답이 이상해요 (코드 {last_status})", (
+                "시트가 '구글 스프레드시트' 형식이 아니거나 일시적인 오류일 수 있어요. "
+                "잠시 후 다시 시도하시거나, 엑셀로 다운로드해서 '파일로 올리기'를 써주세요.")
+        sheets = pd.read_excel(io.BytesIO(content), sheet_name=None, header=None, dtype=str)
+        if not sheets or all(df.empty for df in sheets.values()):
+            return None, "시트가 비어 있어요", "내용이 있는 탭이 하나도 없어요. 맞는 파일인지 확인해주세요."
+        return sheets, None, None
+    except requests.exceptions.RequestException as e:
+        return None, "구글에 연결하지 못했어요", f"네트워크 문제일 수 있어요. 잠시 후 다시 시도해주세요. (상세: {type(e).__name__}: {e})"
+    except Exception as e:
+        return None, "파일을 해석하지 못했어요", f"(상세: {type(e).__name__}: {e})"
+
+
+def _read_uploaded_sheet_file(f):
+    """직접 올린 .xlsx / .csv 파일을 {탭이름: DataFrame}으로 읽는다. (sheets, 에러문구)"""
+    try:
+        if f.name.lower().endswith(".csv"):
+            raw = f.getvalue()
+            for enc in ("utf-8-sig", "cp949"):
+                try:
+                    return {"CSV": pd.read_csv(io.StringIO(raw.decode(enc)), header=None, dtype=str)}, None
+                except UnicodeDecodeError:
+                    continue
+            return None, "CSV 글자 인코딩을 알 수 없어요. 엑셀(.xlsx)로 저장해서 올려주세요."
+        return pd.read_excel(io.BytesIO(f.getvalue()), sheet_name=None, header=None, dtype=str), None
+    except Exception as e:
+        return None, f"파일을 읽지 못했어요 ({type(e).__name__}: {e})"
+
+
+def _cell_is_datalike(v):
+    """셀이 '값'(금액·URL·이메일·날짜·계좌번호)처럼 보이면 True, 비었으면 None, 글자뿐이면 False."""
+    sv = str(v).strip()
+    if not sv or sv.lower() == "nan":
+        return None
+    if re.search(r"\d", sv) and re.fullmatch(r"[\d,.\s₩원$-]+", sv):
+        return True
+    if "@" in sv or sv.lower().startswith("http") or re.search(r"\d{2,}-\d{2,}", sv):
+        return True
+    return bool(re.fullmatch(r"\d{2,4}[-./]\d{1,2}[-./]\d{1,2}", sv))
+
+
+def _detect_header_rows(raw_df):
+    """한 탭 안에서 '제목줄(헤더)처럼 보이는 행'을 찾는다. 반환: 1부터 세는 행 번호 목록(못 찾으면 [1]).
+    제목줄 = 내용 있는 칸 3개 이상이 전부 글자뿐이고, 바로 뒤 몇 줄 안에 값(금액·URL 등)이 있는 행."""
+    kinds = [[_cell_is_datalike(v) for v in row] for row in raw_df.values.tolist()]
+    found = []
+    for i, ks in enumerate(kinds):
+        filled = [k for k in ks if k is not None]
+        if len(filled) < 3 or any(filled):
+            continue
+        if found and found[-1] == i:  # 바로 윗줄도 제목줄이면 두 줄짜리 제목으로 보고 첫 줄만 사용
+            continue
+        if any(True in [k for k in nxt if k is not None] for nxt in kinds[i + 1:i + 4]):
+            found.append(i + 1)
+    return found or [1]
+
+
+def _parse_row_numbers(text, max_row):
+    """'1, 22, 45' → [1, 22, 45]. 범위를 벗어나거나 숫자가 아닌 건 버린다."""
+    nums = {int(t) for t in re.findall(r"\d+", str(text or "")) if 1 <= int(t) <= max_row}
+    return sorted(nums)
+
+
+def _col_letter(n):
+    out = ""
+    n += 1
+    while n:
+        n, r = divmod(n - 1, 26)
+        out = chr(65 + r) + out
+    return out
+
+
+def _collect_sections(all_sheets):
+    """탭마다 사용자가 확인한 제목줄 행 번호대로 표 구간을 나눈다. {'탭 · 행 a~b': DataFrame(첫 행=제목줄)}"""
+    sections = {}
+    for i, (name, df) in enumerate(all_sheets.items()):
+        if st.session_state.get(f"hdr_skip_{i}") or df.empty:
+            continue
+        heads = _parse_row_numbers(st.session_state.get(f"hdr_rows_{i}", ""), len(df)) or [1]
+        for k, h in enumerate(heads):
+            end = heads[k + 1] - 1 if k + 1 < len(heads) else len(df)
+            sections[f"{name} · 행 {h}~{end}"] = df.iloc[h - 1:end].reset_index(drop=True)
+    return sections
+
+
+_DRIVE_API = "https://www.googleapis.com/drive/v3/files"
+_CONTRACT_WORDS = ("계약", "contract", "agreement", "mou", "견적", "합의")
+
+
+def _drive_token():
+    """서비스계정(GOOGLE_SERVICE_ACCOUNT_JSON)으로 드라이브 읽기 전용 토큰을 받는다. (token, 서비스계정 이메일, 에러문구)"""
+    raw = os.environ.get("GOOGLE_SERVICE_ACCOUNT_JSON")
+    if not raw:
+        return None, None, "GOOGLE_SERVICE_ACCOUNT_JSON 환경변수가 이 서비스(brandslamteamspace)에 설정돼 있지 않아요. Railway Variables에 다른 서비스에서 쓰는 값을 복사해주세요."
+    try:
+        info = json.loads(raw)
+    except Exception as e:
+        return None, None, f"GOOGLE_SERVICE_ACCOUNT_JSON이 올바른 JSON이 아니에요 ({type(e).__name__}: {e}). 줄바꿈·따옴표가 깨졌는지 확인해주세요."
+    email = info.get("client_email")
+    try:
+        from google.oauth2 import service_account
+        from google.auth.transport.requests import Request
+        creds = service_account.Credentials.from_service_account_info(
+            info, scopes=["https://www.googleapis.com/auth/drive.readonly"])
+        creds.refresh(Request())
+        return creds.token, email, None
+    except ImportError:
+        return None, email, "google-auth 패키지가 설치돼 있지 않아요(requirements.txt 반영 후 재배포가 필요해요)."
+    except Exception as e:
+        return None, email, f"구글 인증에 실패했어요 ({type(e).__name__}: {e})"
+
+
+def _drive_norm(text):
+    """비교용으로 공백·기호를 없애고 소문자로 맞춘다. 'Farm Skin_방문형' → 'farmskin방문형'"""
+    return re.sub(r"[^0-9a-z가-힣]", "", str(text or "").lower())
+
+
+def _drive_q(text):
+    return str(text).replace("\\", "\\\\").replace("'", "\\'")
+
+
+class _DriveError(Exception):
+    """드라이브 호출 실패 — 메시지를 그대로 화면에 보여준다."""
+
+
+def _sa_field(key):
+    try:
+        return json.loads(os.environ.get("GOOGLE_SERVICE_ACCOUNT_JSON") or "{}").get(key)
+    except Exception:
+        return None
+
+
+def _google_error_parts(res):
+    """구글 오류 응답에서 (error.message, error.errors[0].reason, error.details[].reason 목록)을 꺼낸다."""
+    try:
+        err = res.json().get("error", {})
+    except Exception:
+        return (res.text or "")[:200], None, []
+    if not isinstance(err, dict):
+        return str(err)[:200], None, []
+    errors = err.get("errors") or []
+    reason = errors[0].get("reason") if errors and isinstance(errors[0], dict) else None
+    details = [d.get("reason") for d in (err.get("details") or []) if isinstance(d, dict) and d.get("reason")]
+    return (err.get("message") or (res.text or "")[:200]), reason, details
+
+
+def _drive_http_error(res, target="최상위 폴더"):
+    """드라이브 오류 응답을 원인별 안내 + 구글이 보낸 원문(message/reason)으로 바꾼다."""
+    message, reason, details = _google_error_parts(res)
+    code = res.status_code
+    email = _sa_field("client_email") or "(서비스계정 이메일)"
+    if reason in ("accessNotConfigured", "SERVICE_DISABLED") or "SERVICE_DISABLED" in details:
+        project = _sa_field("project_id") or "<서비스계정 JSON의 project_id>"
+        head = (f"Drive API가 꺼져 있어요. 아래 링크에서 '사용'을 눌러 켜주세요 (켠 뒤 몇 분 걸릴 수 있어요):\n"
+                f"https://console.cloud.google.com/apis/library/drive.googleapis.com?project={project}")
+    elif code == 404:
+        head = (f"{target}을(를) 못 찾았어요 (404). **서비스계정이 공유 드라이브 멤버가 아니에요.** "
+                f"공유 드라이브라면 그 드라이브에 `{email}` 을(를) 멤버(뷰어 이상)로 추가해주세요. "
+                "일반 폴더라면 폴더 공유에 같은 이메일을 뷰어로 추가하고, DRIVE_FOLDER_ID가 맞는지도 확인해주세요.")
+    elif code == 403:
+        head = (f"{target}을(를) 열 권한이 없어요 (403). 폴더 공유에 `{email}` 을(를) 뷰어로 추가해주세요.")
+    elif code == 401:
+        head = "구글 인증이 거부됐어요 (401). GOOGLE_SERVICE_ACCOUNT_JSON 값이 맞는지 확인해주세요."
+    else:
+        head = f"드라이브 응답 오류 (코드 {code})."
+    raw = f"구글 응답: {message}" + (f" (reason: {reason})" if reason else "")
+    if details and set(details) - {reason}:
+        raw += f" [details: {', '.join(dict.fromkeys(details))}]"
+    return f"{head}\n\n{raw}"
+
+
+def _drive_list(token, q, fields="id,name,mimeType,webViewLink,modifiedTime,parents", page_cap=5):
+    """드라이브 files.list를 페이지 끝까지(최대 page_cap쪽) 읽는다. 공유 드라이브 포함."""
+    out, page_token = [], None
+    for _ in range(page_cap):
+        params = {
+            "q": q, "fields": f"nextPageToken,files({fields})", "pageSize": 1000,
+            "supportsAllDrives": "true", "includeItemsFromAllDrives": "true", "corpora": "allDrives",
+        }
+        if page_token:
+            params["pageToken"] = page_token
+        res = requests.get(_DRIVE_API, params=params, headers={"Authorization": f"Bearer {token}"}, timeout=30)
+        if res.status_code != 200:
+            raise _DriveError(_drive_http_error(res, "폴더 목록"))
+        data = res.json()
+        out.extend(data.get("files", []))
+        page_token = data.get("nextPageToken")
+        if not page_token:
+            break
+    return out
+
+
+def _drive_find_contracts(brand_name, campaign_name="", max_folders=400, max_show=60,
+                          folder_words=("계약",), file_words=None, label="계약", month_hints=()):
+    """DRIVE_FOLDER_ID(최상위 폴더) 아래 모든 하위 폴더를 훑어서, 이름에 '계약'이 들어간 폴더와 업체명이 들어간 폴더·파일을 찾는다.
+    반환: (후보 목록, 안내문구, 에러문구). 후보: {'id','name','path','link','modified','score'}"""
+    file_words = file_words or _CONTRACT_WORDS
+    root = os.environ.get("DRIVE_FOLDER_ID")
+    if not root:
+        return [], None, "DRIVE_FOLDER_ID 환경변수가 이 서비스에 설정돼 있지 않아요(최상위 폴더 ID)."
+    token, sa_email, err = _drive_token()
+    if err:
+        return [], None, err
+    try:
+        meta = requests.get(
+            f"{_DRIVE_API}/{root}", params={"fields": "id,name", "supportsAllDrives": "true"},
+            headers={"Authorization": f"Bearer {token}"}, timeout=30,
+        )
+        if meta.status_code != 200:
+            return [], None, _drive_http_error(meta, f"최상위 폴더({root})")
+
+        # 1) 하위 폴더 전체를 층별로 훑어서 {폴더ID: (이름, 부모ID)} 로 만든다
+        folders = {root: (meta.json().get("name", ""), None)}
+        level = [root]
+        while level and len(folders) < max_folders:
+            nxt = []
+            for i in range(0, len(level), 25):
+                parents = " or ".join(f"'{pid}' in parents" for pid in level[i:i + 25])
+                for f in _drive_list(token, f"({parents}) and trashed=false and mimeType='application/vnd.google-apps.folder'",
+                                     fields="id,name,parents"):
+                    if f["id"] not in folders:
+                        folders[f["id"]] = (f["name"], (f.get("parents") or [None])[0])
+                        nxt.append(f["id"])
+            level = nxt
+
+        def path_of(fid):
+            names, cur = [], fid
+            while cur in folders and len(names) < 12:
+                names.append(folders[cur][0]); cur = folders[cur][1]
+            return " / ".join(reversed(names))
+
+        brand = (brand_name or "").strip()
+        brand_n = _drive_norm(brand)
+        camp_n = _drive_norm(campaign_name)
+        ids = list(folders)
+
+        def chain_names(fid):  # 최상위 폴더를 뺀 폴더 이름들(바깥 → 안쪽)
+            names, cur = [], fid
+            while cur in folders and cur != root and len(names) < 12:
+                names.append(folders[cur][0]); cur = folders[cur][1]
+            return list(reversed(names))
+
+        def in_contract(fid):  # 이름에 '계약'이 들어간 폴더이거나 그 아래에 있는 폴더
+            return any(w in n.lower() for n in chain_names(fid) for w in folder_words)
+
+        def brand_in_chain(fid):
+            return bool(brand_n) and any(brand_n in _drive_norm(n) for n in chain_names(fid))
+
+        # 2) 파일: '계약' 폴더 아래 + 업체명이 들어간 폴더 아래의 모든 파일을 가져와서, 파일명/폴더경로에 업체명이 있으면 전부 후보로 삼는다
+        #    (드라이브의 name contains 검색은 단어 앞부분만 맞춰서, 'farmskin_계약서'처럼 붙은 이름은 파이썬에서 직접 걸러낸다)
+        found, api_hits = {}, set()
+        if brand_n:
+            scan_ids = [fid for fid in ids if fid != root and (in_contract(fid) or brand_in_chain(fid))]
+            for i in range(0, len(scan_ids), 25):
+                parents = " or ".join(f"'{pid}' in parents" for pid in scan_ids[i:i + 25])
+                for f in _drive_list(token, f"({parents}) and trashed=false and mimeType!='application/vnd.google-apps.folder'", page_cap=10):
+                    found[f["id"]] = f
+            for i in range(0, len(ids), 25):  # 보조: 계약 폴더 밖에 있는 파일 중 이름에 업체명이 있는 것
+                parents = " or ".join(f"'{pid}' in parents" for pid in ids[i:i + 25])
+                for f in _drive_list(token, f"({parents}) and trashed=false and mimeType!='application/vnd.google-apps.folder' and name contains '{_drive_q(brand)}'"):
+                    found[f["id"]] = f
+                    api_hits.add(f["id"])
+
+        cands = []
+        for f in found.values():
+            parent = (f.get("parents") or [None])[0]
+            fpath = path_of(parent) if parent in folders else ""
+            name_hit = bool(brand_n) and brand_n in _drive_norm(f["name"])
+            path_hit = parent in folders and brand_in_chain(parent)
+            if not (name_hit or path_hit or f["id"] in api_hits):
+                continue  # '계약' 폴더 안에 있어도 업체명과 무관한 파일은 제외
+            score = 0
+            if parent in folders and in_contract(parent):
+                score += 3
+            if name_hit:
+                score += 4
+            if path_hit:
+                score += 2
+            if any(w in f["name"].lower() for w in file_words):
+                score += 1
+            if month_hints and any(h in _drive_norm(f["name"]) for h in month_hints):
+                score += 3  # 캠페인 월이 이름에 들어간 파일(예: '10월', '202610')
+            if camp_n and camp_n in _drive_norm(f["name"]):
+                score += 2
+            cands.append({
+                "id": f["id"], "name": f["name"], "path": fpath, "link": f.get("webViewLink"),
+                "modified": (f.get("modifiedTime") or "")[:10], "score": score, "kind": "file", "mime": f.get("mimeType"),
+            })
+        n_files = len(cands)
+
+        # 3) 폴더: 이름에 '계약'이 들어간 폴더 + 이름에 업체명이 들어간 폴더(예: '계약서/farmskin 방문형')를 폴더째로 제안
+        n_contract_folders = n_brand_folders = 0
+        for fid in ids:
+            fname = folders[fid][0]
+            if fid == root:
+                continue
+            is_contract = any(w in fname.lower() for w in folder_words)
+            is_brand = bool(brand_n) and brand_n in _drive_norm(fname)
+            if not (is_contract or is_brand):
+                continue
+            score = (6 + (2 if in_contract(fid) else 0)) if is_brand else 4
+            if is_contract and brand_in_chain(fid):
+                score += 3
+            if camp_n and camp_n in _drive_norm(path_of(fid)):
+                score += 1
+            parent_id = folders[fid][1]
+            n_brand_folders += is_brand
+            n_contract_folders += (is_contract and not is_brand)
+            cands.append({
+                "id": fid, "name": fname, "path": path_of(parent_id) if parent_id in folders else "",
+                "link": f"https://drive.google.com/drive/folders/{fid}", "modified": "", "score": score, "kind": "folder",
+            })
+        cands.sort(key=lambda c: (c["score"], c["modified"]), reverse=True)
+        note = f"폴더 {len(folders)}개를 훑어서 '{label}' 폴더 {n_contract_folders}개"
+        if brand:
+            note += f", '{brand}' 폴더 {n_brand_folders}개, '{brand}' 관련 파일 {n_files}개를 찾았어요."
+        else:
+            note += "를 찾았어요. (브랜드명을 입력하면 그 브랜드 폴더·파일도 같이 찾아요)"
+        if len(cands) > max_show:
+            note += f" 점수가 높은 {max_show}개만 보여드려요."
+        if len(folders) >= max_folders:
+            note += f" (폴더가 많아서 앞 {max_folders}개까지만 훑었어요)"
+        return cands[:max_show], note, None
+    except _DriveError as e:
+        return [], None, str(e)
+    except Exception as e:
+        return [], None, f"드라이브에서 찾는 중 문제가 생겼어요 ({type(e).__name__}: {e})"
+
+
+@st.cache_data(ttl=120, show_spinner=False)
+def _drive_children(folder_id):
+    """폴더 안의 항목(하위 폴더 + 파일)을 읽는다. 반환: (항목 목록, 에러문구). 하위 폴더가 먼저, 파일은 최근 수정순."""
+    token, _email, err = _drive_token()
+    if err:
+        return [], err
+    try:
+        items = _drive_list(
+            token, f"'{_drive_q(folder_id)}' in parents and trashed=false",
+            fields="id,name,mimeType,webViewLink,modifiedTime", page_cap=5,
+        )
+    except _DriveError as e:
+        return [], str(e)
+    except Exception as e:
+        return [], f"폴더 내용을 읽는 중 문제가 생겼어요 ({type(e).__name__}: {e})"
+    is_folder = lambda it: it.get("mimeType") == "application/vnd.google-apps.folder"
+    folders_ = sorted([i for i in items if is_folder(i)], key=lambda i: i["name"].lower())
+    files_ = sorted([i for i in items if not is_folder(i)], key=lambda i: i.get("modifiedTime") or "", reverse=True)
+    return folders_ + files_, None
+
+
+_CAL_COLORS = ["#4C78A8", "#F58518", "#54A24B", "#B279A2", "#E45756", "#72B7B2", "#EECA3B", "#9D755D"]
+
+
+def _render_month_calendar(events, year, month, today, max_chips=4):
+    """월 달력(HTML)을 만든다. events: [{'date','label','full','key','done'}]. 같은 날 일정은 캠페인 색으로 쌓여서 겹쳐 보인다."""
+    keys = sorted({e["key"] for e in events}, key=str)
+    color_of = {k: _CAL_COLORS[i % len(_CAL_COLORS)] for i, k in enumerate(keys)}
+    by_day = {}
+    for e in events:
+        by_day.setdefault(e["date"], []).append(e)
+    weeks = calendar.Calendar(firstweekday=6).monthdatescalendar(year, month)  # 일요일 시작
+    head = "".join(f"<th style='padding:6px;text-align:center;font-weight:600'>{d}</th>" for d in "일월화수목금토")
+    rows = []
+    for wk in weeks:
+        tds = []
+        for d in wk:
+            in_month = d.month == month
+            chips = []
+            for e in sorted(by_day.get(d, []), key=lambda x: (x["done"], str(x["key"])))[:max_chips]:
+                c = color_of[e["key"]]
+                deco = "text-decoration:line-through;opacity:.55;" if e["done"] else ""
+                chips.append(
+                    f"<div title='{html.escape(e['full'], quote=True)}' style='margin:2px 0;padding:1px 5px;border-radius:4px;"
+                    f"border-left:3px solid {c};background:{c}33;font-size:11px;line-height:1.35;white-space:nowrap;"
+                    f"overflow:hidden;text-overflow:ellipsis;{deco}'>{html.escape(e['label'])}</div>"
+                )
+            more = len(by_day.get(d, [])) - max_chips
+            if more > 0:
+                chips.append(f"<div style='font-size:11px;opacity:.7'>+{more}개 더</div>")
+            is_today = d == today
+            num_style = "font-weight:700;color:#fff;background:#E45756;border-radius:10px;padding:0 6px;" if is_today else ""
+            tds.append(
+                f"<td style='vertical-align:top;height:104px;padding:4px;border:1px solid rgba(128,128,128,.25);"
+                f"{'' if in_month else 'opacity:.35;'}'><div style='font-size:12px;margin-bottom:2px'>"
+                f"<span style='{num_style}'>{d.day}</span></div>{''.join(chips)}</td>"
+            )
+        rows.append("<tr>" + "".join(tds) + "</tr>")
+    return (
+        "<table style='width:100%;table-layout:fixed;border-collapse:collapse'>"
+        f"<thead><tr>{head}</tr></thead><tbody>{''.join(rows)}</tbody></table>"
+    ), color_of
+
+
+def _month_add(y, m, n):
+    t = y * 12 + (m - 1) + n
+    return t // 12, t % 12 + 1
+
+
+def _forecast_next_month(accounts, campaigns, tasks, today):
+    """등록된 데이터만으로 '다음달 캠페인'을 규칙 기반으로 예측한다(추측 숫자를 만들지 않고, 근거를 함께 돌려준다).
+    반환: 계정별 행 목록. 상태: 확정(다음달 캠페인이 이미 등록됨) / 높음 / 중간 / 낮음."""
+    cy, cm = today.year, today.month
+    ny, nm = _month_add(cy, cm, 1)
+    camps_by_acc = {}
+    for c in campaigns:
+        if c.get("account_id") and c.get("open_date"):
+            camps_by_acc.setdefault(c["account_id"], []).append(c)
+    tasks_by_camp = {}
+    for t in tasks:
+        tasks_by_camp.setdefault(t["campaign_id"], []).append(t)
+
+    rows = []
+    for a in accounts:
+        if a.get("status") in ("종료", "이탈"):
+            continue
+        cs = sorted(camps_by_acc.get(a["id"], []), key=lambda c: str(c["open_date"]))
+        months = {(int(str(c["open_date"])[:4]), int(str(c["open_date"])[5:7])) for c in cs}
+        budget = float(a["monthly_budget"]) if a.get("monthly_budget") else None
+        renewal = date.fromisoformat(str(a["renewal_date"])[:10]) if a.get("renewal_date") else None
+        renewal_next = bool(renewal and (renewal.year, renewal.month) == (ny, nm))
+
+        # 이번 달(없으면 지난달)부터 거꾸로 연속으로 캠페인이 있던 달 수
+        start = (cy, cm) if (cy, cm) in months else _month_add(cy, cm, -1)
+        streak, cur = 0, start
+        while cur in months and streak < 12:
+            streak += 1
+            cur = _month_add(cur[0], cur[1], -1)
+        streak = streak if start in months else 0
+
+        last = cs[-1] if cs else None
+        pred_open = None
+        if last:
+            ld = date.fromisoformat(str(last["open_date"])[:10])
+            pred_open = date(ny, nm, min(ld.day, calendar.monthrange(ny, nm)[1]))
+        elif renewal_next:
+            pred_open = renewal
+
+        # 가장 최근 캠페인의 '다음달 견적서 발송(3주차)' · '다음달 계약 확정·입금(4주차)' 진행 상황
+        wk = {t["week_number"]: t["status"] for t in tasks_by_camp.get(last["id"], [])} if last else {}
+
+        registered = [c for c in cs if (int(str(c["open_date"])[:4]), int(str(c["open_date"])[5:7])) == (ny, nm)]
+        reasons = []
+        if registered:
+            level = "확정"
+            reasons.append(f"다음달 캠페인 {len(registered)}건 등록됨: " + ", ".join(c["campaign_name"] for c in registered))
+        else:
+            active = a.get("status") in ("운영중", "계약완료")
+            if active and streak >= 2:
+                level = "높음"; reasons.append(f"{streak}개월 연속 캠페인 진행")
+            elif active and (streak == 1 or renewal_next):
+                level = "중간"
+                if streak == 1:
+                    reasons.append("지난/이번 달 캠페인 진행 (연속 1개월)")
+            else:
+                level = "낮음"
+                reasons.append("협상 중" if a.get("status") == "협상중" else "최근 캠페인 기록이 없음")
+            if renewal_next:
+                reasons.append(f"다음달 갱신/온보딩일 {renewal.isoformat()}")
+            if wk.get(3) == "완료":
+                reasons.append("3주차 '익월 견적서 발송' 완료")
+            elif last and wk.get(3):
+                reasons.append(f"견적서 발송(3주차) {wk[3]}")
+        rows.append({
+            "brand": a["brand_name"], "level": level, "reason": " · ".join(reasons) or "-",
+            # 근거가 약하면(낮음) 예상 오픈일을 지어내지 않는다
+            "pred_open": None if level == "낮음" else pred_open,
+            "budget": budget, "budget_missing": budget is None,
+            "owner": a.get("assigned_to"),
+        })
+    order = {"확정": 0, "높음": 1, "중간": 2, "낮음": 3}
+    rows.sort(key=lambda r: (order[r["level"]], r["brand"]))
+    return rows
+
+
+_INVOICE_FOLDER_WORDS = ("인보이스", "invoice", "청구")
+_INVOICE_FILE_WORDS = ("인보이스", "invoice", "청구", "inv", "세금계산서", "거래명세")
+
+
+def _drive_find_invoices(brand_name, campaign_name="", open_date=None):
+    """브랜드·캠페인 월에 맞는 인보이스 후보를 드라이브에서 찾는다(파일명에 월이 있으면 가산점)."""
+    hints = ()
+    if open_date:
+        y, m = int(str(open_date)[:4]), int(str(open_date)[5:7])
+        hints = (f"{m}월", f"{y}{m:02d}", f"{y % 100:02d}{m:02d}", f"{m:02d}월")
+    return _drive_find_contracts(
+        brand_name, campaign_name, folder_words=_INVOICE_FOLDER_WORDS, file_words=_INVOICE_FILE_WORDS,
+        label="인보이스", month_hints=tuple(_drive_norm(h) for h in hints),
+    )
+
+
+_AMOUNT_RX = re.compile(
+    r"(?<![\w.])(?:[₩$]\s*)?\d{1,3}(?:,\d{3})+(?:\.\d{1,2})?(?![\d])"
+    r"|(?<![\w.])[₩$]\s*\d+(?:\.\d{1,2})?"
+    r"|(?<![\w.,])\d{5,}(?:\.\d{1,2})?(?![\d])"
+    r"|(?<![\w.,])\d+\.\d{2}(?![\d])"
+)
+_AMOUNT_KEYS = [  # (우선순위, 줄에 들어 있는 단어) — 숫자가 작을수록 '최종 청구금액'에 가깝다
+    (1, re.compile(r"합계\s*금액|총\s*청구\s*금액|청구\s*금액|총\s*합계|grand\s*total|total\s*due|amount\s*due|balance\s*due", re.I)),
+    (2, re.compile(r"합계|총\s*금액|총액|total\s*amount|total", re.I)),
+    (3, re.compile(r"공급\s*가액|supply\s*amount|sub\s*total|소계", re.I)),
+]
+_INV_NO_RX = re.compile(
+    r"(?:invoice\s*(?:no\.?|number|#)|인보이스\s*(?:번호|no\.?)|청구서\s*번호|문서\s*번호|거래명세서\s*번호)\s*[:：#]?\s*([A-Za-z0-9][A-Za-z0-9\-_/]{2,30})",
+    re.I,
+)
+
+
+def _to_amount(raw):
+    num = re.sub(r"[^\d.]", "", raw)
+    try:
+        return float(num) if num else None
+    except ValueError:
+        return None
+
+
+def _doc_text(data, name):
+    """PDF·엑셀·워드 파일에서 글자를 뽑는다. 이미지(스캔)는 글자를 못 읽으므로 빈 문자열."""
+    low = (name or "").lower()
+    try:
+        if low.endswith(".pdf") or data[:4] == b"%PDF":
+            from pypdf import PdfReader
+            reader = PdfReader(io.BytesIO(data))
+            return "\n".join((pg.extract_text() or "") for pg in reader.pages[:6])
+        if low.endswith((".xlsx", ".xlsm")) or data[:2] == b"PK" and not low.endswith(".docx"):
+            sheets = pd.read_excel(io.BytesIO(data), sheet_name=None, header=None, dtype=str)
+            return "\n".join("  ".join(str(v) for v in row if str(v) != "nan") for df in sheets.values() for row in df.values.tolist())
+        if low.endswith(".docx"):
+            import zipfile
+            with zipfile.ZipFile(io.BytesIO(data)) as z:
+                xml = z.read("word/document.xml").decode("utf-8", "ignore")
+            return re.sub(r"<[^>]+>", " ", xml.replace("</w:p>", "\n"))
+    except Exception:
+        return ""
+    return ""
+
+
+def _extract_invoice_fields(data, name):
+    """인보이스 파일에서 금액 후보·번호·통화를 읽는다. 결제 정보는 추측하지 않는다:
+    금액 후보가 여러 개거나 통화가 불확실하면 '확정하지 않고' 후보만 돌려줘서 사람이 고르게 한다."""
+    text = _doc_text(data, name)
+    out = {"text_found": bool(text.strip()), "amounts": [], "amount": None, "currency": None, "number": None, "note": ""}
+    if not out["text_found"]:
+        out["note"] = "파일에서 글자를 읽지 못했어요(스캔·이미지일 수 있어요). 금액과 번호는 직접 입력해주세요."
+        m = re.search(r"(INV[-_]?\d[A-Za-z0-9\-]*)", name or "", re.I)
+        out["number"] = m.group(1) if m else None
+        return out
+    lines = [ln.strip() for ln in text.splitlines() if ln.strip()]
+    found = []  # (우선순위, 값, 줄)
+    for i, ln in enumerate(lines):
+        for prio, rx in _AMOUNT_KEYS:
+            if rx.search(ln):
+                nums = _AMOUNT_RX.findall(ln) or (_AMOUNT_RX.findall(lines[i + 1])[:1] if i + 1 < len(lines) else [])
+                for raw in nums:
+                    v = _to_amount(raw)
+                    if v:
+                        found.append((prio, v, ln))
+                break
+    if found:
+        best = min(f[0] for f in found)
+        top_vals = list(dict.fromkeys(f[1] for f in found if f[0] == best))
+        others = [f[1] for f in found if f[0] != best and f[1] not in top_vals]
+        out["amounts"] = (top_vals + list(dict.fromkeys(others)))[:5]
+        if len(top_vals) == 1:
+            out["amount"] = top_vals[0]
+        else:
+            out["note"] = "금액 후보가 여러 개 보여요. 맞는 금액을 골라주세요."
+        ctx = " ".join(f[2] for f in found if f[0] == best)
+    else:
+        ctx = text
+        out["note"] = "금액을 찾지 못했어요. 직접 입력해주세요."
+    krw = bool(re.search(r"₩|원|KRW", ctx))
+    usd = bool(re.search(r"\$|USD", ctx, re.I))
+    if krw != usd:
+        out["currency"] = "KRW" if krw else "USD"
+    else:
+        krw_all, usd_all = bool(re.search(r"₩|KRW|[가-힣]원", text)), bool(re.search(r"\$|USD", text, re.I))
+        if krw_all != usd_all:
+            out["currency"] = "KRW" if krw_all else "USD"
+    m = _INV_NO_RX.search(text) or re.search(r"(INV[-_]?\d[A-Za-z0-9\-]*)", name or "", re.I)
+    out["number"] = m.group(1) if m else None
+    return out
+
+
+@st.cache_data(ttl=600, show_spinner=False)
+def _drive_invoice_autofill(file_id, mime, name):
+    """드라이브 파일을 내려받아 금액·번호를 읽는다. 반환: (읽은 결과 또는 None, 에러문구)"""
+    token, _email, err = _drive_token()
+    if err:
+        return None, err
+    try:
+        if (mime or "").startswith("application/vnd.google-apps."):
+            export = "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet" if "spreadsheet" in mime else "application/pdf"
+            res = requests.get(f"{_DRIVE_API}/{file_id}/export", params={"mimeType": export},
+                               headers={"Authorization": f"Bearer {token}"}, timeout=60)
+            name = name + (".xlsx" if "spreadsheet" in mime else ".pdf")
+        else:
+            res = requests.get(f"{_DRIVE_API}/{file_id}", params={"alt": "media", "supportsAllDrives": "true"},
+                               headers={"Authorization": f"Bearer {token}"}, timeout=60)
+        if res.status_code != 200:
+            return None, _drive_http_error(res, "인보이스 파일")
+        if len(res.content) > 15 * 1024 * 1024:
+            return None, "파일이 15MB보다 커서 자동으로 읽지 않았어요. 금액과 번호를 직접 입력해주세요."
+        return _extract_invoice_fields(res.content, name), None
+    except Exception as e:
+        return None, f"파일을 읽는 중 문제가 생겼어요 ({type(e).__name__}: {e})"
+
+
+def _drive_picker_ui(ns, res, brand_now, empty_msg):
+    """드라이브 검색 결과를 화면에 보여주고, 사용자가 고른 '파일'을 돌려준다(없으면 None).
+    폴더를 고르면 이 화면 안에서 안의 폴더·파일을 탐색한다. 위젯 key는 ns로 구분."""
+    if not res:
+        return None
+    if res["brand"] != brand_now:
+        st.caption("브랜드를 바꾸셨어요. 아래 결과는 이전 브랜드 기준이라, 다시 '찾기'를 눌러주세요.")
+        return None
+    if res["err"]:
+        st.error(f"❌ {res['err']}")
+        return None
+    st.caption(res["note"])
+    if not res["cands"]:
+        st.warning(empty_msg)
+        return None
+    by_id = {c["id"]: c for c in res["cands"]}
+    pick_id = st.radio(
+        "찾은 폴더·파일 중 골라주세요 (폴더를 고르면 안의 파일이 아래에 나와요)", list(by_id.keys()), index=None,
+        format_func=lambda fid: (
+            f"📁 {by_id[fid]['name']}  ·  {by_id[fid]['path'] or '(최상위)'}  ·  폴더" if by_id[fid].get("kind") == "folder"
+            else f"📄 {by_id[fid]['name']}  ·  {by_id[fid]['path'] or '(최상위)'}  ·  수정 {by_id[fid]['modified'] or '-'}"
+        ),
+        key=f"{ns}_pick",
+    )
+    pick = by_id.get(pick_id)
+    if not pick or pick.get("kind") != "folder":
+        return pick
+    bs = st.session_state.get(f"{ns}_browse")
+    if not bs or bs["root"] != pick_id:
+        bs = {"root": pick_id, "stack": [{"id": pick_id, "name": pick["name"]}]}
+        st.session_state[f"{ns}_browse"] = bs
+    cur = bs["stack"][-1]
+    st.markdown("📂 **" + " › ".join(x["name"] for x in bs["stack"]) + "**")
+    kids, kids_err = _drive_children(cur["id"])
+    if len(bs["stack"]) > 1 and st.button("⬆ 상위 폴더로", key=f"{ns}_up"):
+        bs["stack"].pop()
+        st.rerun()
+    if kids_err:
+        st.error(f"❌ {kids_err}")
+        return None
+    sub_folders = [k for k in kids if k.get("mimeType") == "application/vnd.google-apps.folder"]
+    sub_files = [k for k in kids if k.get("mimeType") != "application/vnd.google-apps.folder"]
+    for sf in sub_folders:
+        if st.button(f"📁 {sf['name']}", key=f"{ns}_open_{sf['id']}"):
+            bs["stack"].append({"id": sf["id"], "name": sf["name"]})
+            st.rerun()
+    if not sub_files:
+        st.caption("이 폴더에는 파일이 없어요." + (" 위의 폴더를 눌러 안으로 들어가 보세요." if sub_folders else ""))
+        return None
+    kid_by_id = {k["id"]: k for k in sub_files}
+    icon = lambda mt: "📊" if "spreadsheet" in (mt or "") else ("📝" if "document" in (mt or "") else "📄")
+    file_id = st.radio(
+        f"이 폴더 안의 파일 중 골라주세요 ({len(sub_files)}개)", list(kid_by_id.keys()), index=None,
+        format_func=lambda kid: f"{icon(kid_by_id[kid].get('mimeType'))} {kid_by_id[kid]['name']}  ·  수정 {(kid_by_id[kid].get('modifiedTime') or '')[:10] or '-'}",
+        key=f"{ns}_file_{cur['id']}",
+    )
+    if not file_id:
+        return None
+    kf = kid_by_id[file_id]
+    return {"id": kf["id"], "name": kf["name"], "link": kf.get("webViewLink"), "kind": "file", "mime": kf.get("mimeType")}
+
+
+def _render_invoice_section(c, brand, can_edit, my_name, refresh):
+    """캠페인 하나의 '최종 인보이스' 영역. 첨부·교체·브랜드 승인은 담당자(can_edit)만, 나머지는 보기만.
+    드라이브에서 자동으로 찾아 금액·번호를 채우되, 금액/통화는 사람이 확인해야 저장된다."""
+    cid = c["id"]
+    ns = f"inv_{cid}"
+    has_inv = bool(c.get("invoice_url"))
+    st.markdown("**📑 최종 인보이스** (브랜드 승인용)")
+    if has_inv:
+        parts = [f"[{c.get('invoice_name') or '인보이스'}]({c['invoice_url']})"]
+        if c.get("invoice_number"):
+            parts.append(f"번호 {c['invoice_number']}")
+        if c.get("invoice_amount") is not None:
+            amt = float(c["invoice_amount"])
+            parts.append(f"금액 {c.get('invoice_currency') or ''} {amt:,.0f}" if amt == int(amt) else f"금액 {c.get('invoice_currency') or ''} {amt:,.2f}")
+        if c.get("invoice_attached_by"):
+            parts.append(f"첨부 {c['invoice_attached_by']} · {str(c.get('invoice_attached_at') or '')[:10]}")
+        st.markdown(" · ".join(parts))
+    else:
+        st.caption("아직 첨부되지 않았어요." + ("" if can_edit else " 담당자(김선재)가 최종본을 첨부해요."))
+
+    # 브랜드 승인: 인보이스가 있어야만 처리할 수 있다
+    if c.get("brand_approved_at"):
+        st.success(f"✅ 브랜드 승인 완료 ({c['brand_approved_at']})")
+        if can_edit and st.button("승인 취소", key=f"{ns}_unapprove"):
+            try:
+                SUPA.table("sales_campaigns").update({"brand_approved_at": None}).eq("id", cid).execute()
+            except Exception as e:
+                st.error(f"저장하지 못했어요 ({type(e).__name__}: {e})")
+            else:
+                refresh()
+    elif not has_inv:
+        st.caption("🔒 인보이스를 첨부해야 '브랜드 승인 완료' 처리를 할 수 있어요.")
+    elif can_edit:
+        if st.button("✅ 브랜드 승인 완료 처리", key=f"{ns}_approve"):
+            try:
+                SUPA.table("sales_campaigns").update({"brand_approved_at": date.today().isoformat()}).eq("id", cid).execute()
+            except Exception as e:
+                st.error(f"저장하지 못했어요 ({type(e).__name__}: {e})")
+            else:
+                refresh()
+    else:
+        st.caption("브랜드 승인을 기다리는 중이에요.")
+
+    if not can_edit:
+        return
+    if has_inv and not st.checkbox("📎 인보이스 교체하기", key=f"{ns}_replace"):
+        return
+    with st.container(border=True):
+        up = st.file_uploader("파일 올리기 (PDF·엑셀·워드·이미지)", type=["pdf", "xlsx", "docx", "png", "jpg", "jpeg"], key=f"{ns}_file")
+        if st.button("🔍 드라이브에서 이 캠페인 인보이스 자동 찾기", key=f"{ns}_find", use_container_width=True):
+            with st.spinner("구글드라이브를 훑는 중..."):
+                _cands, _note, _err = _drive_find_invoices(brand, c["campaign_name"], c.get("open_date"))
+            st.session_state[f"{ns}_res"] = {"brand": brand, "cands": _cands, "note": _note, "err": _err}
+            st.session_state.pop(f"{ns}_pick", None)
+            st.session_state.pop(f"{ns}_browse", None)
+        picked = _drive_picker_ui(
+            ns, st.session_state.get(f"{ns}_res"), brand,
+            "'인보이스' 폴더도, 브랜드명이 들어간 파일도 못 찾았어요. 위에서 직접 올려주세요.",
+        )
+        source = None  # (식별자, 파일이름, 링크 또는 None, 읽은 결과, 에러)
+        if up is not None:
+            sig = f"up:{up.name}:{up.size}"
+            if st.session_state.get(f"{ns}_sig") != sig:
+                st.session_state[f"{ns}_parsed"] = (_extract_invoice_fields(up.getvalue(), up.name), None)
+        elif picked:
+            sig = f"dr:{picked['id']}"
+            if st.session_state.get(f"{ns}_sig") != sig:
+                st.session_state[f"{ns}_parsed"] = _drive_invoice_autofill(picked["id"], picked.get("mime"), picked["name"])
+        else:
+            sig = None
+        if sig is None:
+            return
+        parsed, perr = st.session_state.get(f"{ns}_parsed", (None, None))
+        if st.session_state.get(f"{ns}_sig") != sig:  # 새 파일을 골랐을 때만 입력칸을 자동으로 채운다
+            st.session_state[f"{ns}_sig"] = sig
+            st.session_state[f"{ns}_no"] = (parsed or {}).get("number") or ""
+            cur0 = (parsed or {}).get("currency")
+            st.session_state[f"{ns}_cur"] = cur0 if cur0 in ("KRW", "USD") else None
+            amts = (parsed or {}).get("amounts") or []
+            opts = [f"{a:,.0f}" if a == int(a) else f"{a:,.2f}" for a in amts] + ["직접 입력"]
+            st.session_state[f"{ns}_amt_opts"] = (opts, amts)
+            st.session_state[f"{ns}_amt_pick"] = opts[0] if (parsed or {}).get("amount") else None
+            st.session_state[f"{ns}_amt"] = 0.0
+        if perr:
+            st.warning(f"자동으로 읽지 못했어요: {perr}")
+        elif parsed and parsed.get("note"):
+            st.info(parsed["note"])
+        elif parsed:
+            st.success("🤖 파일에서 번호·금액을 읽어 채웠어요. 맞는지 확인하고 저장하세요.")
+        opts, amts = st.session_state.get(f"{ns}_amt_opts", (["직접 입력"], []))
+        n1, n2 = st.columns(2)
+        inv_no = n1.text_input("인보이스 번호", key=f"{ns}_no")
+        inv_cur = n2.selectbox("통화 (확인 필수)", ["KRW", "USD"], index=None, placeholder="선택", key=f"{ns}_cur")
+        amt_pick = st.radio("청구 금액", opts, index=None, horizontal=True, key=f"{ns}_amt_pick")
+        final_amt = None
+        if amt_pick == "직접 입력":
+            v = st.number_input("금액 직접 입력", min_value=0.0, step=1000.0, format="%.2f", key=f"{ns}_amt")
+            final_amt = v or None
+        elif amt_pick:
+            final_amt = amts[opts.index(amt_pick)]
+        if st.button("📌 이 인보이스로 확정", type="primary", key=f"{ns}_save"):
+            if not final_amt or not inv_cur:
+                st.error("청구 금액과 통화를 확인해서 선택해주세요. (결제 정보는 자동으로 확정하지 않아요)")
+            else:
+                url = name = None
+                try:
+                    if up is not None:
+                        ext = os.path.splitext(up.name)[1].lower()
+                        path = f"invoice/{cid}/{uuid.uuid4().hex[:8]}{ext}"
+                        SUPA.storage.from_("contract-files").upload(
+                            path, up.getvalue(), {"content-type": up.type or "application/octet-stream"},
+                        )
+                        url = f"{os.environ.get('SUPABASE_URL')}/storage/v1/object/public/contract-files/{path}"
+                        name = up.name
+                    else:
+                        url, name = picked.get("link"), picked["name"]
+                except Exception as e:
+                    st.error(f"파일을 저장하지 못했어요 ({type(e).__name__}: {e})")
+                    return
+                try:
+                    SUPA.table("sales_campaigns").update({
+                        "invoice_url": url, "invoice_name": name, "invoice_number": inv_no.strip() or None,
+                        "invoice_amount": final_amt, "invoice_currency": inv_cur,
+                        "invoice_attached_by": my_name, "invoice_attached_at": datetime.utcnow().isoformat() + "Z",
+                    }).eq("id", cid).execute()
+                except Exception as e:
+                    st.error(
+                        "인보이스를 저장하지 못했어요. DB에 인보이스 칸(migrations/20261006_sales_campaigns_invoice_columns.sql)이 "
+                        f"적용돼 있는지 확인해주세요. ({type(e).__name__}: {e})"
+                    )
+                    return
+                for k in ("res", "sig", "parsed", "amt_opts"):
+                    st.session_state.pop(f"{ns}_{k}", None)
+                refresh()
+
+
+REQ_STATUSES = ["요청", "확인", "진행중", "완료", "보류"]
+REQ_PRIORITIES = ["낮음", "보통", "높음", "긴급"]
+REQ_PRIO_ICON = {"낮음": "⚪", "보통": "🔵", "높음": "🟠", "긴급": "🔴"}
+
+
+def _today_kst():
+    return (datetime.utcnow() + timedelta(hours=9)).date()  # 서버는 UTC라서 한국 날짜로 맞춘다
+
+
+@st.cache_data(ttl=10)
+def load_team_requests():
+    """요청 게시판 글 전체(최근 500건). 반환: (목록, 에러문구). 테이블이 없어도 앱이 죽지 않게 에러를 돌려준다."""
+    try:
+        return SUPA.table("team_requests").select("*").order("created_at", desc=True).limit(500).execute().data, None
+    except Exception as e:
+        return [], f"{type(e).__name__}: {e}"
+
+
+@st.cache_data(ttl=10)
+def load_request_comments():
+    try:
+        return SUPA.table("team_comments").select("*").eq("target_type", "request").order("created_at").limit(2000).execute().data
+    except Exception:
+        return []
+
+
+@st.cache_data(ttl=60)
+def load_board_campaigns():
+    """요청에 연결할 캠페인 목록 [(id, '브랜드 · 캠페인명')]. 세일즈 데이터가 없거나 실패해도 빈 목록."""
+    try:
+        accs = {a["id"]: a["brand_name"] for a in SUPA.table("sales_accounts").select("id,brand_name").execute().data}
+        camps = SUPA.table("sales_campaigns").select("id,account_id,campaign_name,open_date").order("open_date", desc=True).limit(100).execute().data
+        return [(c["id"], f"{accs.get(c['account_id'], '?')} · {c['campaign_name']}") for c in camps]
+    except Exception:
+        return []
+
+
+def _req_open(r):
+    return r.get("status") not in ("완료", "보류")
+
+
+def _req_days_overdue(r, today):
+    """마감이 지났고 아직 끝나지 않았으면 며칠 지났는지(아니면 0)."""
+    if not r.get("due_date") or not _req_open(r):
+        return 0
+    return max(0, (today - date.fromisoformat(str(r["due_date"])[:10])).days)
+
+
+def _render_my_request_banner(rows, my_name, today):
+    """내 홈 화면 맨 위: 마감 지난 요청은 ⚠️ 처리요망, 새 요청은 📬로 알려준다."""
+    mine = [r for r in rows if r["assignee"] == my_name and _req_open(r)]
+    od = sorted([r for r in mine if _req_days_overdue(r, today)], key=lambda r: -_req_days_overdue(r, today))
+    new = [r for r in mine if r["status"] == "요청" and not _req_days_overdue(r, today)]
+    if od:
+        lines = "".join(f"\n- {r['title']} (요청: {r['requester']} · 마감 {_req_days_overdue(r, today)}일 지남)" for r in od[:5])
+        more = f"\n- 외 {len(od) - 5}건" if len(od) > 5 else ""
+        st.warning(f"⚠️ **처리요망 {len(od)}건** — 마감이 지난 요청이에요. '📮 요청 게시판'에서 처리해주세요.{lines}{more}")
+    if new:
+        st.info(f"📬 새 요청 {len(new)}건이 있어요: " + ", ".join(r["title"] for r in new[:3]) + (" …" if len(new) > 3 else ""))
+    asked = [r for r in rows if r["requester"] == my_name and r["assignee"] != my_name and _req_days_overdue(r, today)]
+    if asked:
+        st.caption(f"📤 내가 올린 요청 중 마감이 지난 건 {len(asked)}건: " + ", ".join(f"{r['title']}({r['assignee']})" for r in asked[:3]))
+
+
+def _post_request_comment(req_id, key, author):
+    txt = (st.session_state.get(key) or "").strip()
+    if not txt:
+        return
+    try:
+        SUPA.table("team_comments").insert({"target_type": "request", "target_id": req_id, "author": author, "body": txt}).execute()
+    except Exception as e:
+        st.session_state["req_flash_err"] = f"댓글을 저장하지 못했어요 ({type(e).__name__}: {e})"
+        return
+    st.session_state[key] = ""  # 입력칸 비우기(콜백 안에서만 가능)
+    load_request_comments.clear()
+
+
+def _render_request_board(rows, my_name, today):
+    """요청 게시판: 모두에게 보이고, 담당자는 상태를 바꾸고, 요청한 사람은 내용을 고치고, 누구나 댓글을 단다."""
+    if st.session_state.get("req_flash"):
+        st.success(st.session_state.pop("req_flash"))
+    if st.session_state.get("req_flash_err"):
+        st.error(st.session_state.pop("req_flash_err"))
+    camps = load_board_campaigns()
+    camp_label = {cid: lab for cid, lab in camps}
+
+    with st.expander("➕ 새 요청 올리기", expanded=not rows):
+        with st.form("new_request_form", clear_on_submit=True):
+            title = st.text_input("제목 *", placeholder="예: 10월 닥터리앤장 포스팅 일정 확인 부탁드려요")
+            body = st.text_area("자세한 내용", height=90)
+            f1, f2, f3 = st.columns(3)
+            assignee = f1.selectbox("담당자 *", STAFF_NAMES, index=None, placeholder="누구에게 요청하나요?")
+            due = f2.date_input("마감일", value=None)
+            prio = f3.selectbox("우선순위", REQ_PRIORITIES, index=1)
+            related = st.selectbox("관련 캠페인 (선택)", ["(연결 안 함)"] + [lab for _cid, lab in camps])
+            submitted = st.form_submit_button("📮 요청 올리기", type="primary")
+        if submitted:
+            if not title.strip() or not assignee:
+                st.error("제목과 담당자를 입력해주세요.")
+            elif due and due < today:
+                st.error("마감일이 이미 지났어요. 오늘 이후 날짜로 정해주세요.")
+            else:
+                row = {"requester": my_name, "assignee": assignee, "title": title.strip(), "body": body.strip() or None,
+                       "due_date": due.isoformat() if due else None, "priority": prio}
+                if related != "(연결 안 함)":
+                    row["related_type"] = "campaign"
+                    row["related_id"] = next(cid for cid, lab in camps if lab == related)
+                try:
+                    SUPA.table("team_requests").insert(row).execute()
+                except Exception as e:
+                    st.error(f"요청을 저장하지 못했어요 ({type(e).__name__}: {e})")
+                else:
+                    load_team_requests.clear()
+                    st.session_state["req_flash"] = f"요청을 올렸어요. {assignee}님 홈에 📬로 표시돼요."
+                    st.rerun()
+
+    v1, v2 = st.columns([3, 1])
+    view = v1.radio("보기", ["전체", "나에게 온 요청", "내가 올린 요청", "⚠️ 처리요망만"], horizontal=True, key="req_view")
+    show_closed = v2.checkbox("완료·보류도 보기", key="req_closed")
+    shown = [r for r in rows if show_closed or _req_open(r)]
+    if view == "나에게 온 요청":
+        shown = [r for r in shown if r["assignee"] == my_name]
+    elif view == "내가 올린 요청":
+        shown = [r for r in shown if r["requester"] == my_name]
+    elif view == "⚠️ 처리요망만":
+        shown = [r for r in shown if _req_days_overdue(r, today)]
+    prio_rank = {p: i for i, p in enumerate(reversed(REQ_PRIORITIES))}
+    shown.sort(key=lambda r: (not _req_days_overdue(r, today), str(r.get("due_date") or "9999"), prio_rank.get(r["priority"], 9)))
+    if not shown:
+        st.caption("보여드릴 요청이 없어요.")
+        return
+    comments = load_request_comments()
+    by_req = {}
+    for c in comments:
+        by_req.setdefault(c["target_id"], []).append(c)
+
+    for r in shown:
+        rid = r["id"]
+        od = _req_days_overdue(r, today)
+        with st.container(border=True):
+            st.markdown(f"{REQ_PRIO_ICON.get(r['priority'], '🔵')} **{r['title']}**  ·  `{r['status']}`")
+            when = f"⚠️ **처리요망** · 마감 {od}일 지남 ({r['due_date']})" if od else (f"📅 마감 {r['due_date']}" if r.get("due_date") else "마감 없음")
+            st.markdown(f"{r['requester']} → **{r['assignee']}**  ·  {when}  ·  올린 날 {str(r['created_at'])[:10]}")
+            if r.get("body"):
+                st.write(r["body"])
+            if r.get("related_type") == "campaign" and r.get("related_id") in camp_label:
+                st.caption(f"🔗 관련 캠페인: {camp_label[r['related_id']]}")
+
+            if my_name == r["assignee"]:
+                s1, s2 = st.columns([2, 1])
+                new_status = s1.selectbox("상태", REQ_STATUSES, index=REQ_STATUSES.index(r["status"]), key=f"req_status_{rid}")
+                log_it = False
+                if new_status == "완료" and r["status"] != "완료":
+                    log_it = st.checkbox("오늘 업무기록에도 남기기", value=True, key=f"req_log_{rid}")
+                if s2.button("상태 저장", key=f"req_save_{rid}", use_container_width=True) and new_status != r["status"]:
+                    now_iso = datetime.utcnow().isoformat() + "Z"
+                    try:
+                        SUPA.table("team_requests").update({
+                            "status": new_status, "updated_at": now_iso,
+                            "completed_at": now_iso if new_status == "완료" else None,
+                        }).eq("id", rid).execute()
+                        if log_it:
+                            SUPA.table("daily_activity_log").insert({
+                                "staff_name": my_name, "note": f"[요청 완료] {r['title']} (요청: {r['requester']})",
+                            }).execute()
+                    except Exception as e:
+                        st.error(f"저장하지 못했어요 ({type(e).__name__}: {e})")
+                    else:
+                        load_team_requests.clear()
+                        st.session_state["req_flash"] = f"'{r['title']}' 상태를 {new_status}(으)로 바꿨어요." + (" 업무기록에도 남겼어요." if log_it else "")
+                        st.rerun()
+            else:
+                st.caption(f"상태 변경은 담당자({r['assignee']})만 할 수 있어요. 댓글은 누구나 남길 수 있어요.")
+
+            if my_name == r["requester"]:  # 요청한 사람만 내용 수정·삭제 (담당자와 같은 사람이어도 됨)
+                with st.expander("✏️ 내용 수정 / 삭제"):
+                    e_title = st.text_input("제목", value=r["title"], key=f"req_et_{rid}")
+                    e_body = st.text_area("내용", value=r.get("body") or "", key=f"req_eb_{rid}")
+                    g1, g2, g3 = st.columns(3)
+                    e_assignee = g1.selectbox("담당자", STAFF_NAMES, index=STAFF_NAMES.index(r["assignee"]) if r["assignee"] in STAFF_NAMES else 0, key=f"req_ea_{rid}")
+                    e_due = g2.date_input("마감일", value=date.fromisoformat(str(r["due_date"])[:10]) if r.get("due_date") else None, key=f"req_ed_{rid}")
+                    e_prio = g3.selectbox("우선순위", REQ_PRIORITIES, index=REQ_PRIORITIES.index(r["priority"]), key=f"req_ep_{rid}")
+                    if st.button("수정 저장", key=f"req_es_{rid}") and e_title.strip():
+                        try:
+                            SUPA.table("team_requests").update({
+                                "title": e_title.strip(), "body": e_body.strip() or None, "assignee": e_assignee,
+                                "due_date": e_due.isoformat() if e_due else None, "priority": e_prio,
+                                "updated_at": datetime.utcnow().isoformat() + "Z",
+                            }).eq("id", rid).execute()
+                        except Exception as e:
+                            st.error(f"저장하지 못했어요 ({type(e).__name__}: {e})")
+                        else:
+                            load_team_requests.clear()
+                            st.session_state["req_flash"] = "요청 내용을 고쳤어요."
+                            st.rerun()
+                    if st.checkbox("이 요청을 삭제할게요", key=f"req_dc_{rid}") and st.button("🗑 삭제", key=f"req_del_{rid}"):
+                        try:
+                            SUPA.table("team_comments").delete().eq("target_type", "request").eq("target_id", rid).execute()
+                            SUPA.table("team_requests").delete().eq("id", rid).execute()
+                        except Exception as e:
+                            st.error(f"삭제하지 못했어요 ({type(e).__name__}: {e})")
+                        else:
+                            load_team_requests.clear(); load_request_comments.clear()
+                            st.session_state["req_flash"] = "요청을 삭제했어요."
+                            st.rerun()
+
+            cm = by_req.get(rid, [])
+            with st.expander(f"💬 댓글 {len(cm)}개"):
+                for c in cm:
+                    st.markdown(f"**{c['author']}** · {str(c['created_at'])[:16].replace('T', ' ')}")
+                    st.write(c["body"])
+                ckey = f"req_cmt_{rid}"
+                st.text_input("댓글 달기", key=ckey, placeholder="확인했어요 / 이 부분은 이렇게 할게요")
+                st.button("남기기", key=f"req_cmt_btn_{rid}", on_click=_post_request_comment, args=(rid, ckey, my_name))
+
+
+LEAVE_HOURS = {"연차": 8, "반차": 4, "반반차": 2}  # 1일 = 8시간, 반차 = 4시간, 반반차 = 2시간
+LEAVE_SLOTS = {"반차": ["오전", "오후"], "반반차": ["오전 앞", "오전 뒤", "오후 앞", "오후 뒤"]}
+_SLOT_QUARTERS = {"오전": {1, 2}, "오후": {3, 4}, "오전 앞": {1}, "오전 뒤": {2}, "오후 앞": {3}, "오후 뒤": {4}}
+
+
+def _leave_quarters(kind, slot):
+    """하루를 4등분(2시간씩)했을 때 이 휴가가 차지하는 칸. 같은 날 겹치는지 확인할 때 쓴다."""
+    return {1, 2, 3, 4} if kind == "연차" else set(_SLOT_QUARTERS.get(slot or "", set()))
+
+
+def _fmt_days(hours):
+    """시간 → 일수 문자열(소수점 활용). 94시간 → '11.75', 120시간 → '15', 2시간 → '0.25'"""
+    return f"{hours / 8:.2f}".rstrip("0").rstrip(".")
+
+
+def _add_months(d, n):
+    y, m = divmod(d.year * 12 + (d.month - 1) + n, 12)
+    return date(y, m + 1, min(d.day, calendar.monthrange(y, m + 1)[1]))
+
+
+def _full_months(hire, today):
+    """입사일부터 오늘까지 꽉 채운 개월 수."""
+    m = (today.year - hire.year) * 12 + (today.month - hire.month) - (1 if today.day < hire.day else 0)
+    return max(0, m)
+
+
+def _leave_d(v):
+    return v if isinstance(v, date) and not isinstance(v, datetime) else date.fromisoformat(str(v)[:10])
+
+
+def _leave_balance(hire, annual_days, leaves, today):
+    """잔여 휴가 계산. leaves = 취소되지 않은 휴가 기록들(leave_date, hours).
+    - 입사 1년 미만: 매달 1일씩 발생한 만큼만(입사 후 누적 사용분과 비교)
+    - 입사 1년 이상: 올해(1/1~12/31) 연 annual_days일을 자유롭게(올해 사용분과 비교)
+    사용 = 오늘까지 쓴 것, 예약 = 앞으로 쓸 것. 남은 = 부여 − 사용 − 예약."""
+    months = _full_months(hire, today)
+    probation = months < 12
+    if probation:
+        granted = min(float(annual_days), float(months)) * 8
+        scope = [x for x in leaves if _leave_d(x["leave_date"]) >= hire]
+    else:
+        granted = float(annual_days) * 8
+        scope = [x for x in leaves if _leave_d(x["leave_date"]).year == today.year]
+    used = sum(float(x["hours"]) for x in scope if _leave_d(x["leave_date"]) <= today)
+    booked = sum(float(x["hours"]) for x in scope if _leave_d(x["leave_date"]) > today)
+    return {
+        "probation": probation, "months": months, "granted_h": granted, "used_h": used, "booked_h": booked,
+        "remaining_h": granted - used - booked,
+        "next_accrual": _add_months(hire, months + 1) if probation and months < 12 else None,
+    }
+
+
+def _leave_validate(hire, annual_days, leaves, new_items, today):
+    """새로 신청하는 휴가(new_items=[(날짜, 종류, 시간대)])가 가능한지 차례로 확인한다. 안 되면 이유 문구, 되면 None."""
+    existing = list(leaves)
+    for d, kind, slot in new_items:
+        if d.weekday() >= 5:
+            return f"{d.isoformat()}은(는) 주말이라 신청할 수 없어요."
+        if d < hire:
+            return f"입사일({hire.isoformat()}) 이전 날짜는 신청할 수 없어요."
+        if d.year < today.year and _full_months(hire, today) >= 12:
+            return "작년 이전 날짜는 등록할 수 없어요."
+        if d > today + timedelta(days=400):
+            return "너무 먼 날짜예요. 1년 이내로 신청해주세요."
+        taken = set()
+        for x in existing:
+            if _leave_d(x["leave_date"]) == d:
+                taken |= _leave_quarters(x["kind"], x.get("slot"))
+        if taken & _leave_quarters(kind, slot):
+            return f"{d.isoformat()}에는 이미 겹치는 휴가({'/'.join(sorted(map(str, taken)))}칸)가 있어요."
+        hours = LEAVE_HOURS[kind]
+        if d.year == today.year or _full_months(hire, today) < 12:
+            bal = _leave_balance(hire, annual_days, existing, today)
+        else:  # 내년 날짜: 내년 한 해 기준으로 확인
+            bal = _leave_balance(hire, annual_days, existing, date(d.year, 1, 1))
+        if hours > bal["remaining_h"] + 1e-9:
+            extra = " (입사 1년 미만은 매달 1일씩 발생한 만큼만 쓸 수 있어요)" if bal["probation"] else ""
+            return f"남은 휴가가 부족해요 — 남은 {_fmt_days(max(0, bal['remaining_h']))}일, 신청 {_fmt_days(hours)}일.{extra}"
+        existing.append({"leave_date": d, "kind": kind, "slot": slot, "hours": hours})
+    return None
+
+
+_WEEKDAY_KO = "월화수목금토일"
+
+
+def _leave_label(x):
+    return f"{x['kind']}" + (f" {x['slot']}" if x.get("slot") else "")
+
+
+def _render_leave_page(my_name, today):
+    """개인별 휴가 신청. 연차(8시간)·반차(4시간)·반반차(2시간)를 자유롭게 쓰고, 남은 휴가를 소수점 일수로 보여준다."""
+    st.caption("1일 = 8시간 · 반차 = 4시간(0.5일) · 반반차 = 2시간(0.25일). 남은 휴가는 소수점 일수로 보여드려요.")
+    if st.session_state.get("leave_flash"):
+        st.success(st.session_state.pop("leave_flash"))
+    try:
+        prof_rows = SUPA.table("leave_profiles").select("*").eq("person", my_name).execute().data
+        my_leaves = [x for x in SUPA.table("leave_requests").select("*").eq("person", my_name).order("leave_date").execute().data
+                     if not x.get("canceled_at")]
+    except Exception as e:
+        st.error(f"❌ 휴가 정보를 불러오지 못했어요 ({type(e).__name__}: {e}). DB에 leave_profiles / leave_requests 테이블이 있는지 확인해주세요.")
+        return
+
+    if not prof_rows:
+        st.info("처음 한 번만 **입사일**을 입력해주세요. 입사일로 쓸 수 있는 휴가를 계산해요. 잘못 입력했다면 대표님께 알려주세요(이 화면에서는 고칠 수 없어요).")
+        hd = st.date_input("입사일", value=None, min_value=date(2000, 1, 1), max_value=today, key="leave_hire")
+        if st.button("입사일 저장", key="leave_hire_save", type="primary"):
+            if not hd:
+                st.error("입사일을 선택해주세요.")
+            else:
+                try:
+                    SUPA.table("leave_profiles").insert({"person": my_name, "hire_date": hd.isoformat()}).execute()
+                except Exception as e:
+                    st.error(f"저장하지 못했어요 ({type(e).__name__}: {e})")
+                else:
+                    st.session_state["leave_flash"] = f"입사일({hd.isoformat()})을 저장했어요."
+                    st.rerun()
+        return
+
+    prof = prof_rows[0]
+    hire, annual = _leave_d(prof["hire_date"]), float(prof["annual_days"])
+    bal = _leave_balance(hire, annual, my_leaves, today)
+    h = lambda v: f"{v:g}시간"
+    m1, m2, m3, m4 = st.columns(4)
+    m1.metric("지금까지 발생" if bal["probation"] else f"{today.year}년 부여", f"{_fmt_days(bal['granted_h'])}일", h(bal["granted_h"]), delta_color="off")
+    m2.metric("사용", f"{_fmt_days(bal['used_h'])}일", h(bal["used_h"]), delta_color="off")
+    m3.metric("예약(앞으로)", f"{_fmt_days(bal['booked_h'])}일", h(bal["booked_h"]), delta_color="off")
+    m4.metric("✅ 남은 휴가", f"{_fmt_days(max(0, bal['remaining_h']))}일", h(max(0, bal["remaining_h"])), delta_color="off")
+    if bal["probation"]:
+        st.caption(
+            f"입사 {bal['months']}개월차(입사일 {hire.isoformat()}) — 입사 1년 전까지는 매달 1일씩 발생한 만큼 쓸 수 있어요. "
+            f"다음 발생일: {bal['next_accrual'].isoformat()}"
+        )
+    else:
+        st.caption(f"입사 1년이 지나서 올해({today.year}.1.1~12.31) {_fmt_days(annual * 8)}일을 월 제한 없이 자유롭게 쓸 수 있어요.")
+
+    st.markdown("#### 휴가 쓰기")
+    kind_label = st.radio("종류", ["연차 (1일)", "반차 (0.5일)", "반반차 (0.25일)"], horizontal=True, key="leave_kind")
+    kind = kind_label.split(" ")[0]
+    c1, c2 = st.columns(2)
+    d1 = c1.date_input("날짜", value=today, key="leave_d1")
+    multi = kind == "연차" and c2.checkbox("여러 날 이어서 쓰기", key="leave_multi")
+    slot = None
+    if kind != "연차":
+        slot = c2.selectbox("시간대", LEAVE_SLOTS[kind], key=f"leave_slot_{kind}")
+    d2 = d1
+    if multi:
+        d2 = st.date_input("마지막 날", value=d1, min_value=d1, key="leave_d2")
+        st.caption("주말은 자동으로 빼요. 공휴일은 직접 빼주세요.")
+    memo = st.text_input("메모 (선택)", key="leave_memo", placeholder="예: 병원 / 가족 행사")
+    days = [d1 + timedelta(days=i) for i in range((d2 - d1).days + 1)]
+    items = [(d, kind, slot) for d in days if d.weekday() < 5] if multi else [(d1, kind, slot)]
+    err = "선택한 기간이 모두 주말이에요." if not items else _leave_validate(hire, annual, my_leaves, items, today)
+    total_h = sum(LEAVE_HOURS[k] for _d, k, _s in items)
+    if err:
+        st.warning(err)
+    else:
+        after = bal["remaining_h"] - total_h
+        st.caption(f"이번 신청 {_fmt_days(total_h)}일({total_h}시간) → 신청 후 남는 휴가 **{_fmt_days(after)}일** ({after:g}시간)")
+    if st.button("🏖️ 휴가 쓰기", type="primary", key="leave_submit", disabled=bool(err)):
+        rows = [{"person": my_name, "leave_date": d.isoformat(), "kind": k, "slot": sl, "hours": LEAVE_HOURS[k], "memo": memo.strip() or None}
+                for d, k, sl in items]
+        try:
+            SUPA.table("leave_requests").insert(rows).execute()
+        except Exception as e:
+            st.error(f"저장하지 못했어요 ({type(e).__name__}: {e})")
+        else:
+            st.session_state["leave_flash"] = f"휴가를 등록했어요: {_fmt_days(total_h)}일 ({items[0][0].isoformat()}" + (f" ~ {items[-1][0].isoformat()}" if len(items) > 1 else "") + ")"
+            st.rerun()
+
+    st.markdown("#### 내 휴가 기록")
+    upcoming = sorted([x for x in my_leaves if _leave_d(x["leave_date"]) >= today], key=lambda x: str(x["leave_date"]))
+    past = sorted([x for x in my_leaves if _leave_d(x["leave_date"]) < today], key=lambda x: str(x["leave_date"]), reverse=True)
+    if not upcoming:
+        st.caption("예약된 휴가가 없어요.")
+    for x in upcoming:
+        d = _leave_d(x["leave_date"])
+        r1, r2 = st.columns([5, 1])
+        r1.markdown(f"📅 **{d.isoformat()} ({_WEEKDAY_KO[d.weekday()]})** · {_leave_label(x)} · {_fmt_days(float(x['hours']))}일" + (f" · {x['memo']}" if x.get("memo") else ""))
+        if r2.button("취소", key=f"leave_cancel_{x['id']}", use_container_width=True):
+            try:
+                SUPA.table("leave_requests").update({"canceled_at": datetime.utcnow().isoformat() + "Z"}).eq("id", x["id"]).eq("person", my_name).execute()
+            except Exception as e:
+                st.error(f"취소하지 못했어요 ({type(e).__name__}: {e})")
+            else:
+                st.session_state["leave_flash"] = f"{d.isoformat()} {_leave_label(x)} 휴가를 취소했어요. 남은 휴가에 다시 반영했어요."
+                st.rerun()
+    if past:
+        with st.expander(f"지난 휴가 {len(past)}건"):
+            st.dataframe(pd.DataFrame([{
+                "날짜": _leave_d(x["leave_date"]).isoformat(), "종류": _leave_label(x), "일수": _fmt_days(float(x["hours"])), "메모": x.get("memo") or "",
+            } for x in past]), hide_index=True, use_container_width=True)
+
+    # 팀 휴가: 누가 언제 쉬는지(메모는 보여주지 않는다)
+    st.markdown("#### 🗓️ 팀 휴가 (이번 달 ~ 다음 달)")
+    start = today.replace(day=1)
+    end = _add_months(start, 2) - timedelta(days=1)
+    try:
+        team = [x for x in SUPA.table("leave_requests").select("person,leave_date,kind,slot,hours,canceled_at")
+                .gte("leave_date", start.isoformat()).lte("leave_date", end.isoformat()).order("leave_date").execute().data
+                if not x.get("canceled_at")]
+    except Exception:
+        team = []
+    today_off = [x["person"] for x in team if _leave_d(x["leave_date"]) == today]
+    if today_off:
+        st.info("🏖️ 오늘 휴가: " + ", ".join(f"{x['person']}({_leave_label(x)})" for x in team if _leave_d(x["leave_date"]) == today))
+    if not team:
+        st.caption("이번 달~다음 달에 등록된 팀 휴가가 없어요.")
+    else:
+        st.dataframe(pd.DataFrame([{
+            "날짜": _leave_d(x["leave_date"]).isoformat(), "요일": _WEEKDAY_KO[_leave_d(x["leave_date"]).weekday()],
+            "이름": x["person"], "종류": _leave_label(x), "일수": _fmt_days(float(x["hours"])),
+        } for x in team]), hide_index=True, use_container_width=True)
+
+
+def _api_error_text(status, body):
+    """Claude API 오류를 직원이 이해할 수 있는 말로 바꾼다(원문도 같이 보여줘서 원인을 숨기지 않는다)."""
+    body = str(body or "")
+    if "credit balance is too low" in body:
+        return ("Anthropic API 크레딧이 부족해요. 코드 문제가 아니라 결제 문제예요 — "
+                "console.anthropic.com → Plans & Billing에서 이 API 키가 속한 조직의 크레딧을 충전해주세요. "
+                f"(원문: 코드 {status})")
+    if status == 401:
+        return f"ANTHROPIC_API_KEY가 올바르지 않아요 (코드 401): {body[:150]}"
+    if status == 429:
+        return f"요청이 너무 많아요. 잠시 후 다시 시도해주세요 (코드 429): {body[:150]}"
+    return f"Claude API 응답 오류 (코드 {status}): {body[:200]}"
+
+
 def _ai_infer_column_mapping(all_sheets):
     """본격적으로 전부 추출하기 전에, 열 구성을 어떻게 이해했는지 사람이 먼저 확인하게 한다
     (예: 'A열이 이름이 맞나요?'에 해당하는 사전 점검 단계)."""
     api_key = os.environ.get("ANTHROPIC_API_KEY")
     if not api_key:
-        return None
+        return None, "ANTHROPIC_API_KEY 환경변수가 이 앱(brandslamteamspace)에 설정되어 있지 않아요."
     sheet_samples = {}
     for name, raw_df in all_sheets.items():
         if raw_df.empty:
@@ -185,7 +1495,7 @@ def _ai_infer_column_mapping(all_sheets):
         sample_rows = raw_df.iloc[1:3].fillna("").astype(str).values.tolist()
         sheet_samples[name] = {"header": header, "sample_rows": sample_rows}
     if not sheet_samples:
-        return None
+        return None, "시트에서 읽을 데이터를 못 찾았어요(빈 시트)."
 
     system = (
         "너는 스프레드시트의 열 구성을 사람에게 짧게 설명해주는 보조원이다. 헤더 텍스트와 샘플 행 1~2개를 보고, "
@@ -203,18 +1513,29 @@ def _ai_infer_column_mapping(all_sheets):
             timeout=30,
         )
         if res.status_code >= 300:
-            return None
-        return "".join(b.get("text", "") for b in res.json().get("content", []) if b.get("type") == "text").strip()
-    except Exception:
-        return None
+            return None, _api_error_text(res.status_code, res.text)
+        text = "".join(b.get("text", "") for b in res.json().get("content", []) if b.get("type") == "text").strip()
+        return text, None
+    except Exception as e:
+        return None, f"예외 발생: {e}"
 
 
-def _ai_extract_payment_rows(raw_df, existing_keys, batch_size=20, extra_hint=None):
+def _ai_extract_payment_rows(raw_df, existing_keys, batch_size=20, extra_hint=None, report=None):
     """시트 양식이 제각각이라도(방문형/업로드형/기업형 등) Claude가 각 행의 '의미'를 보고
     알아서 이름/금액/결제수단/링크 등을 뽑아낸다 — 열 위치를 고정하지 않는다.
     헤더 텍스트가 구글폼 질문이라 믿을 수 없는 경우에도 셀 내용 자체로 판단한다."""
     api_key = os.environ.get("ANTHROPIC_API_KEY")
     rows, skipped = [], 0
+    if report is None:
+        report = {}
+    report.setdefault("errors", [])
+    report.setdefault("reasons", {})
+
+    def _why(reason, n=1):
+        report["reasons"][reason] = report["reasons"].get(reason, 0) + n
+
+    if not api_key:
+        report["errors"].append("ANTHROPIC_API_KEY 환경변수가 이 서비스에 설정돼 있지 않아요.")
     if not api_key or raw_df.empty or len(raw_df) < 2:
         return rows, max(0, len(raw_df) - 1)
 
@@ -251,26 +1572,30 @@ def _ai_extract_payment_rows(raw_df, existing_keys, batch_size=20, extra_hint=No
                 timeout=60,
             )
             if res.status_code >= 300:
+                report["errors"].append(_api_error_text(res.status_code, res.text))
                 skipped += len(chunk)
                 continue
             text = "".join(b.get("text", "") for b in res.json().get("content", []) if b.get("type") == "text").strip()
-            if text.startswith("```"):
-                text = text.strip("`")
-                if text.startswith("json"):
-                    text = text[4:]
-            extracted = json.loads(text)
-        except Exception:
+            # 앞뒤에 설명이나 ```json 이 붙어 와도 JSON 배열 부분만 꺼낸다
+            lb, rb = text.find("["), text.rfind("]")
+            if lb == -1 or rb <= lb:
+                raise ValueError(f"JSON 배열을 못 찾음. 응답 앞부분: {text[:120]}")
+            extracted = json.loads(text[lb:rb + 1])
+        except Exception as e:
+            report["errors"].append(f"{start + 1}~{start + len(chunk)}행 처리 실패 ({type(e).__name__}: {e})")
             skipped += len(chunk)
             continue
 
         for item in extracted:
             if not isinstance(item, dict) or item.get("skip"):
                 skipped += 1
+                _why("AI가 송금 정보가 아닌 행(안내문·빈 줄 등)으로 판단")
                 continue
             name = str(item.get("influencer_name") or "").strip()
             amount = _clean_number(item.get("amount"))
             if not name or amount is None:
                 skipped += 1
+                _why("이름 또는 금액을 못 찾음")
                 continue
 
             payment_method_raw = item.get("payment_method_raw")
@@ -288,6 +1613,7 @@ def _ai_extract_payment_rows(raw_df, existing_keys, batch_size=20, extra_hint=No
             dedup_key = hashlib.md5(dedup_src.encode("utf-8")).hexdigest()
             if dedup_key in existing_keys:
                 skipped += 1
+                _why("이미 등록된 건(중복)")
                 continue
 
             rows.append({
@@ -335,131 +1661,10 @@ def refresh():
 
 
 my_name = st.selectbox("내 이름", STAFF_NAMES, key="my_name")
-ROLE_MAP = {"김선재": "sales", "곽재선": "influencer", "구정회": "dev", "이단우": "china_ops"}
+ROLE_MAP = {"김선재": "sales", "곽재선": "influencer", "구정회": "dev", "이단우": "china_ops", "가상인턴": "sales"}  # 가상인턴=테스트 계정(세일즈 화면 시험용)
 my_role = ROLE_MAP.get(my_name)
+INVOICE_EDITORS = {"김선재", "가상인턴"}  # 최종 인보이스를 첨부·교체하고 브랜드 승인 처리를 할 수 있는 사람(나머지는 보기만, 가상인턴=테스트)
 
-# ── 📋 채워주세요! (30분마다 도는 완성도 체크가 찾아낸 빈 정보) ──
-open_prompts = (
-    SUPA.table("data_completeness_prompts")
-    .select("*").eq("person", my_name).eq("status", "open")
-    .order("created_at", desc=True).execute().data
-)
-if open_prompts:
-    st.warning(f"📋 **현황판을 완성하려면 아래 {len(open_prompts)}건이 필요해요** (자동으로 채워지지 않아서 직접 확인 부탁드려요)")
-    for p in open_prompts:
-        pc1, pc2 = st.columns([5, 1])
-        pc1.caption(f"• {p['message']}")
-        if pc2.button("✅ 처리함", key=f"resolve_prompt_{p['id']}"):
-            SUPA.table("data_completeness_prompts").update({
-                "status": "dismissed",
-            }).eq("id", p["id"]).execute()
-            st.rerun()
-
-# ── 🤖 AI가 미리 준비해둔 내용 (구글드라이브 등에서 발견, 본인 확인만 하면 됨) ──
-ai_drafts = (
-    SUPA.table("ai_drafted_updates").select("*")
-    .eq("person", my_name).eq("status", "pending")
-    .order("created_at", desc=True).execute().data
-)
-if ai_drafts:
-    st.info(f"🤖 **구글드라이브 등에서 업무 관련 내용을 확인했어요** — 아래 {len(ai_drafts)}건, 맞는지만 봐주세요")
-    for d in ai_drafts:
-        with st.container(border=True):
-            st.write(d["draft_content"])
-            dc1, dc2 = st.columns([1, 2])
-            if dc1.button("✅ 맞아요, 문제없어요", key=f"confirm_draft_{d['id']}", use_container_width=True):
-                SUPA.table("ai_drafted_updates").update({
-                    "status": "applied", "resolved_at": pd.Timestamp.now(tz="UTC").isoformat(),
-                }).eq("id", d["id"]).execute()
-                st.rerun()
-            correction = dc2.text_input(
-                "틀린 부분 있으면 여기에 자유롭게 적어주세요", key=f"correction_{d['id']}",
-                placeholder="예: 계약 시작일은 9/1이 아니라 9/15이에요",
-            )
-            if correction.strip() and st.button("📝 수정사항 제출", key=f"submit_correction_{d['id']}"):
-                SUPA.table("ai_drafted_updates").update({
-                    "status": "correction_requested", "correction_note": correction.strip(),
-                }).eq("id", d["id"]).execute()
-                st.success("제출 완료! 30분 안에 알아서 정리해둘게요.")
-                st.rerun()
-
-# ── 📼 세일즈 전용: 등록된 업체명이 언급된 회의만 알림 (기밀 보호) ──
-if my_role == "sales":
-    sales_alerts = (
-        SUPA.table("sales_meeting_alerts").select("*")
-        .eq("person", my_name).eq("status", "open")
-        .order("meeting_date", desc=True).execute().data
-    )
-    if sales_alerts:
-        st.info(f"📼 **담당하시는 업체 관련 회의가 있었어요** — {len(sales_alerts)}건 (등록된 업체명이 언급된 회의만 보여드려요)")
-        for al in sales_alerts:
-            with st.container(border=True):
-                when = al["meeting_date"][:10] if al.get("meeting_date") else ""
-                st.markdown(f"**[{al['brand_matched']}]** {al.get('meeting_title') or ''} · {when}")
-                if al.get("summary_snippet"):
-                    st.caption(al["summary_snippet"])
-                ac1, ac2 = st.columns(2)
-                if ac1.button("✅ 업무보고에 반영해주세요", key=f"reflect_meeting_{al['id']}", use_container_width=True):
-                    SUPA.table("ai_drafted_updates").insert({
-                        "person": my_name, "source": "meeting", "source_ref": str(al["meeting_id"]),
-                        "target_table": "sales_accounts",
-                        "draft_content": f"[{al['brand_matched']}] 관련 회의 내용: {al.get('summary_snippet') or ''}",
-                    }).execute()
-                    SUPA.table("sales_meeting_alerts").update({"status": "reflected"}).eq("id", al["id"]).execute()
-                    st.success("반영 요청 접수! 위 'AI가 준비해둔 내용'에서 곧 확인하실 수 있어요.")
-                    st.rerun()
-                if ac2.button("그냥 참고만 할게요", key=f"dismiss_meeting_{al['id']}", use_container_width=True):
-                    SUPA.table("sales_meeting_alerts").update({"status": "dismissed"}).eq("id", al["id"]).execute()
-                    st.rerun()
-
-# ── 🧭 내 KPI 데이터 정렬 제안 (kpi_gap만 — 본인 데이터라 바로 처리) ──
-my_kpi_gaps = (
-    SUPA.table("kpi_alignment_suggestions").select("*")
-    .eq("person", my_name).eq("status", "open").eq("suggestion_type", "kpi_gap")
-    .order("created_at", desc=True).execute().data
-)
-if my_kpi_gaps:
-    st.info(f"🧭 **내 KPI 추적 관련 제안이 있어요** — {len(my_kpi_gaps)}건 (Claude가 목표랑 실제 데이터를 비교해서 찾은 것)")
-    for g in my_kpi_gaps:
-        with st.container(border=True):
-            st.write(g["suggestion_text"])
-            gl1, gl2 = st.columns([3, 1])
-            sheet_link = gl1.text_input(
-                "이 KPI를 추적할 구글시트 링크(있으면)", key=f"kpigap_link_{g['id']}",
-                placeholder="https://docs.google.com/spreadsheets/...", label_visibility="collapsed",
-            )
-            if gl2.button("등록", key=f"kpigap_register_{g['id']}", use_container_width=True):
-                if sheet_link.strip():
-                    SUPA.table("kpi_data_sources").insert({
-                        "person": my_name, "related_suggestion_text": g["suggestion_text"],
-                        "source_url": sheet_link.strip(),
-                    }).execute()
-                SUPA.table("kpi_alignment_suggestions").update({"status": "applied"}).eq("id", g["id"]).execute()
-                st.success("등록 완료! 다음부터 이 소스를 참고해서 분석할게요.")
-                st.rerun()
-            if st.button("아직 없어요 / 나중에", key=f"kpigap_skip_{g['id']}"):
-                SUPA.table("kpi_alignment_suggestions").update({"status": "dismissed"}).eq("id", g["id"]).execute()
-                st.rerun()
-
-st.divider()
-
-# ══════════════════════════════════════════════════════════
-# 🧭 회사 비전 (항상 보임 — 모두가 바라보는 방향)
-# ══════════════════════════════════════════════════════════
-vision_data = SUPA.table("company_vision").select("*").order("updated_at", desc=True).limit(1).execute().data
-if vision_data:
-    v = vision_data[0]
-    st.markdown(
-        f"""<div style="background: linear-gradient(135deg, #10234f, #2e5597); padding: 20px 28px; border-radius: 16px 16px 0 0;">
-<div style="color: #FFD700; font-size: 13px; font-weight: 800; letter-spacing: 3px;">VISION</div>
-<div style="color: white; font-size: 28px; font-weight: 800; margin-top: 4px;">{v['title']}</div>
-</div>""",
-        unsafe_allow_html=True,
-    )
-    with st.container(border=True):
-        st.markdown(v["content"])
-
-st.divider()
 
 st.markdown("""
 <style>
@@ -495,9 +1700,142 @@ div[data-testid="stVerticalBlockBorderWrapper"] {
 </style>
 """, unsafe_allow_html=True)
 
-tab_okr, tab_log, tab_campaign, tab_finance, tab_mywork, tab_summary, tab_org = st.tabs([
-    "🎯 목표", "📝 오늘 기록", "📋 캠페인", "💰 재무", "🧰 내 업무", "📊 요약", "🏢 조직도",
+_req_rows, _req_err = load_team_requests()
+_req_today = _today_kst()
+_my_overdue = sum(1 for r in _req_rows if r["assignee"] == my_name and _req_days_overdue(r, _req_today))
+tab_home, tab_okr, tab_log, tab_campaign, tab_finance, tab_mywork, tab_board, tab_leave, tab_summary, tab_org = st.tabs([
+    "🏠 홈", "🎯 목표", "📝 오늘 기록", "📋 캠페인", "💰 재무", "🧰 내 업무",
+    "📮 요청 게시판" + (f" ⚠️{_my_overdue}" if _my_overdue else ""), "🏖️ 휴가", "📊 요약", "🏢 조직도",
 ])
+
+with tab_home:
+    # ── 📮 요청 게시판: 마감 지난 요청(⚠️ 처리요망)·새 요청 ──
+    if not _req_err:
+        _render_my_request_banner(_req_rows, my_name, _req_today)
+
+    # ── 📋 채워주세요! (30분마다 도는 완성도 체크가 찾아낸 빈 정보) ──
+    open_prompts = (
+        SUPA.table("data_completeness_prompts")
+        .select("*").eq("person", my_name).eq("status", "open")
+        .order("created_at", desc=True).execute().data
+    )
+    if open_prompts:
+        st.warning(f"📋 **현황판을 완성하려면 아래 {len(open_prompts)}건이 필요해요** (자동으로 채워지지 않아서 직접 확인 부탁드려요)")
+        for p in open_prompts:
+            pc1, pc2 = st.columns([5, 1])
+            pc1.caption(f"• {p['message']}")
+            if pc2.button("✅ 처리함", key=f"resolve_prompt_{p['id']}"):
+                SUPA.table("data_completeness_prompts").update({
+                    "status": "dismissed",
+                }).eq("id", p["id"]).execute()
+                st.rerun()
+
+    # ── 🤖 AI가 미리 준비해둔 내용 (구글드라이브 등에서 발견, 본인 확인만 하면 됨) ──
+    ai_drafts = (
+        SUPA.table("ai_drafted_updates").select("*")
+        .eq("person", my_name).eq("status", "pending")
+        .order("created_at", desc=True).execute().data
+    )
+    if ai_drafts:
+        st.info(f"🤖 **구글드라이브 등에서 업무 관련 내용을 확인했어요** — 아래 {len(ai_drafts)}건, 맞는지만 봐주세요")
+        for d in ai_drafts:
+            with st.container(border=True):
+                st.write(d["draft_content"])
+                dc1, dc2 = st.columns([1, 2])
+                if dc1.button("✅ 맞아요, 문제없어요", key=f"confirm_draft_{d['id']}", use_container_width=True):
+                    SUPA.table("ai_drafted_updates").update({
+                        "status": "applied", "resolved_at": pd.Timestamp.now(tz="UTC").isoformat(),
+                    }).eq("id", d["id"]).execute()
+                    st.rerun()
+                correction = dc2.text_input(
+                    "틀린 부분 있으면 여기에 자유롭게 적어주세요", key=f"correction_{d['id']}",
+                    placeholder="예: 계약 시작일은 9/1이 아니라 9/15이에요",
+                )
+                if correction.strip() and st.button("📝 수정사항 제출", key=f"submit_correction_{d['id']}"):
+                    SUPA.table("ai_drafted_updates").update({
+                        "status": "correction_requested", "correction_note": correction.strip(),
+                    }).eq("id", d["id"]).execute()
+                    st.success("제출 완료! 30분 안에 알아서 정리해둘게요.")
+                    st.rerun()
+
+    # ── 📼 세일즈 전용: 등록된 업체명이 언급된 회의만 알림 (기밀 보호) ──
+    if my_role == "sales":
+        sales_alerts = (
+            SUPA.table("sales_meeting_alerts").select("*")
+            .eq("person", my_name).eq("status", "open")
+            .order("meeting_date", desc=True).execute().data
+        )
+        if sales_alerts:
+            st.info(f"📼 **담당하시는 업체 관련 회의가 있었어요** — {len(sales_alerts)}건 (등록된 업체명이 언급된 회의만 보여드려요)")
+            for al in sales_alerts:
+                with st.container(border=True):
+                    when = al["meeting_date"][:10] if al.get("meeting_date") else ""
+                    st.markdown(f"**[{al['brand_matched']}]** {al.get('meeting_title') or ''} · {when}")
+                    if al.get("summary_snippet"):
+                        st.caption(al["summary_snippet"])
+                    ac1, ac2 = st.columns(2)
+                    if ac1.button("✅ 업무보고에 반영해주세요", key=f"reflect_meeting_{al['id']}", use_container_width=True):
+                        SUPA.table("ai_drafted_updates").insert({
+                            "person": my_name, "source": "meeting", "source_ref": str(al["meeting_id"]),
+                            "target_table": "sales_accounts",
+                            "draft_content": f"[{al['brand_matched']}] 관련 회의 내용: {al.get('summary_snippet') or ''}",
+                        }).execute()
+                        SUPA.table("sales_meeting_alerts").update({"status": "reflected"}).eq("id", al["id"]).execute()
+                        st.success("반영 요청 접수! 위 'AI가 준비해둔 내용'에서 곧 확인하실 수 있어요.")
+                        st.rerun()
+                    if ac2.button("그냥 참고만 할게요", key=f"dismiss_meeting_{al['id']}", use_container_width=True):
+                        SUPA.table("sales_meeting_alerts").update({"status": "dismissed"}).eq("id", al["id"]).execute()
+                        st.rerun()
+
+    # ── 🧭 내 KPI 데이터 정렬 제안 (kpi_gap만 — 본인 데이터라 바로 처리) ──
+    my_kpi_gaps = (
+        SUPA.table("kpi_alignment_suggestions").select("*")
+        .eq("person", my_name).eq("status", "open").eq("suggestion_type", "kpi_gap")
+        .order("created_at", desc=True).execute().data
+    )
+    if my_kpi_gaps:
+        st.info(f"🧭 **내 KPI 추적 관련 제안이 있어요** — {len(my_kpi_gaps)}건 (Claude가 목표랑 실제 데이터를 비교해서 찾은 것)")
+        for g in my_kpi_gaps:
+            with st.container(border=True):
+                st.write(g["suggestion_text"])
+                gl1, gl2 = st.columns([3, 1])
+                sheet_link = gl1.text_input(
+                    "이 KPI를 추적할 구글시트 링크(있으면)", key=f"kpigap_link_{g['id']}",
+                    placeholder="https://docs.google.com/spreadsheets/...", label_visibility="collapsed",
+                )
+                if gl2.button("등록", key=f"kpigap_register_{g['id']}", use_container_width=True):
+                    if sheet_link.strip():
+                        SUPA.table("kpi_data_sources").insert({
+                            "person": my_name, "related_suggestion_text": g["suggestion_text"],
+                            "source_url": sheet_link.strip(),
+                        }).execute()
+                    SUPA.table("kpi_alignment_suggestions").update({"status": "applied"}).eq("id", g["id"]).execute()
+                    st.success("등록 완료! 다음부터 이 소스를 참고해서 분석할게요.")
+                    st.rerun()
+                if st.button("아직 없어요 / 나중에", key=f"kpigap_skip_{g['id']}"):
+                    SUPA.table("kpi_alignment_suggestions").update({"status": "dismissed"}).eq("id", g["id"]).execute()
+                    st.rerun()
+
+    st.divider()
+
+    # ══════════════════════════════════════════════════════════
+    # 🧭 회사 비전 (항상 보임 — 모두가 바라보는 방향)
+    # ══════════════════════════════════════════════════════════
+    vision_data = SUPA.table("company_vision").select("*").order("updated_at", desc=True).limit(1).execute().data
+    if vision_data:
+        v = vision_data[0]
+        st.markdown(
+            f"""<div style="background: linear-gradient(135deg, #10234f, #2e5597); padding: 20px 28px; border-radius: 16px 16px 0 0;">
+    <div style="color: #FFD700; font-size: 13px; font-weight: 800; letter-spacing: 3px;">VISION</div>
+    <div style="color: white; font-size: 28px; font-weight: 800; margin-top: 4px;">{v['title']}</div>
+    </div>""",
+            unsafe_allow_html=True,
+        )
+        with st.container(border=True):
+            st.markdown(v["content"])
+
+    st.divider()
+
 
 with tab_okr:
     # ══════════════════════════════════════════════════════════
@@ -1129,50 +2467,61 @@ with tab_finance:
     )
     dl1, dl2 = st.columns([1, 3])
     dl1.download_button(
-        "📋 표준 양식 다운로드", data=PAYMENT_TEMPLATE_CSV, file_name="송금정보_양식.csv",
+        "📋 표준 양식 다운로드", data=PAYMENT_TEMPLATE_CSV.encode("utf-8-sig"), file_name="송금정보_양식.csv",
         mime="text/csv", key="download_payment_template",
     )
     dl2.caption("이 양식대로 채우시면 가장 정확하게 인식돼요. 다른 형식(기존에 쓰시던 시트)도 AI가 알아서 읽어보려 시도합니다.")
 
     pay_sheet_url = st.text_input("구글시트 링크", key="payment_sheet_url", placeholder="https://docs.google.com/spreadsheets/d/...")
+    pay_sheet_file = st.file_uploader(
+        "또는 엑셀(.xlsx)/CSV 파일로 올리기 (링크 공유가 어려울 때)", type=["xlsx", "csv"], key="payment_sheet_file",
+    )
     if st.button("1단계: 시트 구조 확인", key="payment_sheet_load"):
-        if not pay_sheet_url.strip():
-            st.error("링크를 붙여넣어주세요.")
+        all_sheets, err_title, err_fix = None, None, None
+        if pay_sheet_file is not None:
+            all_sheets, err_title = _read_uploaded_sheet_file(pay_sheet_file)
+        elif pay_sheet_url.strip():
+            all_sheets, err_title, err_fix = _fetch_google_sheet(pay_sheet_url)
         else:
-            xlsx_url = _sheet_xlsx_url(pay_sheet_url.strip())
-            if not xlsx_url:
-                st.error("구글시트 링크 형식이 아닌 것 같아요.")
+            err_title = "링크를 붙여넣거나 파일을 올려주세요."
+        if all_sheets is None:
+            st.error(f"❌ {err_title}" + (f"\n\n{err_fix}" if err_fix else ""))
+        else:
+            for i, (_nm, _df) in enumerate(all_sheets.items()):  # 탭마다 제목줄 후보를 미리 채워둔다(사용자가 고칠 수 있음)
+                st.session_state[f"hdr_rows_{i}"] = ", ".join(str(n) for n in _detect_header_rows(_df))
+                st.session_state[f"hdr_skip_{i}"] = bool(_df.empty)
+            with st.spinner("Claude가 열 구성을 파악하는 중..."):
+                mapping_desc, mapping_err = _ai_infer_column_mapping(_collect_sections(all_sheets))
+            st.session_state["payment_all_sheets"] = all_sheets
+            if mapping_desc:
+                st.session_state["payment_mapping_desc"] = mapping_desc
             else:
-                try:
-                    res = requests.get(xlsx_url, timeout=30)
-                    if res.status_code == 403 or res.status_code == 401:
-                        st.error(
-                            "🔒 **권한 문제예요** — 이 시트가 아직 비공개 상태라 저희 쪽에서 못 읽어요.\n\n"
-                            "구글시트에서 **우측 상단 '공유' → '일반 액세스'를 '링크가 있는 모든 사용자 - 뷰어'**로 바꿔주세요. "
-                            "(회사 계정끼리만 공유해도 외부 서버에서는 못 읽습니다)\n\n"
-                            "**그래도 복잡하면 아래 '📷 스크린샷으로 대신 올리기'를 쓰셔도 돼요 — 더 쉬울 수 있어요.**"
-                        )
-                    elif res.status_code == 404:
-                        st.error("❌ 링크를 찾을 수 없어요. 주소가 정확한지 다시 확인해주세요.")
-                    elif res.status_code != 200:
-                        st.error(f"❌ 구글시트 응답 오류 (코드 {res.status_code}). 잠시 후 다시 시도해주세요.")
-                    else:
-                        all_sheets = pd.read_excel(io.BytesIO(res.content), sheet_name=None, header=None, dtype=str)
-                        with st.spinner("Claude가 열 구성을 파악하는 중..."):
-                            mapping_desc = _ai_infer_column_mapping(all_sheets)
-                        st.session_state["payment_all_sheets"] = all_sheets
-                        st.session_state["payment_mapping_desc"] = mapping_desc or "(자동 파악 실패 — 그냥 2단계에서 바로 추출을 시도해볼게요)"
-                        st.session_state.pop("payment_rows_preview", None)
-                except Exception as e:
-                    st.error(
-                        f"시트를 못 읽었어요 ({e}).\n\n"
-                        "**확인해주세요:** 구글시트 '공유' 설정이 '링크가 있는 모든 사용자 - 뷰어'로 되어있는지. "
-                        "그래도 안 되면 아래 '📷 스크린샷으로 대신 올리기'를 이용해주세요."
-                    )
+                st.session_state["payment_mapping_desc"] = f"(자동 파악 실패: {mapping_err} — 그냥 2단계에서 바로 추출을 시도해볼게요)"
+                st.warning(f"⚠️ 열 구조 파악 실패 — {mapping_err}")
+            st.session_state.pop("payment_rows_preview", None)
 
     mapping_desc = st.session_state.get("payment_mapping_desc")
     if mapping_desc and st.session_state.get("payment_all_sheets") is not None:
         st.info(f"🧐 **제가 파악한 열 구성이에요 — 맞는지 봐주세요:**\n\n{mapping_desc}")
+        st.markdown("**🗂️ 탭별 표 구간 확인** — 한 탭 안에서 제목줄(헤더)이 중간에 또 나오면, 제목줄 행 번호를 모두 적어주세요.")
+        for i, (sheet_name, sheet_df) in enumerate(st.session_state["payment_all_sheets"].items()):
+            heads = _parse_row_numbers(st.session_state.get(f"hdr_rows_{i}", ""), len(sheet_df)) or [1]
+            with st.expander(f"탭 '{sheet_name}' ({len(sheet_df)}행) — 제목줄 {len(heads)}개로 인식", expanded=len(heads) > 1):
+                hc1, hc2 = st.columns([3, 1])
+                hc1.text_input("제목줄(헤더) 행 번호 — 여러 개면 쉼표로 (예: 1, 22)", key=f"hdr_rows_{i}")
+                hc2.checkbox("이 탭은 제외", key=f"hdr_skip_{i}")
+                preview = sheet_df.head(80).fillna("").astype(str).copy()
+                preview.columns = [_col_letter(j) for j in range(preview.shape[1])]
+                preview.insert(0, "행", range(1, len(preview) + 1))
+                preview.insert(1, " ", ["◀ 제목줄" if n in heads else "" for n in preview["행"]])
+                st.dataframe(preview, hide_index=True, use_container_width=True)
+                if len(sheet_df) > 80:
+                    st.caption(f"(앞 80행만 보여드려요. 80행 뒤에 제목줄이 또 있으면 행 번호를 직접 적어주세요.)")
+        if st.button("🔄 제목줄을 바꿨어요 — 열 구성 다시 파악", key="remap_sections"):
+            with st.spinner("Claude가 열 구성을 다시 파악하는 중..."):
+                _desc, _err = _ai_infer_column_mapping(_collect_sections(st.session_state["payment_all_sheets"]))
+            st.session_state["payment_mapping_desc"] = _desc or f"(자동 파악 실패: {_err} — 그냥 2단계에서 바로 추출을 시도해볼게요)"
+            st.rerun()
         mapping_correction = st.text_input(
             "다르면 바로잡아주세요(선택)", key="mapping_correction",
             placeholder="예: A열은 이름이 아니라 방문 장소예요, 이름은 C열이에요",
@@ -1181,27 +2530,41 @@ with tab_finance:
         if mc1.button("✅ 맞아요, 전체 추출 진행", key="confirm_mapping_proceed", type="primary", use_container_width=True):
             all_sheets = st.session_state["payment_all_sheets"]
             pay_rows, skipped_rows = [], 0
+            extract_report = {"errors": [], "reasons": {}}
             existing_keys = {
                 r["dedup_key"] for r in SUPA.table("payment_requests").select("dedup_key").execute().data
                 if r.get("dedup_key")
             }
             with st.spinner("Claude가 전체 내용을 읽는 중..."):
-                for _, raw_df in all_sheets.items():
+                for _label, raw_df in _collect_sections(all_sheets).items():
                     if raw_df.empty:
                         continue
                     rows, n_skip = _ai_extract_payment_rows(
                         raw_df, existing_keys, extra_hint=mapping_correction.strip() or None,
+                        report=extract_report,
                     )
                     pay_rows.extend(rows)
                     skipped_rows += n_skip
-            st.session_state["payment_rows_preview"] = pay_rows
-            st.session_state.pop("payment_mapping_desc", None)
-            st.session_state.pop("payment_all_sheets", None)
-            msg = f"{len(pay_rows)}명 새로 인식됨."
-            if skipped_rows:
-                msg += f" (이미 등록됐거나 형식이 안 맞는 {skipped_rows}행은 건너뜀)"
-            st.success(msg)
-            st.rerun()
+            reason_lines = "".join(f"\n- {k}: {v}행" for k, v in extract_report["reasons"].items())
+            if not pay_rows:
+                # 0건이면 화면을 초기화하지 않고(=다시 시도할 수 있게) 이유를 그대로 보여준다
+                err_lines = "".join(f"\n- {e}" for e in dict.fromkeys(extract_report["errors"]))
+                st.error(
+                    "❌ 새로 인식된 송금 건이 0건이에요. 아래 이유를 확인해주세요." + (f"\n\n**오류**{err_lines}" if err_lines else "")
+                    + (f"\n\n**건너뛴 이유**{reason_lines}" if reason_lines else "")
+                    + "\n\n제목줄 행 번호나 위의 '열 구성 보정'을 고친 뒤 다시 눌러보세요."
+                )
+            else:
+                msg = f"✅ {len(pay_rows)}명 새로 인식됨."
+                if skipped_rows:
+                    msg += f" (건너뜀 {skipped_rows}행){reason_lines}"
+                if extract_report["errors"]:
+                    msg += "\n\n⚠️ 일부 구간은 처리하지 못했어요:" + "".join(f"\n- {e}" for e in dict.fromkeys(extract_report["errors"]))
+                st.session_state["payment_rows_preview"] = pay_rows
+                st.session_state["payment_extract_msg"] = msg
+                st.session_state.pop("payment_mapping_desc", None)
+                st.session_state.pop("payment_all_sheets", None)
+                st.rerun()
         if mc2.button("❌ 다시 확인 (취소)", key="cancel_mapping", use_container_width=True):
             st.session_state.pop("payment_mapping_desc", None)
             st.session_state.pop("payment_all_sheets", None)
@@ -1225,8 +2588,24 @@ with tab_finance:
                 shot_rows = []
                 with st.spinner("Claude가 스크린샷을 읽는 중..."):
                     for f in shot_files:
-                        img_b64 = base64.b64encode(f.getvalue()).decode("utf-8")
+                        img_bytes = f.getvalue()
                         media_type = f.type or "image/png"
+                        # 전체화면 캡처는 해상도가 너무 커서 API가 거부(400)하는 경우가 많아, 가로/세로 1568px로 축소
+                        try:
+                            from PIL import Image
+                            img = Image.open(io.BytesIO(img_bytes))
+                            img = img.convert("RGB")
+                            max_dim = 1568
+                            if max(img.size) > max_dim:
+                                ratio = max_dim / max(img.size)
+                                img = img.resize((int(img.width * ratio), int(img.height * ratio)))
+                            buf = io.BytesIO()
+                            img.save(buf, format="JPEG", quality=85)
+                            img_bytes = buf.getvalue()
+                            media_type = "image/jpeg"
+                        except Exception as resize_err:
+                            st.caption(f"{f.name}: 리사이즈 건너뜀({resize_err}), 원본으로 시도")
+                        img_b64 = base64.b64encode(img_bytes).decode("utf-8")
                         sys_prompt = (
                             "이 이미지는 인플루언서 송금 정보 화면(또는 메시지)이다. 다음 정보를 찾아서 JSON으로만 출력해라: "
                             "{\"influencer_name\": \"...\", \"amount\": 숫자(원화 기준, 콤마/₩ 제외), "
@@ -1248,7 +2627,7 @@ with tab_finance:
                                 timeout=30,
                             )
                             if r.status_code >= 300:
-                                st.warning(f"{f.name}: 읽기 실패 ({r.status_code})")
+                                st.warning(f"{f.name}: 읽기 실패 ({r.status_code}) — {r.text[:300]}")
                                 continue
                             text = "".join(b.get("text", "") for b in r.json().get("content", []) if b.get("type") == "text").strip()
                             if text.startswith("```"):
@@ -1287,6 +2666,8 @@ with tab_finance:
                     st.rerun()
 
     pay_preview = st.session_state.get("payment_rows_preview")
+    if st.session_state.get("payment_extract_msg") and pay_preview:
+        st.success(st.session_state["payment_extract_msg"])
     if pay_preview:
         REQUIRED_FIELDS = ["influencer_name", "amount", "payment_method_raw", "content_link", "id_doc_link", "scheduled_date", "brand_names"]
         FIELD_LABEL = {
@@ -1526,9 +2907,127 @@ with tab_mywork:
         account_by_id = {a["id"]: a for a in all_sales_accounts}
         STATUS_OPTS_ACC = ["협상중", "계약완료", "운영중", "종료", "이탈"]
 
-        tab_cal, tab_acc, tab_issue, tab_camp = st.tabs(["📅 일정 한눈에보기", "🏢 계정 관리", "🐛 이슈", "🚀 캠페인·주차루틴"])
+        tab_reg, tab_big, tab_fc, tab_cal, tab_acc, tab_issue, tab_camp = st.tabs(["📝 캠페인 등록", "🗓️ 큰 캘린더", "🔮 다음달 예측", "📅 일정 한눈에보기", "🏢 계정 관리", "🐛 이슈", "🚀 캠페인·주차루틴"])
 
         # ── 📅 일정 한눈에보기 ──────────────────────────────────
+        with tab_big:
+            st.markdown("**캠페인 일정 큰 캘린더** — 여러 캠페인이 같은 날 겹쳐도 색깔로 구분돼서 한눈에 보여요. (수정은 '🚀 캠페인·주차루틴' 탭에서)")
+            _camps = {c["id"]: c for c in load_sales_campaigns()}
+            _my_ids = {a["id"] for a in my_accounts}
+            cal_events = []
+            for t in load_sales_campaign_tasks():
+                camp = _camps.get(t["campaign_id"])
+                if not camp or camp["account_id"] not in _my_ids or not t.get("due_date"):
+                    continue
+                brand = account_by_id.get(camp["account_id"], {}).get("brand_name", "?")
+                cal_events.append({
+                    "date": date.fromisoformat(str(t["due_date"])[:10]), "label": f"{brand} {t['week_number']}주차",
+                    "full": f"[{brand}] {camp['campaign_name']} · {t['week_number']}주차 {t['task_title']} ({t['status']})",
+                    "key": camp["id"], "done": t["status"] == "완료", "brand": brand, "campaign": camp["campaign_name"],
+                })
+            for a in my_accounts:
+                if a.get("renewal_date"):
+                    cal_events.append({
+                        "date": date.fromisoformat(str(a["renewal_date"])[:10]), "label": f"🔁 {a['brand_name']} 갱신",
+                        "full": f"{a['brand_name']} 갱신/온보딩일", "key": f"renew-{a['id']}", "done": False,
+                        "brand": a["brand_name"], "campaign": "갱신/온보딩",
+                    })
+
+            today_d = date.today()
+            ym = st.session_state.setdefault("bigcal_ym", (today_d.year, today_d.month))
+            nv1, nv2, nv3, nv4 = st.columns([1, 1, 1, 4])
+            if nv1.button("◀ 이전 달", key="bigcal_prev", use_container_width=True):
+                y, m = st.session_state["bigcal_ym"]
+                st.session_state["bigcal_ym"] = (y - 1, 12) if m == 1 else (y, m - 1)
+                st.rerun()
+            if nv2.button("오늘", key="bigcal_today", use_container_width=True):
+                st.session_state["bigcal_ym"] = (today_d.year, today_d.month)
+                st.rerun()
+            if nv3.button("다음 달 ▶", key="bigcal_next", use_container_width=True):
+                y, m = st.session_state["bigcal_ym"]
+                st.session_state["bigcal_ym"] = (y + 1, 1) if m == 12 else (y, m + 1)
+                st.rerun()
+            cy, cm = st.session_state["bigcal_ym"]
+            nv4.markdown(f"### {cy}년 {cm}월")
+
+            all_brands = sorted({e["brand"] for e in cal_events})
+            f1, f2 = st.columns([3, 1])
+            pick_brands = f1.multiselect("브랜드 필터 (비우면 전체)", all_brands, key="bigcal_brands")
+            show_done = f2.checkbox("완료한 일정도 보기", value=True, key="bigcal_done")
+            shown = [e for e in cal_events if (not pick_brands or e["brand"] in pick_brands) and (show_done or not e["done"])]
+
+            cal_html, color_of = _render_month_calendar(shown, cy, cm, today_d)
+            st.markdown(cal_html, unsafe_allow_html=True)
+            if not shown:
+                st.caption("표시할 일정이 없어요. 캠페인을 등록하면 주차별 일정이 여기에 나타나요.")
+            else:
+                legend = "".join(
+                    f"<span style='display:inline-block;margin:2px 8px 2px 0;padding:1px 8px;border-radius:4px;border-left:3px solid {color_of[k]};"
+                    f"background:{color_of[k]}33;font-size:12px'>{html.escape(name)}</span>"
+                    for k, name in dict.fromkeys((e["key"], f"{e['brand']} · {e['campaign']}") for e in shown)
+                )
+                st.markdown(legend, unsafe_allow_html=True)
+                month_rows = sorted([e for e in shown if e["date"].year == cy and e["date"].month == cm], key=lambda e: e["date"])
+                with st.expander(f"이번 달 일정 목록 ({len(month_rows)}건)"):
+                    if month_rows:
+                        st.dataframe(pd.DataFrame([{
+                            "날짜": e["date"].isoformat(), "브랜드": e["brand"], "캠페인": e["campaign"], "내용": e["full"],
+                        } for e in month_rows]), hide_index=True, use_container_width=True)
+                    else:
+                        st.caption("이번 달에는 일정이 없어요.")
+
+        with tab_fc:
+            _t = date.today()
+            _ny, _nm = _month_add(_t.year, _t.month, 1)
+            st.markdown(f"**{_ny}년 {_nm}월 캠페인 예측** — 등록된 캠페인·계정 정보만으로 계산해요. 근거가 없으면 만들어내지 않고 '낮음'으로 둡니다.")
+            fc_rows = _forecast_next_month(my_accounts, load_sales_campaigns(), load_sales_campaign_tasks(), _t)
+            confirmed = [r for r in fc_rows if r["level"] == "확정"]
+            high = [r for r in fc_rows if r["level"] == "높음"]
+            mid = [r for r in fc_rows if r["level"] == "중간"]
+            low = [r for r in fc_rows if r["level"] == "낮음"]
+            _sum = lambda rs: sum(r["budget"] or 0 for r in rs)
+            m1, m2, m3, m4 = st.columns(4)
+            m1.metric("✅ 확정(등록됨)", f"{len(confirmed)}건", f"₩{_sum(confirmed):,.0f}", delta_color="off")
+            m2.metric("🟢 가능성 높음", f"{len(high)}건", f"₩{_sum(high):,.0f}", delta_color="off")
+            m3.metric("🟡 가능성 중간", f"{len(mid)}건", f"₩{_sum(mid):,.0f}", delta_color="off")
+            m4.metric("🔴 낮음/불확실", f"{len(low)}건")
+            st.caption("금액은 '🏢 계정 관리'에 적힌 월 예산 기준이에요. 월 예산이 비어 있는 브랜드는 0원으로 계산돼요.")
+
+            if not fc_rows:
+                st.info("예측할 브랜드 계정이 아직 없어요. '🏢 계정 관리'에서 담당 브랜드를 등록하고, 캠페인을 등록하면 여기에 나타나요.")
+            elif not confirmed:
+                todo = [r["brand"] for r in high + mid]
+                st.error(
+                    f"⚠️ {_ny}년 {_nm}월에 확정된 캠페인이 아직 없어요. "
+                    + (f"지금 견적·계약을 챙겨야 할 브랜드: **{', '.join(todo)}**" if todo else "가능성이 높은 브랜드도 없어서, 신규 수주가 필요해요.")
+                )
+            elif not high and not mid:
+                st.success(f"{_ny}년 {_nm}월 캠페인 {len(confirmed)}건이 확정돼 있어요.")
+
+            if fc_rows:
+                icon = {"확정": "✅ 확정", "높음": "🟢 높음", "중간": "🟡 중간", "낮음": "🔴 낮음"}
+                st.dataframe(pd.DataFrame([{
+                    "상태": icon[r["level"]], "브랜드": r["brand"], "예상 오픈일": r["pred_open"].isoformat() if r["pred_open"] else "-",
+                    "월 예산": (f"₩{r['budget']:,.0f}" if r["budget"] else "미입력"), "근거": r["reason"], "담당": r["owner"],
+                } for r in fc_rows]), hide_index=True, use_container_width=True)
+                no_budget = [r["brand"] for r in fc_rows if r["budget_missing"] and r["level"] in ("확정", "높음", "중간")]
+                if no_budget:
+                    st.caption(f"💡 월 예산이 비어 있는 브랜드: {', '.join(no_budget)} — '🏢 계정 관리'에 적어두면 예상 매출이 정확해져요.")
+
+            # 최근 6개월 + 다음달 캠페인 수: '한 달 달리고 한 달 쉬는' 패턴이 있는지 한눈에 보기
+            _camps_all = [c for c in load_sales_campaigns() if c.get("account_id") in {a["id"] for a in my_accounts} and c.get("open_date")]
+            _cnt = {}
+            for c in _camps_all:
+                k = str(c["open_date"])[:7]
+                _cnt[k] = _cnt.get(k, 0) + 1
+            _months = [_month_add(_t.year, _t.month, i) for i in range(-5, 2)]
+            _labels = [f"{y}-{m:02d}" for y, m in _months]
+            _series = [_cnt.get(l, 0) for l in _labels]
+            _series[-1] = len(confirmed)  # 다음달은 '확정'만 센다
+            if sum(_series) > 0:
+                st.markdown("**월별 캠페인 시작 건수** (마지막 달 = 다음달 확정 건수)")
+                st.bar_chart(pd.DataFrame({"캠페인 수": _series}, index=_labels))
+
         with tab_cal:
             st.markdown("**다가오는 일정**")
             all_tasks = load_sales_campaign_tasks()
@@ -1674,55 +3173,138 @@ with tab_mywork:
                             st.success("저장 완료"); refresh_sales()
 
         # ── 🚀 캠페인·주차루틴 ──────────────────────────────────
-        with tab_camp:
+        with tab_reg:
             st.markdown("**캠페인 등록 → 4주 루틴 자동 생성**")
-            if not my_accounts:
-                st.caption("먼저 브랜드 계정을 등록해주세요.")
-            else:
-                with st.expander("🚀 새 캠페인 등록", expanded=True):
-                    with st.form("new_campaign_form", clear_on_submit=True):
-                        acc_names2 = {a["brand_name"]: a["id"] for a in my_accounts}
-                        camp_brand = st.selectbox("브랜드", list(acc_names2.keys()), key="camp_brand_pick")
-                        camp_name = st.text_input("캠페인명 *", placeholder="예: 9월 명동 오픈 캠페인")
-                        camp_open_date = st.date_input("캠페인 오픈일", value=date.today(), key="camp_open_date")
-                        camp_submitted = st.form_submit_button("등록 (4주 루틴 자동 생성)", type="primary")
-                    if camp_submitted:
-                        if not camp_name.strip():
-                            st.error("캠페인명을 입력해주세요.")
-                        else:
-                            camp_res = SUPA.table("sales_campaigns").insert({
-                                "account_id": acc_names2[camp_brand], "campaign_name": camp_name.strip(),
-                                "open_date": camp_open_date.isoformat(), "created_by": my_name,
-                            }).execute()
-                            new_camp_id = camp_res.data[0]["id"]
-                            week_tasks = [{
-                                "campaign_id": new_camp_id, "week_number": wn, "task_title": wt,
-                                "task_description": wd, "due_date": (camp_open_date + timedelta(days=(wn - 1) * 7)).isoformat(),
-                            } for wn, wt, wd in WEEK_TEMPLATE]
-                            SUPA.table("sales_campaign_tasks").insert(week_tasks).execute()
-                            st.success(f"캠페인 등록 완료! 1~4주차 루틴 {len(week_tasks)}개가 자동으로 만들어졌어요.")
-                            refresh_sales()
+            with st.expander("🚀 새 캠페인 등록", expanded=True):
+                cv = st.session_state.setdefault("camp_new_ver", 0)  # 등록 성공 후 입력칸을 비우려고 key에 붙이는 번호
+                if st.session_state.get("camp_new_msg"):
+                    st.success(st.session_state.pop("camp_new_msg"))
+                acc_names2 = {a["brand_name"]: a["id"] for a in my_accounts}
+                NEW_BRAND = "➕ 새 브랜드 직접 입력"
+                camp_brand = st.selectbox("브랜드", list(acc_names2.keys()) + [NEW_BRAND], key="camp_brand_pick")
+                new_brand_name = ""
+                if camp_brand == NEW_BRAND:
+                    new_brand_name = st.text_input(
+                        "새 브랜드명 *", key=f"camp_new_brand_{cv}",
+                        help="등록하면 '🏢 계정 관리'에도 내 담당 브랜드로 자동 추가돼요.",
+                    )
+                    if not acc_names2:
+                        st.caption("아직 등록된 브랜드 계정이 없어서, 여기서 브랜드명을 쓰면 계정도 같이 만들어져요.")
+                camp_name = st.text_input("캠페인명 *", placeholder="예: 9월 명동 오픈 캠페인", key=f"camp_new_name_{cv}")
+                camp_open_date = st.date_input("캠페인 오픈일", value=date.today(), key=f"camp_new_open_{cv}")
 
-                my_account_ids_camp = {a["id"] for a in my_accounts}
-                my_campaigns = [c for c in load_sales_campaigns() if c["account_id"] in my_account_ids_camp]
-                if not my_campaigns:
-                    st.caption("등록된 캠페인이 없습니다.")
-                for c in my_campaigns:
-                    acc = account_by_id.get(c["account_id"], {})
-                    with st.expander(f"🚀 [{acc.get('brand_name', '?')}] {c['campaign_name']} · 오픈 {c['open_date']} · {c['status']}"):
-                        tasks = [t for t in load_sales_campaign_tasks() if t["campaign_id"] == c["id"]]
-                        for t in sorted(tasks, key=lambda x: x["week_number"]):
-                            with st.container(border=True):
-                                st.markdown(f"**{t['week_number']}주차 — {t['task_title']}** · 마감 {t.get('due_date') or '-'}")
-                                if t.get("task_description"):
-                                    st.caption(t["task_description"])
-                                new_tstatus = st.selectbox(
-                                    "상태", ["예정", "진행중", "완료"], index=["예정", "진행중", "완료"].index(t["status"]),
-                                    key=f"wtstatus_{t['id']}", label_visibility="collapsed",
+                st.markdown("**📄 계약서** (선택) — 직접 올리거나, 구글드라이브에서 찾아올 수 있어요")
+                cc1, cc2 = st.columns(2)
+                camp_contract_file = cc1.file_uploader(
+                    "계약서 파일 올리기", type=["pdf", "docx", "png", "jpg", "jpeg"], key=f"camp_new_contract_file_{cv}",
+                )
+                cc2.caption("브랜드명(과 캠페인명)이 들어간 파일·폴더를 드라이브에서 찾아와요.")
+                if cc2.button("🔍 구글드라이브에서 찾아오기", key="camp_new_drive_find", use_container_width=True):
+                    with st.spinner("구글드라이브를 훑는 중... (폴더가 많으면 시간이 좀 걸려요)"):
+                        _cands, _note, _err = _drive_find_contracts(new_brand_name.strip() if camp_brand == NEW_BRAND else camp_brand, camp_name)
+                    st.session_state["camp_drive_result"] = {"brand": camp_brand if camp_brand != NEW_BRAND else new_brand_name.strip(), "cands": _cands, "note": _note, "err": _err}
+                    st.session_state.pop(f"camp_{cv}_pick", None)
+                    st.session_state.pop(f"camp_{cv}_browse", None)
+
+                drive_res = st.session_state.get("camp_drive_result")
+                drive_pick = _drive_picker_ui(
+                    f"camp_{cv}", drive_res, camp_brand if camp_brand != NEW_BRAND else new_brand_name.strip(),
+                    "'계약'이 들어간 폴더도, 브랜드명이 들어간 파일도 못 찾았어요. 폴더·파일 이름을 확인하시거나, 위에서 직접 올려주세요.",
+                )
+
+                if st.button("등록 (4주 루틴 자동 생성)", type="primary", key=f"camp_new_submit_{cv}"):
+                    if not camp_name.strip():
+                        st.error("캠페인명을 입력해주세요.")
+                    elif camp_brand == NEW_BRAND and not new_brand_name.strip():
+                        st.error("새 브랜드명을 입력해주세요.")
+                    else:
+                        if camp_brand == NEW_BRAND:
+                            nb = new_brand_name.strip()
+                            if nb in acc_names2:  # 이미 있는 이름이면 중복 생성하지 않고 그 계정을 쓴다
+                                target_account_id = acc_names2[nb]
+                            else:
+                                target_account_id = SUPA.table("sales_accounts").insert({
+                                    "brand_name": nb, "assigned_to": my_name, "status": "운영중",
+                                }).execute().data[0]["id"]
+                            camp_brand_for_drive = nb
+                        else:
+                            target_account_id = acc_names2[camp_brand]
+                            camp_brand_for_drive = camp_brand
+                        camp_res = SUPA.table("sales_campaigns").insert({
+                            "account_id": target_account_id, "campaign_name": camp_name.strip(),
+                            "open_date": camp_open_date.isoformat(), "created_by": my_name,
+                        }).execute()
+                        new_camp_id = camp_res.data[0]["id"]
+                        week_tasks = [{
+                            "campaign_id": new_camp_id, "week_number": wn, "task_title": wt,
+                            "task_description": wd, "due_date": (camp_open_date + timedelta(days=(wn - 1) * 7)).isoformat(),
+                        } for wn, wt, wd in WEEK_TEMPLATE]
+                        SUPA.table("sales_campaign_tasks").insert(week_tasks).execute()
+                        msg = f"캠페인 등록 완료! 1~4주차 루틴 {len(week_tasks)}개가 자동으로 만들어졌어요."
+
+                        contract_url, contract_name = None, None
+                        if camp_contract_file is not None:  # 직접 올린 파일이 있으면 그걸 우선 사용
+                            try:
+                                ext = os.path.splitext(camp_contract_file.name)[1].lower()
+                                cpath = f"campaign/{new_camp_id}/{uuid.uuid4().hex[:8]}{ext}"
+                                SUPA.storage.from_("contract-files").upload(
+                                    cpath, camp_contract_file.getvalue(),
+                                    {"content-type": camp_contract_file.type or "application/octet-stream"},
                                 )
-                                if st.button("저장", key=f"wtsave_{t['id']}"):
-                                    SUPA.table("sales_campaign_tasks").update({"status": new_tstatus}).eq("id", t["id"]).execute()
-                                    st.success("저장 완료"); refresh_sales()
+                                contract_url = f"{os.environ.get('SUPABASE_URL')}/storage/v1/object/public/contract-files/{cpath}"
+                                contract_name = camp_contract_file.name
+                            except Exception as e:
+                                st.warning(f"계약서 업로드는 실패했지만 캠페인은 등록됐어요 ({type(e).__name__}: {e})")
+                        elif drive_pick and drive_res and drive_res["brand"] == camp_brand_for_drive:
+                            contract_url = drive_pick.get("link")
+                            contract_name = f"📁 {drive_pick['name']}" if drive_pick.get("kind") == "folder" else drive_pick["name"]
+                        if contract_url:
+                            try:
+                                SUPA.table("sales_campaigns").update({
+                                    "contract_url": contract_url, "contract_name": contract_name,
+                                }).eq("id", new_camp_id).execute()
+                                msg += f" 📄 계약서 연결: {contract_name}"
+                            except Exception as e:
+                                st.warning(
+                                    "캠페인은 등록됐지만 계약서 링크를 저장하지 못했어요. DB에 계약서 칸(contract_url, contract_name)이 "
+                                    f"아직 없는 것 같아요 — 관리자에게 알려주세요. ({type(e).__name__}: {e})"
+                                )
+                        st.session_state["camp_new_msg"] = msg
+                        st.session_state["camp_new_ver"] = cv + 1
+                        st.session_state.pop("camp_drive_result", None)
+                        refresh_sales()
+                        st.rerun()
+
+        with tab_camp:
+            st.markdown("**등록된 캠페인 · 주차 루틴**")
+            my_account_ids_camp = {a["id"] for a in my_accounts}
+            my_campaigns = [c for c in load_sales_campaigns() if c["account_id"] in my_account_ids_camp]
+            if not my_campaigns:
+                st.caption("등록된 캠페인이 없습니다.")
+            for c in my_campaigns:
+                acc = account_by_id.get(c["account_id"], {})
+                _open_d = date.fromisoformat(str(c["open_date"])[:10])
+                inv_warn = (not c.get("invoice_url")) and c["status"] != "완료" and date.today() >= _open_d + timedelta(days=14)
+                with st.expander(
+                    f"🚀 [{acc.get('brand_name', '?')}] {c['campaign_name']} · 오픈 {c['open_date']} · {c['status']}"
+                    + ("  ⚠️ 인보이스 미첨부" if inv_warn else "") + ("  ✅ 브랜드 승인" if c.get("brand_approved_at") else "")
+                ):
+                    tasks = [t for t in load_sales_campaign_tasks() if t["campaign_id"] == c["id"]]
+                    if c.get("contract_url"):
+                        st.markdown(f"📄 계약서: [{c.get('contract_name') or '열기'}]({c['contract_url']})")
+                    _render_invoice_section(c, acc.get("brand_name", ""), my_name in INVOICE_EDITORS, my_name, refresh_sales)
+                    for t in sorted(tasks, key=lambda x: x["week_number"]):
+                        with st.container(border=True):
+                            st.markdown(f"**{t['week_number']}주차 — {t['task_title']}** · 마감 {t.get('due_date') or '-'}")
+                            if t.get("task_description"):
+                                st.caption(t["task_description"])
+                            new_tstatus = st.selectbox(
+                                "상태", ["예정", "진행중", "완료"], index=["예정", "진행중", "완료"].index(t["status"]),
+                                key=f"wtstatus_{t['id']}", label_visibility="collapsed",
+                            )
+                            if st.button("저장", key=f"wtsave_{t['id']}"):
+                                SUPA.table("sales_campaign_tasks").update({"status": new_tstatus}).eq("id", t["id"]).execute()
+                                st.success("저장 완료"); refresh_sales()
     elif my_role == "dev":
         st.markdown("**💻 개발 업무 관리** — 백로그 → 진행중 → 리뷰 → 완료 (칸반 방식)")
         st.caption("전세계 개발팀이 가장 많이 쓰는 방식이에요. 카드를 만들고 상태만 옮기면 됩니다.")
@@ -1917,6 +3499,23 @@ with tab_mywork:
 
     else:
         st.caption("이 이름에는 아직 맞춤 도구가 없어요. 필요하시면 말씀해주세요 — 바로 만들어드릴게요.")
+
+
+with tab_board:
+    st.subheader("📮 요청 게시판")
+    st.caption(
+        "팀원끼리 서로 요청하는 곳이에요. 모두에게 보이고, 담당자는 상태를 바꾸고, 요청한 사람은 내용을 고쳐요. "
+        "마감이 지나면 담당자 홈에 ⚠️ 처리요망이 뜨고, 평일 아침에 모아서 메일이 가요."
+    )
+    if _req_err:
+        st.error(f"❌ 게시판을 불러오지 못했어요 ({_req_err}). DB에 team_requests 테이블이 있는지 확인해주세요.")
+    else:
+        _render_request_board(_req_rows, my_name, _req_today)
+
+
+with tab_leave:
+    st.subheader(f"🏖️ {my_name}님의 휴가")
+    _render_leave_page(my_name, _req_today)
 
 
 with tab_summary:
