@@ -43,6 +43,7 @@
 - 급여·인건비 데이터는 AI 스캔/리포트에서 완전 제외. 다른 직원의 대화·회의 내용 노출 금지(세일즈 회의 알림은 "등록된 업체명이 언급된 회의"만).
 - 사용자는 "감시당한다"가 아니라 "도움받는다"고 느껴야 함. 문구는 간결·구체·담백하게(오글거리는 표현 금지).
 - 직원에게 에러가 나면 **원인을 숨기지 말고** 무엇이 문제인지/어떻게 해결하는지 화면에 보여줄 것.
+- **고르는 동안은 아무것도 실행하지 않는다(10/7 대표 지시).** 여러 값을 고르거나 입력하는 화면은 `st.form`으로 묶고, '저장·등록·확인' 같은 **결정 버튼을 눌렀을 때만** 처리한다(DB 저장·AI 호출·로딩 표시 모두). 선택 즉시 저장되는 방식(`if new != old: update`)은 쓰지 않는다. DB에 저장하는 마지막 버튼은 하나로 두고, 그 전에 '아직 저장되지 않았다'는 안내와 최종 확인표를 보여준다.
 
 ## 6. 이미 겪은 함정 (반복 금지)
 - **엑셀 한글 깨짐**: CSV 다운로드는 반드시 `.encode("utf-8-sig")`(BOM). 안 하면 한국 윈도우 엑셀에서 깨짐.
@@ -53,22 +54,28 @@
 - **Resend Suppressed**: 한 번 반송된 주소는 조용히 발송이 막힘. 이상하면 resend.com > Suppressions 확인.
 - **스크린샷 업로드 400 에러**: 큰 이미지는 API가 거부. Pillow로 1568px 이하로 줄여서 전송(`Pillow`가 requirements에 있어야 함).
 - **st.tabs 안의 위젯 key**: 같은 key를 두 번 쓰면 터짐. 새 위젯엔 고유 key.
+- **성공 메시지 증발**: `st.success(...)` 바로 뒤에 `st.rerun()`/`refresh()`를 하면 메시지가 사라진다 → `_flash("메시지")`(다음 화면 맨 위에 표시)를 쓸 것.
+- **폼 안의 위젯 key와 이전 입력값**: 같은 key는 이전 배치의 값이 남는다(예: 신분증 확인 체크가 미리 켜짐). 새 목록을 만들 때 key에 버전(`pay_ver`)을 붙여 초기화.
+- **폼 안에서는 `st.button`이 안 된다** → `st.form_submit_button`. 폼 안 위젯 값은 제출 전까지 서버에 안 오므로, 값에 따라 칸이 나타나고 사라지는 화면(휴가 신청 미리보기 등)은 폼으로 만들지 말 것.
 - **Python 3.13 / f-string**: 중첩 따옴표 f-string은 피하고 변수로 분리.
 
 ## 7. DB 주요 테이블 (public)
 - 직원/업무: `okr_org`, `okr_items`(is_recurring=KPI, due_date), `daily_activity_log`, `assigned_tasks`, `data_completeness_prompts`, `ai_drafted_updates`, `kpi_alignment_suggestions`, `kpi_data_sources`, `company_vision`
 - 역할별 도구: `sales_accounts/issues/campaigns/campaign_tasks/meeting_alerts`, `dev_tasks`, `influencer_pool`, `casting_funnel`
 - 휴가: `leave_profiles`(입사일·연 부여일수 기본 15, 본인이 최초 1회 입력·수정은 DB에서), `leave_requests`(연차 8h·반차 4h·반반차 2h, 취소는 canceled_at). 입사 1년 미만=월 1일씩 발생분만, 1년 이상=올해 15일 자유 사용. 둘 다 RLS 켜짐
-- 팀 협업: `team_requests`(요청 게시판: 요청자·담당자·마감·상태, 마감 지나면 홈에 ⚠️ 처리요망), `team_comments`(댓글, target_type=request/campaign/account/date). 둘 다 RLS 켜짐(서비스 키로만 접근)
+- 팀 협업: `team_requests`(요청 게시판: 요청자·담당자·마감·상태, 마감 지나면 홈에 ⚠️ 처리요망), `team_comments`(댓글, target_type=request/campaign/account/date, 파일 첨부 attachment_url/name). 둘 다 RLS 켜짐(서비스 키로만 접근)
 - 재무: `bank_transactions`(dedup_hash 유니크), `bankda_*`, `cash_events`, `fin_*`, `tax_invoices`, `fin_cash_forecasts`(예정입출금 신고), `payment_requests`(인플루언서 송금: 통화·페이팔/안내메일 분리·dedup_key·batch_id·report_complete)
 - 메일/드라이브: `email_log`, `drive_file_index`, `drive_scan_log`, `meetings`
 - ⚠️ `drive_*`, `campaigns`, `brands`, `sales_brands`, `sales_revenue_monthly`, `assistant_notifications` 등은 다른 세션에서 만들어진 것으로 보임 — 사용 전 스키마와 쓰임 확인.
 
 ## 8. 알려진 미해결 / 확인 필요
+- **캠페인 흐름(10/7 대표 지시)**: 김선재가 `🧰 내 업무 → 📝 캠페인 등록`에서 캠페인(+계약서·인보이스)을 등록하면 → 모든 직원의 `📋 캠페인` 탭 위쪽 **캠페인 캘린더**에 보이고(곽재선·이단우는 `🧰 내 업무`에도), 캘린더 아래에서 의견·댓글·파일첨부로 참여한다(`_render_campaign_hub`). `📋 캠페인` 탭 아래쪽은 기존 '인플루언서 매칭 현황'(배치 관리·구글시트 일괄 등록). 인보이스 금액·링크는 담당자(김선재)만 보임.
+- **캠페인 흐름 2단계(미구현, 결정·샘플 필요)**: ① 인보이스의 서비스 항목(품목·수량)을 읽어 캠페인 '해줘야 할 서비스'로 저장 ② 서비스를 충족하는 인플루언서 매칭 목표·진행률(배치를 캠페인에 연결) ③ 직원 전체 '구글시트 연동' 활성화.
 - 크론의 Google Drive 서비스계정 스캔(`kpi_context_sync.py`)이 결과 0건. (대화형 Claude의 Drive 커넥터는 정상 → 서로 다른 경로.) 근본 원인 미확정.
 - 원칙상 "재무 완료 상태는 은행거래 매칭으로만" 인데, 현재 `payment_requests`엔 수동 "송금완료 처리" 버튼이 있음. 둘의 정합성 정리 필요.
 - `support_chat_staff` 테이블 RLS 비활성(보안): `ALTER TABLE public.support_chat_staff ENABLE ROW LEVEL SECURITY;` 및 정책 설계 필요.
 - 지출기안서 링크는 현재 선택사항. 추후 승인 플로우에서 필수화 예정.
 - 직원이 실제로 쓰는 시트/양식이 제각각이라 송금정보 읽기 정확도는 계속 개선 대상.
+- (10/7 회의 결정) Anthropic API 크레딧 소진으로 송금 시트 AI 추출은 당분간 쓰지 않음 → **표준 양식(CSV/엑셀) 다운로드 → 캠페인별 작성 → 업로드 등록**이 기본 경로(`📥 인플루언서 송금정보 등록`, AI 없이 읽음). AI 자유양식 읽기·시트 연동 버튼은 추후. '재무' 메뉴 명칭은 '인플루언서 송금'으로 변경됨.
 - 처리요망 알림 메일 `scripts/send_overdue_digest.py`(마감 지난 요청을 담당자 본인에게 하루 1통): 아직 Railway Cron 서비스로 등록 안 됨(`0 0 * * 1-5`, UTC). 등록 전에는 홈의 ⚠️ 표시만 동작. 먼저 `--dry-run`으로 확인.
 - 요청 게시판의 '마감 지나면 팀 전체에 알림'과 주간 팀 메일은 보류(대표님이 결정 후 진행). 대표용 메뉴는 `brandslamContract` 레포에서 대표님이 직접 관리.
