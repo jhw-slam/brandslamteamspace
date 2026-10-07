@@ -1467,6 +1467,106 @@ def _render_leave_page(my_name, today):
         } for x in team]), hide_index=True, use_container_width=True)
 
 
+PAYMENT_TEMPLATE_HEADERS = ["이름", "금액", "통화", "결제수단", "콘텐츠링크", "방문일", "업로드일", "송금예정일", "신분증링크", "브랜드"]
+PAYMENT_TEMPLATE_SAMPLE = ["홍길동(예시 — 이 줄은 지우거나 그대로 둬도 무시돼요)", "150000", "KRW", "하나은행 123-456789-01", "https://instagram.com/p/xxxx",
+                           "2026-10-01", "2026-10-05", "2026-10-10", "https://drive.google.com/...", "브랜드A, 브랜드B"]
+_STD_PAY_ALIASES = {
+    "influencer_name": ["이름", "성명", "인플루언서", "인플루언서명", "name"],
+    "amount": ["금액", "송금액", "amount"],
+    "currency": ["통화", "currency"],
+    "payment_method_raw": ["결제수단", "결제정보", "계좌", "계좌정보", "페이팔", "paypal"],
+    "content_link": ["콘텐츠링크", "콘텐츠url", "업로드링크", "uploadurl", "contentlink"],
+    "visit_date": ["방문일", "방문날짜"],
+    "upload_date": ["업로드일", "업로드날짜"],
+    "scheduled_date": ["송금예정일", "송금일", "지급예정일"],
+    "id_doc_link": ["신분증링크", "신분증", "신분증사본"],
+    "brand_names": ["브랜드", "브랜드사", "참여브랜드", "브랜드명"],
+}
+_STD_CURRENCY = {"KRW": "KRW", "원": "KRW", "₩": "KRW", "USD": "USD", "$": "USD", "달러": "USD", "EUR": "EUR", "€": "EUR",
+                 "유로": "EUR", "GBP": "GBP", "£": "GBP", "JPY": "JPY", "¥": "JPY", "엔": "JPY"}
+
+
+def _std_norm(v):
+    return re.sub(r"[\s_\-]+", "", str(v if v is not None else "")).lower()
+
+
+def _std_header_map(row):
+    """한 행이 표준 양식의 제목줄이면 {필드: 열 위치}를, 아니면 {}를 돌려준다(이름·금액 열이 있어야 제목줄로 인정)."""
+    rev = {_std_norm(a): f for f, al in _STD_PAY_ALIASES.items() for a in al}
+    cols = {}
+    for i, cell in enumerate(row):
+        f = rev.get(_std_norm(cell))
+        if f and f not in cols:
+            cols[f] = i
+    return cols if "influencer_name" in cols and "amount" in cols else {}
+
+
+def _parse_standard_payment_sheets(sheets, existing_keys):
+    """표준 양식 파일을 AI 없이 읽는다. 반환: (등록 후보 행 목록, 읽지 못한 행 이유 목록, 건너뛴 중복 수).
+    한 탭 안에 제목줄이 또 나오면 거기서부터 새 표로 읽는다. 읽을 수 없는 행은 조용히 버리지 않고 이유를 남긴다."""
+    rows, problems, dup = [], [], 0
+    seen = set(existing_keys)
+    for sheet_name, df in sheets.items():
+        cols = {}
+        for r_i, raw in enumerate(df.fillna("").astype(str).values.tolist()):
+            row_no = r_i + 1
+            hm = _std_header_map(raw)
+            if hm:
+                cols = hm
+                continue
+            if not cols:
+                continue
+            if not any(c.strip() for c in raw):
+                continue
+            get = lambda f: (raw[cols[f]].strip() if f in cols and cols[f] < len(raw) else "")
+            where = f"{sheet_name} {row_no}행" if len(sheets) > 1 else f"{row_no}행"
+            name, amount_raw, content_link = get("influencer_name"), get("amount"), get("content_link")
+            if "xxxx" in content_link or "예시" in name:
+                continue  # 양식에 들어 있는 예시 줄
+            if not name:
+                problems.append(f"{where}: 이름이 비어 있어요")
+                continue
+            amount = _clean_number(amount_raw)
+            if not amount:
+                problems.append(f"{where} ({name}): 금액을 읽을 수 없어요 ('{amount_raw}')")
+                continue
+            currency = None
+            cur_raw = get("currency")
+            if cur_raw:
+                currency = _STD_CURRENCY.get(cur_raw.strip().upper()) or _STD_CURRENCY.get(cur_raw.strip())
+                if not currency:
+                    problems.append(f"{where} ({name}): 통화를 읽을 수 없어요 ('{cur_raw}') — KRW/USD/EUR/GBP/JPY 중 하나로 적어주세요")
+                    continue
+            dates = {}
+            for f, f_ko in (("visit_date", "방문일"), ("upload_date", "업로드일"), ("scheduled_date", "송금예정일")):
+                raw_d = get(f)
+                dates[f] = _clean_date(raw_d) if raw_d else None
+                if raw_d and not dates[f]:
+                    problems.append(f"{where} ({name}): {f_ko} 형식을 읽을 수 없어서 비워뒀어요 ('{raw_d}') — 아래에서 직접 채워주세요")
+            pm = get("payment_method_raw") or None
+            dedup_key = hashlib.md5(f"{content_link or ''}|{dates['visit_date'] or ''}|{amount}".encode("utf-8")).hexdigest()
+            if dedup_key in seen:
+                dup += 1
+                continue
+            seen.add(dedup_key)
+            rows.append({
+                "influencer_name": name, "tiktok_url": None, "instagram_url": None,
+                "visit_date": dates["visit_date"], "upload_date": dates["upload_date"], "content_link": content_link or None,
+                "payment_method_raw": pm, "id_doc_link": get("id_doc_link") or None, "amount": amount,
+                "scheduled_date": dates["scheduled_date"], "paypal_email": _extract_email(pm) if pm else None,
+                "notification_email": None, "payment_destination_verified": bool(pm and pm not in ("-", "")),
+                "dedup_key": dedup_key, "brand_names": get("brand_names") or None, "currency": currency,
+            })
+    return rows, problems, dup
+
+
+def _payment_template_xlsx():
+    buf = io.BytesIO()
+    with pd.ExcelWriter(buf, engine="openpyxl") as w:
+        pd.DataFrame([PAYMENT_TEMPLATE_SAMPLE], columns=PAYMENT_TEMPLATE_HEADERS).to_excel(w, index=False, sheet_name="송금정보")
+    return buf.getvalue()
+
+
 def _api_error_text(status, body):
     """Claude API 오류를 직원이 이해할 수 있는 말로 바꾼다(원문도 같이 보여줘서 원인을 숨기지 않는다)."""
     body = str(body or "")
@@ -1644,8 +1744,11 @@ def load_placements():
 
 
 @st.cache_data(ttl=20)
-def load_activity_log(limit=15):
-    return SUPA.table("daily_activity_log").select("*").order("created_at", desc=True).limit(limit).execute().data
+def load_activity_log(limit=15, person=None):
+    q = SUPA.table("daily_activity_log").select("*")
+    if person:
+        q = q.eq("staff_name", person)
+    return q.order("created_at", desc=True).limit(limit).execute().data
 
 
 @st.cache_data(ttl=20)
@@ -1704,7 +1807,7 @@ _req_rows, _req_err = load_team_requests()
 _req_today = _today_kst()
 _my_overdue = sum(1 for r in _req_rows if r["assignee"] == my_name and _req_days_overdue(r, _req_today))
 tab_home, tab_okr, tab_log, tab_campaign, tab_finance, tab_mywork, tab_board, tab_leave, tab_summary, tab_org = st.tabs([
-    "🏠 홈", "🎯 목표", "📝 오늘 기록", "📋 캠페인", "💰 재무", "🧰 내 업무",
+    "🏠 홈", "🎯 목표", "📝 오늘 기록", "📋 캠페인", "💸 인플루언서 송금", "🧰 내 업무",
     "📮 요청 게시판" + (f" ⚠️{_my_overdue}" if _my_overdue else ""), "🏖️ 휴가", "📊 요약", "🏢 조직도",
 ])
 
@@ -1851,13 +1954,19 @@ with tab_okr:
         return org, items
 
 
-    with st.expander("열기 (평소엔 접어둠)", expanded=False):
+    with st.expander("열기 (내 OKR이 먼저 보여요)", expanded=False):
         st.caption("전사 목표(OKR)를 참고용으로 보여드려요. 여기서는 수정이 안 되고 확인만 하는 용도예요 — 편집은 기존 OKR 페이지에서 계속 하시면 됩니다.")
         okr_org_data, okr_items_data = load_okr()
 
         if not okr_org_data:
             st.caption("등록된 OKR이 없습니다.")
         else:
+            _okr_people = [o["person"] for o in okr_org_data]
+            if my_name in _okr_people and st.session_state.get("_okr_default_for") != my_name:
+                # '내 이름'을 고르거나 바꿀 때마다 그 사람의 OKR이 먼저 보이게 기본값을 맞춘다
+                st.session_state["okr_view_mode"] = "👤 개별 보기"
+                st.session_state["okr_indiv_person"] = my_name
+                st.session_state["_okr_default_for"] = my_name
             okr_view = st.radio("보기", ["🏢 회사 전체 OKR", "👤 개별 보기"], horizontal=True, key="okr_view_mode")
 
             if okr_view == "🏢 회사 전체 OKR":
@@ -2056,9 +2165,12 @@ with tab_log:
                     st.session_state["pending_okr_suggestions"] = [s for s in st.session_state["pending_okr_suggestions"] if s is not sug]
                     st.rerun()
 
-    recent_logs = load_activity_log()
+    log_scope = st.radio("최근 기록 보기", ["👤 내 기록", "👥 팀 전체"], horizontal=True, key="log_scope")
+    recent_logs = load_activity_log(person=my_name if log_scope == "👤 내 기록" else None)
+    if not recent_logs:
+        st.caption("보여드릴 기록이 아직 없어요." if log_scope == "👤 내 기록" else "팀 기록이 아직 없어요.")
     if recent_logs:
-        with st.expander(f"최근 기록 {len(recent_logs)}건 보기"):
+        with st.expander(f"최근 기록 {len(recent_logs)}건 보기", expanded=log_scope == "👤 내 기록"):
             for lg in recent_logs:
                 when = lg["created_at"][:16].replace("T", " ")
                 extra = []
@@ -2456,21 +2568,59 @@ with tab_finance:
     # ══════════════════════════════════════════════════════════
     # 📥 인플루언서 송금정보 — 구글시트에서 바로 읽어오기
     # ══════════════════════════════════════════════════════════
-    st.subheader("📥 인플루언서 송금정보 (구글시트에서 바로 읽어오기)")
+    st.subheader("📥 인플루언서 송금정보 등록")
+    st.info(
+        "**당분간은 표준 양식으로 등록해요 (AI 없이 바로 읽혀요):** ① 아래 양식 다운로드 → ② 캠페인별로 시트 작성 → ③ 파일을 올려서 등록. "
+        "구글시트에서 만들었다면 '파일 → 다운로드 → CSV 또는 엑셀'로 내려받은 파일을 올리면 돼요."
+    )
+    tpl_csv = (",".join(PAYMENT_TEMPLATE_HEADERS) + "\n" + ",".join(f'"{v}"' if "," in v else v for v in PAYMENT_TEMPLATE_SAMPLE) + "\n").encode("utf-8-sig")
+    dl1, dl2, dl3 = st.columns([1, 1, 3])
+    dl1.download_button("📋 표준 양식 (CSV)", data=tpl_csv, file_name="송금정보_양식.csv", mime="text/csv", key="download_payment_template", use_container_width=True)
+    dl2.download_button(
+        "📗 표준 양식 (엑셀)", data=_payment_template_xlsx(), file_name="송금정보_양식.xlsx",
+        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", key="download_payment_template_xlsx", use_container_width=True,
+    )
+    dl3.caption("열: " + " · ".join(PAYMENT_TEMPLATE_HEADERS) + " — 브랜드가 여러 개면 콤마로 적고, 통화는 KRW/USD/EUR/GBP/JPY 중 하나로 적어주세요.")
+    std_file = st.file_uploader("작성한 표준 양식 올리기 (CSV·엑셀)", type=["csv", "xlsx"], key="pay_std_file")
+    if st.button("📥 표준 양식 불러오기", key="pay_std_load", type="primary"):
+        if std_file is None:
+            st.error("작성한 양식 파일을 먼저 올려주세요.")
+        else:
+            std_sheets, std_err = _read_uploaded_sheet_file(std_file)
+            if std_sheets is None:
+                st.error(f"❌ {std_err}")
+            else:
+                std_existing = {
+                    r["dedup_key"] for r in SUPA.table("payment_requests").select("dedup_key").execute().data if r.get("dedup_key")
+                }
+                std_rows, std_problems, std_dup = _parse_standard_payment_sheets(std_sheets, std_existing)
+                st.session_state["pay_std_problems"] = std_problems
+                if not std_rows:
+                    st.error(
+                        "❌ 등록할 행을 못 찾았어요. 표준 양식의 제목줄(이름·금액 열)이 있는지 확인해주세요."
+                        + (f" (이미 등록된 {std_dup}건은 제외)" if std_dup else "")
+                    )
+                else:
+                    st.session_state["payment_rows_preview"] = std_rows
+                    st.session_state.pop("payment_mapping_desc", None)
+                    st.session_state.pop("payment_all_sheets", None)
+                    st.session_state["payment_extract_msg"] = (
+                        f"✅ 표준 양식에서 {len(std_rows)}건을 읽었어요."
+                        + (f" (이미 등록된 {std_dup}건 제외)" if std_dup else "")
+                        + (f" 읽지 못한 행 {len(std_problems)}개는 아래에서 확인하세요." if std_problems else "")
+                    )
+                    st.rerun()
+    if st.session_state.get("pay_std_problems"):
+        with st.expander(f"⚠️ 읽지 못했거나 확인이 필요한 행 {len(st.session_state['pay_std_problems'])}개", expanded=True):
+            for pr in st.session_state["pay_std_problems"]:
+                st.caption(f"- {pr}")
+
+    st.markdown("---")
+    st.subheader("🤖 자유 양식 시트를 AI가 읽기 (Claude 크레딧 필요)")
     st.caption(
-        "열 순서가 시트마다 달라도 괜찮아요 — Claude가 각 행의 내용을 보고 이름·금액·결제수단·링크를 알아서 찾아냅니다. "
-        "같은 콘텐츠를 다시 올려도 중복 등록되지 않아요."
+        "표준 양식이 아닌 기존 시트를 그대로 올릴 때만 써요. 열 순서가 달라도 Claude가 각 행의 내용을 보고 이름·금액·결제수단·링크를 찾아내지만, "
+        "API 크레딧이 없으면 동작하지 않아요(그땐 위의 표준 양식을 쓰세요). 같은 콘텐츠를 다시 올려도 중복 등록되지 않아요."
     )
-    PAYMENT_TEMPLATE_CSV = (
-        "이름,금액,결제수단,콘텐츠링크,방문일,업로드일,송금예정일,신분증링크\n"
-        "홍길동,150000,하나은행 123-456789-01,https://instagram.com/p/xxxx,2026-10-01,2026-10-05,2026-10-10,https://drive.google.com/...\n"
-    )
-    dl1, dl2 = st.columns([1, 3])
-    dl1.download_button(
-        "📋 표준 양식 다운로드", data=PAYMENT_TEMPLATE_CSV.encode("utf-8-sig"), file_name="송금정보_양식.csv",
-        mime="text/csv", key="download_payment_template",
-    )
-    dl2.caption("이 양식대로 채우시면 가장 정확하게 인식돼요. 다른 형식(기존에 쓰시던 시트)도 AI가 알아서 읽어보려 시도합니다.")
 
     pay_sheet_url = st.text_input("구글시트 링크", key="payment_sheet_url", placeholder="https://docs.google.com/spreadsheets/d/...")
     pay_sheet_file = st.file_uploader(
@@ -2717,8 +2867,9 @@ with tab_finance:
                         placeholder="예: 브랜드A, 브랜드B",
                     ) or None
 
+                _curs = ["KRW", "USD", "EUR", "GBP", "JPY"]
                 r["currency"] = c2.selectbox(
-                    "통화 *", ["KRW", "USD", "EUR", "GBP", "JPY"], key=f"currency_{idx}",
+                    "통화 *", _curs, index=_curs.index(r["currency"]) if r.get("currency") in _curs else 0, key=f"currency_{idx}",
                     help="추측하지 않습니다 — 실제 지급 통화를 정확히 선택해주세요.",
                 )
                 notif_email = c2.text_input(
@@ -3507,6 +3658,13 @@ with tab_board:
         "팀원끼리 서로 요청하는 곳이에요. 모두에게 보이고, 담당자는 상태를 바꾸고, 요청한 사람은 내용을 고쳐요. "
         "마감이 지나면 담당자 홈에 ⚠️ 처리요망이 뜨고, 평일 아침에 모아서 메일이 가요."
     )
+    with st.expander("💡 이 게시판엔 어떤 건을 올리나요?"):
+        st.markdown(
+            "**기록·추적이 꼭 필요한 업무만** 올려주세요 — 담당자와 마감이 있고, 끝났는지 확인해야 하는 요청이에요.\n\n"
+            "- ✅ 게시판: \"10/15까지 닥터리앤장 포스팅 일정 확정해주세요\", \"인플루언서 리스트 정리 부탁드려요\"\n"
+            "- 💬 구글챗: 가벼운 질문, 잡담, 바로 답하면 끝나는 일, 급한 호출\n\n"
+            "게시판에 올린 요청은 마감이 지나면 담당자 홈에 ⚠️ 처리요망으로 떠서 놓치지 않아요."
+        )
     if _req_err:
         st.error(f"❌ 게시판을 불러오지 못했어요 ({_req_err}). DB에 team_requests 테이블이 있는지 확인해주세요.")
     else:
