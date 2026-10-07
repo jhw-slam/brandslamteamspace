@@ -1126,6 +1126,7 @@ def _post_request_comment(req_id, key, author):
     load_request_comments.clear()
 
 
+@st.fragment
 def _render_request_board(rows, my_name, today):
     """요청 게시판: 모두에게 보이고, 담당자는 상태를 바꾸고, 요청한 사람은 내용을 고치고, 누구나 댓글을 단다."""
     if st.session_state.get("req_flash"):
@@ -1366,15 +1367,33 @@ def _leave_label(x):
     return f"{x['kind']}" + (f" {x['slot']}" if x.get("slot") else "")
 
 
+@st.cache_data(ttl=30)
+def load_leave_me(person):
+    prof = SUPA.table("leave_profiles").select("*").eq("person", person).execute().data
+    mine = [x for x in SUPA.table("leave_requests").select("*").eq("person", person).order("leave_date").execute().data
+            if not x.get("canceled_at")]
+    return prof, mine
+
+
+@st.cache_data(ttl=30)
+def load_leave_team(start_iso, end_iso):
+    return [x for x in SUPA.table("leave_requests").select("person,leave_date,kind,slot,hours,canceled_at")
+            .gte("leave_date", start_iso).lte("leave_date", end_iso).order("leave_date").execute().data
+            if not x.get("canceled_at")]
+
+
+def _clear_leave_caches():
+    load_leave_me.clear(); load_leave_team.clear()
+
+
+@st.fragment
 def _render_leave_page(my_name, today):
     """개인별 휴가 신청. 연차(8시간)·반차(4시간)·반반차(2시간)를 자유롭게 쓰고, 남은 휴가를 소수점 일수로 보여준다."""
     st.caption("1일 = 8시간 · 반차 = 4시간(0.5일) · 반반차 = 2시간(0.25일). 남은 휴가는 소수점 일수로 보여드려요.")
     if st.session_state.get("leave_flash"):
         st.success(st.session_state.pop("leave_flash"))
     try:
-        prof_rows = SUPA.table("leave_profiles").select("*").eq("person", my_name).execute().data
-        my_leaves = [x for x in SUPA.table("leave_requests").select("*").eq("person", my_name).order("leave_date").execute().data
-                     if not x.get("canceled_at")]
+        prof_rows, my_leaves = load_leave_me(my_name)
     except Exception as e:
         st.error(f"❌ 휴가 정보를 불러오지 못했어요 ({type(e).__name__}: {e}). DB에 leave_profiles / leave_requests 테이블이 있는지 확인해주세요.")
         return
@@ -1392,6 +1411,7 @@ def _render_leave_page(my_name, today):
                     st.error(f"저장하지 못했어요 ({type(e).__name__}: {e})")
                 else:
                     st.session_state["leave_flash"] = f"입사일({hd.isoformat()})을 저장했어요."
+                    _clear_leave_caches()
                     st.rerun()
         return
 
@@ -1444,6 +1464,7 @@ def _render_leave_page(my_name, today):
             st.error(f"저장하지 못했어요 ({type(e).__name__}: {e})")
         else:
             st.session_state["leave_flash"] = f"휴가를 등록했어요: {_fmt_days(total_h)}일 ({items[0][0].isoformat()}" + (f" ~ {items[-1][0].isoformat()}" if len(items) > 1 else "") + ")"
+            _clear_leave_caches()
             st.rerun()
 
     st.markdown("#### 내 휴가 기록")
@@ -1462,6 +1483,7 @@ def _render_leave_page(my_name, today):
                 st.error(f"취소하지 못했어요 ({type(e).__name__}: {e})")
             else:
                 st.session_state["leave_flash"] = f"{d.isoformat()} {_leave_label(x)} 휴가를 취소했어요. 남은 휴가에 다시 반영했어요."
+                _clear_leave_caches()
                 st.rerun()
     if past:
         with st.expander(f"지난 휴가 {len(past)}건"):
@@ -1474,9 +1496,7 @@ def _render_leave_page(my_name, today):
     start = today.replace(day=1)
     end = _add_months(start, 2) - timedelta(days=1)
     try:
-        team = [x for x in SUPA.table("leave_requests").select("person,leave_date,kind,slot,hours,canceled_at")
-                .gte("leave_date", start.isoformat()).lte("leave_date", end.isoformat()).order("leave_date").execute().data
-                if not x.get("canceled_at")]
+        team = load_leave_team(start.isoformat(), end.isoformat())
     except Exception:
         team = []
     today_off = [x["person"] for x in team if _leave_d(x["leave_date"]) == today]
@@ -1671,6 +1691,7 @@ def _render_hub_thread(ns, target_type, target_id, target_date, my_name, heading
 _TASK_ICON = {"예정": "⚪", "진행중": "🟠", "완료": "✅"}
 
 
+@st.fragment
 def _render_campaign_hub(ns, my_name, can_see_amounts, mine_filter=False):
     """모든 직원이 보는 캠페인 캘린더: 월 달력 + 앞으로 7일 일정 + 캠페인 상세 + 의견·댓글·파일 첨부 + 날짜별 의견.
     캠페인은 세일즈(김선재)가 등록하고, 여기서는 보기 + 의견 남기기만 한다. 금액은 can_see_amounts일 때만 보여준다."""
@@ -2042,10 +2063,72 @@ def load_forecasts():
     return SUPA.table("fin_cash_forecasts").select("*").order("created_at", desc=True).limit(20).execute().data
 
 
+@st.cache_data(ttl=30)
+def load_home_prompts(person):
+    return (SUPA.table("data_completeness_prompts").select("*").eq("person", person).eq("status", "open")
+            .order("created_at", desc=True).execute().data)
+
+
+@st.cache_data(ttl=30)
+def load_home_drafts(person):
+    return (SUPA.table("ai_drafted_updates").select("*").eq("person", person).eq("status", "pending")
+            .order("created_at", desc=True).execute().data)
+
+
+@st.cache_data(ttl=30)
+def load_home_sales_alerts(person):
+    return (SUPA.table("sales_meeting_alerts").select("*").eq("person", person).eq("status", "open")
+            .order("meeting_date", desc=True).execute().data)
+
+
+@st.cache_data(ttl=30)
+def load_home_kpi_gaps(person):
+    return (SUPA.table("kpi_alignment_suggestions").select("*").eq("person", person).eq("status", "open")
+            .eq("suggestion_type", "kpi_gap").order("created_at", desc=True).execute().data)
+
+
+@st.cache_data(ttl=60)
+def load_vision():
+    return SUPA.table("company_vision").select("*").order("updated_at", desc=True).limit(1).execute().data
+
+
+@st.cache_data(ttl=30)
+def load_my_logs(person):
+    return SUPA.table("daily_activity_log").select("*").eq("staff_name", person).order("created_at", desc=True).limit(50).execute().data
+
+
+@st.cache_data(ttl=60)
+def load_okr():
+    org = SUPA.table("okr_org").select("*").order("person").execute().data
+    items = SUPA.table("okr_items").select("*").order("person").execute().data
+    return org, items
+
+
+@st.cache_data(ttl=30)
+def load_my_pending_payments(person):
+    """내가 올린 송금요청 + 캠페인 연결(재확인 표용). 등록·삭제 뒤에는 .clear()."""
+    pend = (SUPA.table("payment_requests").select("*").eq("status", "pending")
+            .eq("submitted_by", person).order("scheduled_date").execute().data)
+    links = []
+    if pend:
+        try:
+            links = SUPA.table("payment_request_campaigns").select("payment_request_id,campaign_id,allocated_amount") \
+                .in_("payment_request_id", [p["id"] for p in pend]).execute().data
+        except Exception:
+            links = []
+    return pend, links
+
+
+def _clear_home_caches():
+    for f in (load_home_prompts, load_home_drafts, load_home_sales_alerts, load_home_kpi_gaps):
+        f.clear()
+
+
 def refresh():
     load_placements.clear()
     load_activity_log.clear()
     load_forecasts.clear()
+    load_my_logs.clear()
     st.rerun()
 
 
@@ -2095,22 +2178,25 @@ if st.session_state.get("flash_msg"):
 _req_rows, _req_err = load_team_requests()
 _req_today = _today_kst()
 _my_overdue = sum(1 for r in _req_rows if r["assignee"] == my_name and _req_days_overdue(r, _req_today))
-tab_home, tab_okr, tab_log, tab_campaign, tab_finance, tab_mywork, tab_board, tab_leave, tab_summary, tab_org = st.tabs([
-    "🏠 홈", "🎯 목표", "📝 오늘 기록", "📋 캠페인", "💸 인플루언서 송금", "🧰 내 업무",
-    "📮 요청 게시판" + (f" ⚠️{_my_overdue}" if _my_overdue else ""), "🏖️ 휴가", "📊 요약", "🏢 조직도",
-])
+_NAV = [
+    ("home", "🏠 홈"), ("okr", "🎯 목표"), ("log", "📝 오늘 기록"), ("campaign", "📋 캠페인"),
+    ("finance", "💸 인플루언서 송금"), ("mywork", "🧰 내 업무"),
+    ("board", "📮 요청 게시판" + (f" ⚠️{_my_overdue}" if _my_overdue else "")),
+    ("leave", "🏖️ 휴가"), ("summary", "📊 요약"), ("org", "🏢 조직도"),
+]
+_NAV_LABEL = dict(_NAV)
+# 선택한 화면만 실행(느림 개선): st.tabs는 안 보이는 탭까지 매번 전부 실행해서 라디오로 교체
+_nav = st.radio("화면", [k for k, _ in _NAV], format_func=_NAV_LABEL.get, horizontal=True,
+                key="main_nav", label_visibility="collapsed")
+st.divider()
 
-with tab_home:
+if _nav == "home":
     # ── 📮 요청 게시판: 마감 지난 요청(⚠️ 처리요망)·새 요청 ──
     if not _req_err:
         _render_my_request_banner(_req_rows, my_name, _req_today)
 
     # ── 📋 채워주세요! (30분마다 도는 완성도 체크가 찾아낸 빈 정보) ──
-    open_prompts = (
-        SUPA.table("data_completeness_prompts")
-        .select("*").eq("person", my_name).eq("status", "open")
-        .order("created_at", desc=True).execute().data
-    )
+    open_prompts = load_home_prompts(my_name)
     if open_prompts:
         st.warning(f"📋 **현황판을 완성하려면 아래 {len(open_prompts)}건이 필요해요** (자동으로 채워지지 않아서 직접 확인 부탁드려요)")
         for p in open_prompts:
@@ -2120,14 +2206,11 @@ with tab_home:
                 SUPA.table("data_completeness_prompts").update({
                     "status": "dismissed",
                 }).eq("id", p["id"]).execute()
+                _clear_home_caches()
                 st.rerun()
 
     # ── 🤖 AI가 미리 준비해둔 내용 (구글드라이브 등에서 발견, 본인 확인만 하면 됨) ──
-    ai_drafts = (
-        SUPA.table("ai_drafted_updates").select("*")
-        .eq("person", my_name).eq("status", "pending")
-        .order("created_at", desc=True).execute().data
-    )
+    ai_drafts = load_home_drafts(my_name)
     if ai_drafts:
         st.info(f"🤖 **구글드라이브 등에서 업무 관련 내용을 확인했어요** — 아래 {len(ai_drafts)}건, 맞는지만 봐주세요")
         for d in ai_drafts:
@@ -2138,6 +2221,7 @@ with tab_home:
                     SUPA.table("ai_drafted_updates").update({
                         "status": "applied", "resolved_at": pd.Timestamp.now(tz="UTC").isoformat(),
                     }).eq("id", d["id"]).execute()
+                    _clear_home_caches()
                     st.rerun()
                 correction = dc2.text_input(
                     "틀린 부분 있으면 여기에 자유롭게 적어주세요", key=f"correction_{d['id']}",
@@ -2148,43 +2232,44 @@ with tab_home:
                         "status": "correction_requested", "correction_note": correction.strip(),
                     }).eq("id", d["id"]).execute()
                     _flash("제출 완료! 30분 안에 알아서 정리해둘게요.")
+                    _clear_home_caches()
                     st.rerun()
 
     # ── 📼 세일즈 전용: 등록된 업체명이 언급된 회의만 알림 (기밀 보호) ──
     if my_role == "sales":
-        sales_alerts = (
-            SUPA.table("sales_meeting_alerts").select("*")
-            .eq("person", my_name).eq("status", "open")
-            .order("meeting_date", desc=True).execute().data
-        )
+        sales_alerts = load_home_sales_alerts(my_name)
         if sales_alerts:
             st.info(f"📼 **담당하시는 업체 관련 회의가 있었어요** — {len(sales_alerts)}건 (등록된 업체명이 언급된 회의만 보여드려요)")
-            for al in sales_alerts:
-                with st.container(border=True):
-                    when = al["meeting_date"][:10] if al.get("meeting_date") else ""
-                    st.markdown(f"**[{al['brand_matched']}]** {al.get('meeting_title') or ''} · {when}")
-                    if al.get("summary_snippet"):
-                        st.caption(al["summary_snippet"])
-                    ac1, ac2 = st.columns(2)
-                    if ac1.button("✅ 업무보고에 반영해주세요", key=f"reflect_meeting_{al['id']}", use_container_width=True):
-                        SUPA.table("ai_drafted_updates").insert({
-                            "person": my_name, "source": "meeting", "source_ref": str(al["meeting_id"]),
-                            "target_table": "sales_accounts",
-                            "draft_content": f"[{al['brand_matched']}] 관련 회의 내용: {al.get('summary_snippet') or ''}",
-                        }).execute()
-                        SUPA.table("sales_meeting_alerts").update({"status": "reflected"}).eq("id", al["id"]).execute()
-                        _flash("반영 요청 접수! 위 'AI가 준비해둔 내용'에서 곧 확인하실 수 있어요.")
-                        st.rerun()
-                    if ac2.button("그냥 참고만 할게요", key=f"dismiss_meeting_{al['id']}", use_container_width=True):
-                        SUPA.table("sales_meeting_alerts").update({"status": "dismissed"}).eq("id", al["id"]).execute()
-                        st.rerun()
+            _SNIP = 90  # 카드에는 앞부분만, 나머지는 '더보기'
+            for _row_start in range(0, len(sales_alerts), 3):  # 와이드 화면에 카드 3개씩
+                for _col, al in zip(st.columns(3), sales_alerts[_row_start:_row_start + 3]):
+                    with _col.container(border=True):
+                        when = al["meeting_date"][:10] if al.get("meeting_date") else ""
+                        st.markdown(f"**[{al['brand_matched']}]** {al.get('meeting_title') or ''}")
+                        st.caption(when)
+                        snip = al.get("summary_snippet") or ""
+                        if snip:
+                            st.caption(snip if len(snip) <= _SNIP else snip[:_SNIP].rstrip() + "…")
+                            if len(snip) > _SNIP:
+                                with st.expander("더보기"):
+                                    st.write(snip)
+                        if st.button("✅ 업무보고에 반영", key=f"reflect_meeting_{al['id']}", use_container_width=True):
+                            SUPA.table("ai_drafted_updates").insert({
+                                "person": my_name, "source": "meeting", "source_ref": str(al["meeting_id"]),
+                                "target_table": "sales_accounts",
+                                "draft_content": f"[{al['brand_matched']}] 관련 회의 내용: {al.get('summary_snippet') or ''}",
+                            }).execute()
+                            SUPA.table("sales_meeting_alerts").update({"status": "reflected"}).eq("id", al["id"]).execute()
+                            _flash("반영 요청 접수! 위 'AI가 준비해둔 내용'에서 곧 확인하실 수 있어요.")
+                            _clear_home_caches()
+                            st.rerun()
+                        if st.button("참고만 할게요", key=f"dismiss_meeting_{al['id']}", use_container_width=True):
+                            SUPA.table("sales_meeting_alerts").update({"status": "dismissed"}).eq("id", al["id"]).execute()
+                            _clear_home_caches()
+                            st.rerun()
 
     # ── 🧭 내 KPI 데이터 정렬 제안 (kpi_gap만 — 본인 데이터라 바로 처리) ──
-    my_kpi_gaps = (
-        SUPA.table("kpi_alignment_suggestions").select("*")
-        .eq("person", my_name).eq("status", "open").eq("suggestion_type", "kpi_gap")
-        .order("created_at", desc=True).execute().data
-    )
+    my_kpi_gaps = load_home_kpi_gaps(my_name)
     if my_kpi_gaps:
         st.info(f"🧭 **내 KPI 추적 관련 제안이 있어요** — {len(my_kpi_gaps)}건 (Claude가 목표랑 실제 데이터를 비교해서 찾은 것)")
         for g in my_kpi_gaps:
@@ -2203,9 +2288,11 @@ with tab_home:
                         }).execute()
                     SUPA.table("kpi_alignment_suggestions").update({"status": "applied"}).eq("id", g["id"]).execute()
                     _flash("등록 완료! 다음부터 이 소스를 참고해서 분석할게요.")
+                    _clear_home_caches()
                     st.rerun()
                 if st.button("아직 없어요 / 나중에", key=f"kpigap_skip_{g['id']}"):
                     SUPA.table("kpi_alignment_suggestions").update({"status": "dismissed"}).eq("id", g["id"]).execute()
+                    _clear_home_caches()
                     st.rerun()
 
     st.divider()
@@ -2213,7 +2300,7 @@ with tab_home:
     # ══════════════════════════════════════════════════════════
     # 🧭 회사 비전 (항상 보임 — 모두가 바라보는 방향)
     # ══════════════════════════════════════════════════════════
-    vision_data = SUPA.table("company_vision").select("*").order("updated_at", desc=True).limit(1).execute().data
+    vision_data = load_vision()
     if vision_data:
         v = vision_data[0]
         st.markdown(
@@ -2229,18 +2316,11 @@ with tab_home:
     st.divider()
 
 
-with tab_okr:
+if _nav == "okr":
     # ══════════════════════════════════════════════════════════
     # 🎯 팀 OKR 현황 (읽기 전용 — 기존 OKR 자료 그대로, 편집 기능 없음)
     # ══════════════════════════════════════════════════════════
     st.subheader("🎯 팀 OKR 현황")
-
-
-    @st.cache_data(ttl=60)
-    def load_okr():
-        org = SUPA.table("okr_org").select("*").order("person").execute().data
-        items = SUPA.table("okr_items").select("*").order("person").execute().data
-        return org, items
 
 
     with st.expander("열기 (내 OKR이 먼저 보여요)", expanded=False):
@@ -2340,7 +2420,7 @@ with tab_okr:
 
 
 
-with tab_log:
+if _nav == "log":
     # ══════════════════════════════════════════════════════════
     # 🖊️ 오늘 빠른 기록
     # ══════════════════════════════════════════════════════════
@@ -2417,7 +2497,8 @@ with tab_log:
                 "link_url": quick_link.strip() or None, "attachment_url": attachment_url,
             }).execute()
 
-            my_okr_items = [it for it in okr_items_data if it["person"] == my_name]
+            _, _okr_all = load_okr()
+            my_okr_items = [it for it in _okr_all if it["person"] == my_name]
             suggestions, err = suggest_okr_match(quick_note.strip(), my_okr_items)
             if suggestions:
                 st.session_state["pending_okr_suggestions"] = suggestions
@@ -2431,7 +2512,7 @@ with tab_log:
     pending = st.session_state.get("pending_okr_suggestions") or []
     if pending:
         st.markdown("🤖 **방금 기록을 보고 이 항목들이 떠올랐어요 — 진행치를 반영할까요?**")
-        item_by_id = {it["id"]: it for it in okr_items_data}
+        item_by_id = {it["id"]: it for it in load_okr()[1]}
         for sug in list(pending):
             it = item_by_id.get(sug.get("item_id"))
             if not it:
@@ -2494,7 +2575,7 @@ with tab_log:
                             st.rerun()
 
 
-with tab_campaign:
+if _nav == "campaign":
     # ══════════════════════════════════════════════════════════
     # 🗓️ 캠페인 캘린더 — 모든 직원이 보는 화면(김선재님이 등록한 캠페인이 그대로 보임)
     # ══════════════════════════════════════════════════════════
@@ -2833,7 +2914,7 @@ with tab_campaign:
                             refresh()
 
 
-with tab_finance:
+if _nav == "finance":
     # ══════════════════════════════════════════════════════════
     # 📢 예정입출금 신고 (구 12_지출예정보고 통합)
     # ══════════════════════════════════════════════════════════
@@ -2923,6 +3004,7 @@ with tab_finance:
                         + (f" (이미 등록된 {std_dup}건 제외)" if std_dup else "")
                         + (f" 읽지 못한 행 {len(std_problems)}개는 아래에서 확인하세요." if std_problems else "")
                     )
+                    load_my_pending_payments.clear()
                     st.rerun()
     if st.session_state.get("pay_std_problems"):
         with st.expander(f"⚠️ 읽지 못했거나 확인이 필요한 행 {len(st.session_state['pay_std_problems'])}개", expanded=True):
@@ -2987,6 +3069,7 @@ with tab_finance:
         if struct_cancel:
             for k in ("payment_mapping_desc", "payment_all_sheets"):
                 st.session_state.pop(k, None)
+            load_my_pending_payments.clear()
             st.rerun()
         if struct_go:
             chosen = _collect_sections(all_sheets_now)
@@ -3014,6 +3097,7 @@ with tab_finance:
         if extract_cancel:
             for k in ("payment_mapping_desc", "payment_all_sheets"):
                 st.session_state.pop(k, None)
+            load_my_pending_payments.clear()
             st.rerun()
         if extract_go:
             all_sheets = all_sheets_now
@@ -3053,6 +3137,7 @@ with tab_finance:
                 st.session_state["payment_extract_msg"] = msg
                 st.session_state.pop("payment_mapping_desc", None)
                 st.session_state.pop("payment_all_sheets", None)
+                load_my_pending_payments.clear()
                 st.rerun()
 
     st.markdown("**또는, 더 간단하게:**")
@@ -3148,6 +3233,7 @@ with tab_finance:
                         st.session_state.get("payment_rows_preview") or []
                     ) + shot_rows
                     _flash(f"{len(shot_rows)}건 인식됨. 아래에서 확인해주세요.")
+                    load_my_pending_payments.clear()
                     st.rerun()
 
     pay_preview = st.session_state.get("payment_rows_preview")
@@ -3391,20 +3477,13 @@ with tab_finance:
                             f"✅ {len(saved_keys)}건이 DB에 저장됐어요! 대표님 재무캘린더에서 송금 처리해주실 거고, 구정회님께도 마진데이터 알림을 보냈어요."
                         )
                     st.session_state.pop("pay_dup_lines", None)
+                    load_my_pending_payments.clear()
                     st.rerun()
 
     # 재확인용: 내가 등록한 것만 보여줌 (송금 처리/완료 버튼은 재무캘린더=대표 전용)
-    my_pending_payments = (
-        SUPA.table("payment_requests").select("*").eq("status", "pending")
-        .eq("submitted_by", my_name).order("scheduled_date").execute().data
-    )
+    my_pending_payments, _links = load_my_pending_payments(my_name)
     if my_pending_payments:
         st.markdown(f"**💸 내가 등록한 송금요청 — 재확인용 ({len(my_pending_payments)}건, 대표님 처리 대기중)**")
-        _pid_list = [p["id"] for p in my_pending_payments]
-        try:
-            _links = SUPA.table("payment_request_campaigns").select("payment_request_id,campaign_id,allocated_amount").in_("payment_request_id", _pid_list).execute().data
-        except Exception:
-            _links = []
         _mc, _ = load_match_campaigns()
         _mc_label = {c["id"]: c["label"].split(" · 오픈")[0] for c in _mc}
         _linked_by_pid = {}
@@ -3434,11 +3513,12 @@ with tab_finance:
                         st.error(err)
                     else:
                         _flash(f"{p['influencer_name']} 송금을 {len(pick)}개 캠페인에 연결했어요.")
+                        load_my_pending_payments.clear()
                         st.rerun()
         st.caption("내용이 틀렸으면 구글시트 수정 후 다시 불러와서 등록해주세요. 송금 완료 처리는 대표님이 재무캘린더에서 하시면 자동으로 알림 메일이 나가요.")
 
 
-with tab_mywork:
+if _nav == "mywork":
     # ══════════════════════════════════════════════════════════
     # 📇 B2B 브랜드 관리 (세일즈) — 캘린더·계정·이슈·캠페인 주차루틴
     # ══════════════════════════════════════════════════════════
@@ -3492,14 +3572,17 @@ with tab_mywork:
         account_by_id = {a["id"]: a for a in all_sales_accounts}
         STATUS_OPTS_ACC = ["협상중", "계약완료", "운영중", "종료", "이탈"]
 
-        tab_reg, tab_big, tab_fc, tab_cal, tab_acc, tab_issue, tab_camp = st.tabs(["📝 캠페인 등록", "🗓️ 큰 캘린더", "🔮 다음달 예측", "📅 일정 한눈에보기", "🏢 계정 관리", "🐛 이슈", "🚀 캠페인·주차루틴"])
+        _SALES_NAV = {"reg": "📝 캠페인 등록", "big": "🗓️ 큰 캘린더", "fc": "🔮 다음달 예측", "cal": "📅 일정 한눈에보기",
+                      "acc": "🏢 계정 관리", "issue": "🐛 이슈", "camp": "🚀 캠페인·주차루틴"}
+        _snav = st.radio("세일즈 화면", list(_SALES_NAV), format_func=_SALES_NAV.get, horizontal=True,
+                         key="sales_nav", label_visibility="collapsed")
 
         # ── 📅 일정 한눈에보기 ──────────────────────────────────
-        with tab_big:
+        if _snav == "big":
             st.caption("모든 직원의 '📋 캠페인' 탭에도 똑같이 보여요. 여기서 등록한 캠페인과 인보이스가 그대로 반영됩니다.")
             _render_campaign_hub("hubsales", my_name, True, mine_filter=True)
 
-        with tab_fc:
+        if _snav == "fc":
             _t = date.today()
             _ny, _nm = _month_add(_t.year, _t.month, 1)
             st.markdown(f"**{_ny}년 {_nm}월 캠페인 예측** — 등록된 캠페인·계정 정보만으로 계산해요. 근거가 없으면 만들어내지 않고 '낮음'으로 둡니다.")
@@ -3551,7 +3634,7 @@ with tab_mywork:
                 st.markdown("**월별 캠페인 시작 건수** (마지막 달 = 다음달 확정 건수)")
                 st.bar_chart(pd.DataFrame({"캠페인 수": _series}, index=_labels))
 
-        with tab_cal:
+        if _snav == "cal":
             st.markdown("**다가오는 일정**")
             all_tasks = load_sales_campaign_tasks()
             all_campaigns_map = {c["id"]: c for c in load_sales_campaigns()}
@@ -3575,7 +3658,7 @@ with tab_mywork:
                 st.dataframe(cal_df[["날짜", "브랜드", "종류", "내용"]], hide_index=True, use_container_width=True)
 
         # ── 🏢 계정 관리 ────────────────────────────────────────
-        with tab_acc:
+        if _snav == "acc":
             st.markdown("**담당 브랜드 계정**")
             with st.expander("➕ 새 브랜드 계정 등록"):
                 with st.form("new_account_form", clear_on_submit=True):
@@ -3647,7 +3730,7 @@ with tab_mywork:
                             _flash("저장 완료"); refresh_sales()
 
         # ── 🐛 이슈 ────────────────────────────────────────────
-        with tab_issue:
+        if _snav == "issue":
             st.markdown("**이슈 등록/관리**")
             if not my_accounts:
                 st.caption("먼저 브랜드 계정을 등록해주세요.")
@@ -3700,7 +3783,7 @@ with tab_mywork:
                             _flash("저장 완료"); refresh_sales()
 
         # ── 🚀 캠페인·주차루틴 ──────────────────────────────────
-        with tab_reg:
+        if _snav == "reg":
             st.markdown("**캠페인 등록 → 4주 루틴 자동 생성**")
             with st.expander("🚀 새 캠페인 등록", expanded=True):
                 cv = st.session_state.setdefault("camp_new_ver", 0)  # 등록 성공 후 입력칸을 비우려고 key에 붙이는 번호
@@ -3826,7 +3909,7 @@ with tab_mywork:
                         refresh_sales()
                         st.rerun()
 
-        with tab_camp:
+        if _snav == "camp":
             st.markdown("**등록된 캠페인 · 주차 루틴**")
             my_account_ids_camp = {a["id"] for a in my_accounts}
             my_campaigns = [c for c in load_sales_campaigns() if c["account_id"] in my_account_ids_camp]
@@ -4066,7 +4149,7 @@ with tab_mywork:
         st.caption("이 이름에는 아직 맞춤 도구가 없어요. 필요하시면 말씀해주세요 — 바로 만들어드릴게요.")
 
 
-with tab_board:
+if _nav == "board":
     st.subheader("📮 요청 게시판")
     st.caption(
         "팀원끼리 서로 요청하는 곳이에요. 모두에게 보이고, 담당자는 상태를 바꾸고, 요청한 사람은 내용을 고쳐요. "
@@ -4085,12 +4168,12 @@ with tab_board:
         _render_request_board(_req_rows, my_name, _req_today)
 
 
-with tab_leave:
+if _nav == "leave":
     st.subheader(f"🏖️ {my_name}님의 휴가")
     _render_leave_page(my_name, _req_today)
 
 
-with tab_summary:
+if _nav == "summary":
     # ══════════════════════════════════════════════════════════
     # 📊 내 요약 카드 (OKR 대체 — 읽기 전용, 자동 집계)
     # ══════════════════════════════════════════════════════════
@@ -4109,8 +4192,8 @@ with tab_summary:
 
 
     week_ago = pd.Timestamp.now() - timedelta(days=7)
-    my_placements = [p for p in placements if p["assigned_to"] == my_name]
-    my_logs_all = SUPA.table("daily_activity_log").select("*").eq("staff_name", my_name).order("created_at", desc=True).limit(50).execute().data
+    my_placements = [p for p in load_placements() if p["assigned_to"] == my_name]
+    my_logs_all = load_my_logs(my_name)
 
     status_counts = {s: 0 for s in STATUS_OPTS}
     for p in my_placements:
@@ -4133,7 +4216,7 @@ with tab_summary:
     st.bar_chart(pd.Series(status_counts))
 
 
-with tab_org:
+if _nav == "org":
     # ══════════════════════════════════════════════════════════
     # 🏢 조직도 (회의록 기준 역할/직급 반영 — 최소 20명 규모를 보여주기 위함)
     # ══════════════════════════════════════════════════════════
