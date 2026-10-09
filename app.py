@@ -2112,17 +2112,19 @@ def load_fin_categories():
 @st.cache_data(ttl=60)
 def load_client_deposits(since_iso):
     """뱅크다(+수동 업로드)로 들어온 은행내역 중 '업체 입금'만. 같은 Supabase DB의 bank_transactions를 직접 읽는다.
-    업체 입금 = 입금(direction='in') 이면서 분류가 매출(revenue)이거나 아직 분류 전인 것.
-    내부이체·이자·기타 잡손익·보증금 등은 제외. 계좌번호(account_label)는 가져오지 않는다."""
+    업체 입금 = 입금(direction='in') 이면서 (분류가 매출(revenue)이거나, 계약/예정(cash_events)과 매칭된 것).
+    아직 분류 전인 입금은 업체인지 알 수 없으므로 제외(재무캘린더에서 분류되면 그때부터 보임).
+    내부이체·이자·기타 잡손익·보증금 등도 제외. 계좌번호(account_label)는 가져오지 않는다."""
     cats = load_fin_categories()
-    rows = (SUPA.table("bank_transactions").select("id,txn_date,amount,description,account_category_id,source")
+    rows = (SUPA.table("bank_transactions").select("id,txn_date,amount,description,account_category_id,matched_cash_event_id,source")
             .eq("direction", "in").gte("txn_date", since_iso).order("txn_date", desc=True).limit(500).execute().data)
     out = []
     for r in rows:
         cat = cats.get(r.get("account_category_id"))
-        if cat and cat.get("type") != "revenue":
+        is_revenue = bool(cat) and cat.get("type") == "revenue"
+        if not (is_revenue or r.get("matched_cash_event_id")):
             continue
-        out.append({**r, "category": cat["name"] if cat else "분류 전"})
+        out.append({**r, "category": cat["name"] if cat else "계약 매칭"})
     return out
 
 
@@ -3608,7 +3610,7 @@ if _nav == "mywork":
             if my_name not in INVOICE_EDITORS:  # 김선재(+테스트 계정 가상인턴)만. 다른 직원에겐 보이지 않는다
                 st.info("이 화면은 세일즈 담당자만 볼 수 있어요.")
             else:
-                st.caption("뱅크다로 가져온 은행내역 중 **업체 입금**만 보여드려요(입금 + 매출로 분류됐거나 아직 분류 전인 건). 내부이체·이자 등은 제외, 계좌번호는 표시하지 않아요. 최대 1분 늦게 반영될 수 있어요.")
+                st.caption("뱅크다로 가져온 은행내역 중 **업체 입금**만 보여드려요(입금 + 매출 계정으로 분류됐거나 계약과 매칭된 건). 내부이체·이자·분류 전 입금은 제외, 계좌번호는 표시하지 않아요. 재무캘린더에서 매출로 분류되면 여기에 나타나고, 최대 1분 늦게 반영될 수 있어요.")
                 _dp_days = st.radio("기간", [30, 90, 365], format_func=lambda d: f"최근 {d}일", horizontal=True, key="dep_days")
                 try:
                     _deps = load_client_deposits((date.today() - timedelta(days=_dp_days)).isoformat())
@@ -3620,11 +3622,10 @@ if _nav == "mywork":
                 else:
                     _mon = date.today().strftime("%Y-%m")
                     _mon_sum = sum(float(d["amount"] or 0) for d in _deps if str(d["txn_date"])[:7] == _mon)
-                    _unc = sum(1 for d in _deps if d["category"] == "분류 전")
                     dm1, dm2, dm3 = st.columns(3)
                     dm1.metric("이번 달 입금 합계", f"₩{_mon_sum:,.0f}")
                     dm2.metric("조회 기간 건수", f"{len(_deps)}건")
-                    dm3.metric("분류 전(재무캘린더에서 분류 필요)", f"{_unc}건")
+                    dm3.metric("가장 최근 입금일", str(_deps[0]["txn_date"])[:10])
                     _dep_df = pd.DataFrame([{
                         "입금일": str(d["txn_date"])[:10], "입금자/적요": d["description"] or "-",
                         "금액": float(d["amount"] or 0), "분류": d["category"],
