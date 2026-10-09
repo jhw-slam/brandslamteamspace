@@ -1,6 +1,7 @@
 import os
 import io
 import re
+import unicodedata
 import html
 import calendar
 import json
@@ -1027,7 +1028,8 @@ def _invoice_input_ui(ns, brand, campaign_name, open_date):
         final_amt = v or None
     elif amt_pick:
         final_amt = amts[opts.index(amt_pick)]
-    return {"up": up, "picked": picked, "number": inv_no.strip() or None, "currency": inv_cur, "amount": final_amt}
+    issue = st.date_input("인보이스 발행일 (입금내역과 맞출 때 써요)", value=None, key=f"{ns}_issue")
+    return {"up": up, "picked": picked, "number": inv_no.strip() or None, "currency": inv_cur, "amount": final_amt, "issue_date": issue}
 
 
 def _invoice_store_file(data, folder_id):
@@ -1046,6 +1048,7 @@ def _invoice_columns(data, url, name, my_name):
         "invoice_url": url, "invoice_name": name, "invoice_number": data["number"],
         "invoice_amount": data["amount"], "invoice_currency": data["currency"],
         "invoice_attached_by": my_name, "invoice_attached_at": datetime.utcnow().isoformat() + "Z",
+        **({"invoice_issue_date": data["issue_date"].isoformat()} if data.get("issue_date") else {}),  # 칸이 아직 없는 DB에서도 날짜를 안 적으면 저장됨
     }
 
 
@@ -2111,19 +2114,73 @@ def load_fin_categories():
 
 @st.cache_data(ttl=60)
 def load_client_deposits(since_iso):
-    """뱅크다(+수동 업로드)로 들어온 은행내역 중 '업체 입금'만. 같은 Supabase DB의 bank_transactions를 직접 읽는다.
-    업체 입금 = 입금(direction='in') 이면서 분류가 매출(revenue)이거나 아직 분류 전인 것.
-    내부이체·이자·기타 잡손익·보증금 등은 제외. 계좌번호(account_label)는 가져오지 않는다."""
+    """같은 Supabase DB의 bank_transactions 중 '대표가 계정과목을 확정한 매출 입금'만.
+    조건: 입금(direction='in') + 분류가 매출(fin_account_categories.type='revenue') + 자동분류 아님(is_auto_categorized 가 True가 아님).
+    분류 전·내부이체·이자 등은 제외. 계좌번호(account_label)는 가져오지 않는다."""
     cats = load_fin_categories()
-    rows = (SUPA.table("bank_transactions").select("id,txn_date,amount,description,account_category_id,source")
-            .eq("direction", "in").gte("txn_date", since_iso).order("txn_date", desc=True).limit(500).execute().data)
+    rows = (SUPA.table("bank_transactions").select("id,txn_date,amount,description,account_category_id,is_auto_categorized")
+            .eq("direction", "in").gte("txn_date", since_iso).not_.is_("account_category_id", "null")
+            .order("txn_date", desc=True).limit(500).execute().data)
     out = []
     for r in rows:
         cat = cats.get(r.get("account_category_id"))
-        if cat and cat.get("type") != "revenue":
+        if not cat or cat.get("type") != "revenue" or r.get("is_auto_categorized"):
             continue
-        out.append({**r, "category": cat["name"] if cat else "분류 전"})
+        out.append({**r, "category": cat["name"]})
     return out
+
+
+_NAME_NOISE = re.compile(r"주식회사|유한회사|유한책임회사|\(주\)|\(유\)|㈜|체크입금|[\s()\[\]·.,\-_/]")
+_BANK_PREFIX = re.compile(r"^(국민|기업|신한|우리|하나|농협|카카오|토스)")
+
+
+def _norm_company(text):
+    """은행 입금자명과 브랜드명을 비교하기 좋게 다듬는다(전각→반각, '(주)'·'주식회사'·은행이름 앞붙임·공백 제거)."""
+    t = unicodedata.normalize("NFKC", str(text or "")).lower()
+    t = _NAME_NOISE.sub("", t)
+    return _BANK_PREFIX.sub("", t)  # 입금자명 앞에 붙는 은행 이름만 제거
+
+
+def _to_date(v):
+    try:
+        return date.fromisoformat(str(v)[:10]) if v else None
+    except ValueError:
+        return None
+
+
+def _match_deposits(deposits, camps, account_by_id):
+    """입금 ↔ 인보이스 매칭(제안만, DB에 저장하지 않음). 이미 정해진 데이터(입금자명·금액·날짜)만 비교한다.
+    이름: 입금자명(은행이 앞 10자 안팎만 줌)이 브랜드명/캠페인명/인보이스 파일명과 서로 포함되면 후보.
+    금액: 인보이스 금액과 같거나 부가세 10% 포함액이면 '금액 일치'. 날짜: 입금일 − 인보이스 발행일(없으면 첨부일)."""
+    res = []
+    for d in deposits:
+        dn = _norm_company(d["description"])
+        paid = float(d["amount"] or 0)
+        dd = _to_date(d["txn_date"])
+        best = None
+        for c in camps:
+            if c.get("invoice_amount") is None or len(dn) < 2:
+                continue
+            brand = (account_by_id.get(c.get("account_id")) or {}).get("brand_name", "")
+            names = [_norm_company(x) for x in (brand, c.get("campaign_name"), c.get("invoice_name")) if x]
+            if not any(n and (dn in n or n in dn) for n in names):
+                continue
+            inv = float(c["invoice_amount"])
+            amt_ok = c.get("invoice_currency") in (None, "KRW") and (abs(paid - inv) < 1 or abs(paid - round(inv * 1.1)) < 1)
+            idate = _to_date(c.get("invoice_issue_date")) or _to_date(c.get("invoice_attached_at"))
+            diff = (dd - idate).days if dd and idate else None
+            date_ok = diff is not None and -3 <= diff <= 90
+            score = (amt_ok, date_ok, -abs(diff) if diff is not None else -9999)
+            if best is None or score > best[0]:
+                best = (score, c, brand, amt_ok, date_ok, diff, idate, bool(c.get("invoice_issue_date")))
+        if best is None:
+            res.append({"dep": d, "status": "❔ 매칭 없음"})
+            continue
+        _, c, brand, amt_ok, date_ok, diff, idate, has_issue = best
+        status = "✅ 일치" if amt_ok and date_ok else ("🔎 후보(금액 불일치)" if date_ok else "🔎 후보(확인 필요)")
+        res.append({"dep": d, "status": status, "brand": brand, "campaign": c["campaign_name"], "inv_no": c.get("invoice_number"),
+                    "inv_amt": float(c["invoice_amount"]), "idate": idate, "has_issue": has_issue, "diff": diff, "amt_ok": amt_ok})
+    return res
 
 
 @st.cache_data(ttl=30)
@@ -3608,7 +3665,8 @@ if _nav == "mywork":
             if my_name not in INVOICE_EDITORS:  # 김선재(+테스트 계정 가상인턴)만. 다른 직원에겐 보이지 않는다
                 st.info("이 화면은 세일즈 담당자만 볼 수 있어요.")
             else:
-                st.caption("뱅크다로 가져온 은행내역 중 **업체 입금**만 보여드려요(입금 + 매출로 분류됐거나 아직 분류 전인 건). 내부이체·이자 등은 제외, 계좌번호는 표시하지 않아요. 최대 1분 늦게 반영될 수 있어요.")
+                st.caption("대표님이 계정과목을 **매출로 확정한** 입금내역만 가져와서, 입금자명·금액·날짜로 등록된 인보이스와 맞춰봐요. "
+                           "맞춰보기만 하고 저장은 하지 않아요. 계좌번호는 표시하지 않고, 최대 1분 늦게 반영될 수 있어요.")
                 _dp_days = st.radio("기간", [30, 90, 365], format_func=lambda d: f"최근 {d}일", horizontal=True, key="dep_days")
                 try:
                     _deps = load_client_deposits((date.today() - timedelta(days=_dp_days)).isoformat())
@@ -3616,22 +3674,30 @@ if _nav == "mywork":
                     st.error(f"❌ 입금내역을 불러오지 못했어요 ({type(e).__name__}: {e})")
                     _deps = []
                 if not _deps:
-                    st.info("이 기간에 업체 입금 내역이 없어요.")
+                    st.info("이 기간에 대표님이 매출로 확정한 입금 내역이 없어요.")
                 else:
+                    _m = _match_deposits(_deps, load_sales_campaigns(), account_by_id)
                     _mon = date.today().strftime("%Y-%m")
-                    _mon_sum = sum(float(d["amount"] or 0) for d in _deps if str(d["txn_date"])[:7] == _mon)
-                    _unc = sum(1 for d in _deps if d["category"] == "분류 전")
                     dm1, dm2, dm3 = st.columns(3)
-                    dm1.metric("이번 달 입금 합계", f"₩{_mon_sum:,.0f}")
-                    dm2.metric("조회 기간 건수", f"{len(_deps)}건")
-                    dm3.metric("분류 전(재무캘린더에서 분류 필요)", f"{_unc}건")
-                    _dep_df = pd.DataFrame([{
-                        "입금일": str(d["txn_date"])[:10], "입금자/적요": d["description"] or "-",
-                        "금액": float(d["amount"] or 0), "분류": d["category"],
-                    } for d in _deps])
-                    st.dataframe(_dep_df.assign(금액=_dep_df["금액"].map(lambda v: f"₩{v:,.0f}")), hide_index=True, use_container_width=True)
+                    dm1.metric("이번 달 입금 합계", f"₩{sum(float(d['amount'] or 0) for d in _deps if str(d['txn_date'])[:7] == _mon):,.0f}")
+                    dm2.metric("인보이스와 일치", f"{sum(1 for x in _m if x['status'] == '✅ 일치')}건")
+                    dm3.metric("매칭 없음/확인 필요", f"{sum(1 for x in _m if x['status'] != '✅ 일치')}건")
+                    _rows = []
+                    for x in _m:
+                        d = x["dep"]
+                        diff = x.get("diff")
+                        _rows.append({
+                            "입금일": str(d["txn_date"])[:10], "입금자": d["description"] or "-", "금액": f"₩{float(d['amount'] or 0):,.0f}",
+                            "분류": d["category"], "매칭": x["status"],
+                            "브랜드·캠페인": f"{x['brand']} · {x['campaign']}" if x.get("campaign") else "-",
+                            "인보이스": (f"{x.get('inv_no') or '번호없음'} / {x['inv_amt']:,.0f}" if x.get("campaign") else "-"),
+                            "발행일→입금": (f"{diff}일 후" + ("" if x["has_issue"] else " (첨부일 기준)")) if diff is not None else "-",
+                        })
+                    _dep_df = pd.DataFrame(_rows)
+                    st.dataframe(_dep_df, hide_index=True, use_container_width=True)
+                    st.caption("✅ 일치 = 이름이 비슷하고, 금액이 인보이스와 같거나 부가세 10% 포함액이며, 입금일이 발행일 −3일~+90일 안. 은행은 입금자명을 앞 10자 안팎만 줘서 '후보'로 뜨는 건 눈으로 확인해주세요.")
                     st.download_button("📥 CSV로 받기", _dep_df.to_csv(index=False).encode("utf-8-sig"),
-                                       file_name="업체입금내역.csv", mime="text/csv", key="dep_csv")
+                                       file_name="업체입금_인보이스매칭.csv", mime="text/csv", key="dep_csv")
 
         if _snav == "fc":
             _t = date.today()
