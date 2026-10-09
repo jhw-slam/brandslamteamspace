@@ -2104,6 +2104,28 @@ def load_okr():
     return org, items
 
 
+@st.cache_data(ttl=300)
+def load_fin_categories():
+    return {c["id"]: c for c in SUPA.table("fin_account_categories").select("id,code,name,type").execute().data}
+
+
+@st.cache_data(ttl=60)
+def load_client_deposits(since_iso):
+    """뱅크다(+수동 업로드)로 들어온 은행내역 중 '업체 입금'만. 같은 Supabase DB의 bank_transactions를 직접 읽는다.
+    업체 입금 = 입금(direction='in') 이면서 분류가 매출(revenue)이거나 아직 분류 전인 것.
+    내부이체·이자·기타 잡손익·보증금 등은 제외. 계좌번호(account_label)는 가져오지 않는다."""
+    cats = load_fin_categories()
+    rows = (SUPA.table("bank_transactions").select("id,txn_date,amount,description,account_category_id,source")
+            .eq("direction", "in").gte("txn_date", since_iso).order("txn_date", desc=True).limit(500).execute().data)
+    out = []
+    for r in rows:
+        cat = cats.get(r.get("account_category_id"))
+        if cat and cat.get("type") != "revenue":
+            continue
+        out.append({**r, "category": cat["name"] if cat else "분류 전"})
+    return out
+
+
 @st.cache_data(ttl=30)
 def load_my_pending_payments(person):
     """내가 올린 송금요청 + 캠페인 연결(재확인 표용). 등록·삭제 뒤에는 .clear()."""
@@ -3572,7 +3594,7 @@ if _nav == "mywork":
         account_by_id = {a["id"]: a for a in all_sales_accounts}
         STATUS_OPTS_ACC = ["협상중", "계약완료", "운영중", "종료", "이탈"]
 
-        _SALES_NAV = {"reg": "📝 캠페인 등록", "big": "🗓️ 큰 캘린더", "fc": "🔮 다음달 예측", "cal": "📅 일정 한눈에보기",
+        _SALES_NAV = {"reg": "📝 캠페인 등록", "big": "🗓️ 큰 캘린더", "fc": "🔮 다음달 예측", "cal": "📅 일정 한눈에보기", "dep": "💰 최근 입금내역",
                       "acc": "🏢 계정 관리", "issue": "🐛 이슈", "camp": "🚀 캠페인·주차루틴"}
         _snav = st.radio("세일즈 화면", list(_SALES_NAV), format_func=_SALES_NAV.get, horizontal=True,
                          key="sales_nav", label_visibility="collapsed")
@@ -3581,6 +3603,35 @@ if _nav == "mywork":
         if _snav == "big":
             st.caption("모든 직원의 '📋 캠페인' 탭에도 똑같이 보여요. 여기서 등록한 캠페인과 인보이스가 그대로 반영됩니다.")
             _render_campaign_hub("hubsales", my_name, True, mine_filter=True)
+
+        if _snav == "dep":
+            if my_name not in INVOICE_EDITORS:  # 김선재(+테스트 계정 가상인턴)만. 다른 직원에겐 보이지 않는다
+                st.info("이 화면은 세일즈 담당자만 볼 수 있어요.")
+            else:
+                st.caption("뱅크다로 가져온 은행내역 중 **업체 입금**만 보여드려요(입금 + 매출로 분류됐거나 아직 분류 전인 건). 내부이체·이자 등은 제외, 계좌번호는 표시하지 않아요. 최대 1분 늦게 반영될 수 있어요.")
+                _dp_days = st.radio("기간", [30, 90, 365], format_func=lambda d: f"최근 {d}일", horizontal=True, key="dep_days")
+                try:
+                    _deps = load_client_deposits((date.today() - timedelta(days=_dp_days)).isoformat())
+                except Exception as e:
+                    st.error(f"❌ 입금내역을 불러오지 못했어요 ({type(e).__name__}: {e})")
+                    _deps = []
+                if not _deps:
+                    st.info("이 기간에 업체 입금 내역이 없어요.")
+                else:
+                    _mon = date.today().strftime("%Y-%m")
+                    _mon_sum = sum(float(d["amount"] or 0) for d in _deps if str(d["txn_date"])[:7] == _mon)
+                    _unc = sum(1 for d in _deps if d["category"] == "분류 전")
+                    dm1, dm2, dm3 = st.columns(3)
+                    dm1.metric("이번 달 입금 합계", f"₩{_mon_sum:,.0f}")
+                    dm2.metric("조회 기간 건수", f"{len(_deps)}건")
+                    dm3.metric("분류 전(재무캘린더에서 분류 필요)", f"{_unc}건")
+                    _dep_df = pd.DataFrame([{
+                        "입금일": str(d["txn_date"])[:10], "입금자/적요": d["description"] or "-",
+                        "금액": float(d["amount"] or 0), "분류": d["category"],
+                    } for d in _deps])
+                    st.dataframe(_dep_df.assign(금액=_dep_df["금액"].map(lambda v: f"₩{v:,.0f}")), hide_index=True, use_container_width=True)
+                    st.download_button("📥 CSV로 받기", _dep_df.to_csv(index=False).encode("utf-8-sig"),
+                                       file_name="업체입금내역.csv", mime="text/csv", key="dep_csv")
 
         if _snav == "fc":
             _t = date.today()
