@@ -1780,6 +1780,82 @@ def _render_hub_thread(ns, target_type, target_id, target_date, my_name, heading
 _TASK_ICON = {"예정": "⚪", "진행중": "🟠", "완료": "✅"}
 
 
+def _hub_refresh():
+    """캠페인 수정(인보이스·입금 연결) 뒤: 관련 캐시를 비우고 다시 그린다."""
+    load_hub_data.clear(); load_match_campaigns.clear()
+    for n in ("load_sales_campaigns", "load_sales_accounts", "load_sales_campaign_tasks", "load_deposit_links"):
+        f = globals().get(n)
+        if f is not None:
+            f.clear()
+    st.rerun()
+
+
+def _vat_expected(inv_amt, vat_type):
+    """인보이스 금액 → 실제 입금될 금액(부가세 구분을 아는 경우만). 모르면 None(추측하지 않음)."""
+    if inv_amt is None or not vat_type:
+        return None
+    return float(inv_amt) * (1.1 if str(vat_type).startswith("별도") else 1.0)
+
+
+def _render_campaign_deposits(c, brand, my_name):
+    """한 캠페인의 입금 연결: 이미 연결된 입금(해제 가능) + 아직 어느 캠페인에도 안 붙은 입금 중에서 골라 연결. 입금은 대표가 매출로 확정한 300만 원 이상만."""
+    cid = c["id"]
+    st.markdown("**💰 입금 연결**")
+    links, lerr = load_deposit_links()
+    if lerr:
+        st.caption("입금 연결 칸이 아직 DB에 없어요 — `migrations/20261009_margin_data_collection.sql` 적용 후 쓸 수 있어요.")
+        return
+    try:
+        deps = load_client_deposits((date.today() - timedelta(days=365)).isoformat())
+    except Exception as e:
+        st.error(f"입금내역을 불러오지 못했어요 ({type(e).__name__}: {e})")
+        return
+    dep_by = {d["id"]: d for d in deps}
+    mine = [(b, a) for b, rows in links.items() for (cc, a) in rows if cc == cid]
+    total = sum(a for _, a in mine)
+    expect = _vat_expected(c.get("invoice_amount"), c.get("invoice_vat_type")) if (c.get("invoice_currency") in (None, "KRW")) else None
+    if mine:
+        for b, a in mine:
+            d = dep_by.get(b)
+            lc1, lc2 = st.columns([5, 1])
+            lc1.markdown(f"✔ {str(d['txn_date'])[:10] if d else '(1년 이전)'} · {(d['description'] if d else '입금')} · ₩{a:,.0f}")
+            if lc2.button("해제", key=f"depun_{cid}_{b}"):
+                try:
+                    SUPA.table("campaign_deposit_links").delete().eq("bank_transaction_id", b).eq("campaign_id", cid).execute()
+                except Exception as e:
+                    st.error(f"해제하지 못했어요 ({type(e).__name__}: {e})")
+                else:
+                    _hub_refresh()
+        st.caption(f"연결된 입금 합계 ₩{total:,.0f}" + (f" / 인보이스 기준 입금 예정 ₩{expect:,.0f}" if expect else ""))
+    else:
+        st.caption("연결된 입금이 없어요.")
+    linked_ids = set(links)
+    free = [d for d in deps if d["id"] not in linked_ids]
+    hit = {x["dep"]["id"] for x in _match_deposits(free, [c], {c.get("account_id"): {"brand_name": brand}}) if x["status"] != "❔ 매칭 없음"}
+    free.sort(key=lambda d: str(d["txn_date"]), reverse=True)
+    free.sort(key=lambda d: d["id"] not in hit)  # 이름이 비슷한 입금을 위로(안정 정렬이라 최신순 유지)
+    if not free:
+        return
+    with st.form(f"depform_{cid}"):
+        pick = st.multiselect("이 캠페인에 연결할 입금 (🔎 = 이름이 비슷한 입금)", [d["id"] for d in free],
+                              format_func=lambda i: f"{'🔎 ' if i in hit else ''}{str(dep_by[i]['txn_date'])[:10]} · {dep_by[i]['description'] or '-'} · ₩{float(dep_by[i]['amount']):,.0f}",
+                              key=f"deppick_{cid}")
+        go = st.form_submit_button("💾 입금 연결 저장 (여기서 저장돼요)")
+    if go:
+        if not pick:
+            st.info("고른 입금이 없어요.")
+        else:
+            try:
+                SUPA.table("campaign_deposit_links").insert([
+                    {"bank_transaction_id": i, "campaign_id": cid, "ratio": 1, "allocated_amount": float(dep_by[i]["amount"]), "matched_by": my_name}
+                    for i in pick]).execute()
+            except Exception as e:
+                st.error(f"저장하지 못했어요 ({type(e).__name__}: {e})")
+            else:
+                _flash(f"입금 {len(pick)}건을 이 캠페인에 연결했어요. (한 입금이 여러 캠페인 몫이면 '최근 입금내역'에서 비율로 나눠주세요)")
+                _hub_refresh()
+
+
 @st.fragment
 def _render_campaign_hub(ns, my_name, can_see_amounts, mine_filter=False):
     """모든 직원이 보는 캠페인 캘린더: 월 달력 + 앞으로 7일 일정 + 캠페인 상세 + 의견·댓글·파일 첨부 + 날짜별 의견.
@@ -1885,6 +1961,11 @@ def _render_campaign_hub(ns, my_name, can_see_amounts, mine_filter=False):
         docs.append(inv)
     if docs:
         st.markdown("  ·  ".join(docs))
+    if can_see_amounts and my_name in INVOICE_EDITORS:  # 담당자(김선재)만: 목차를 늘리지 않고 이 캠페인 안에서 바로 수정
+        with st.expander("✏️ 수정 — 인보이스 · 입금 연결", expanded=False):
+            _render_invoice_section(c, brand_of(c), True, my_name, _hub_refresh)
+            st.markdown("---")
+            _render_campaign_deposits(c, brand_of(c), my_name)
 
     st.markdown("---")
     _render_hub_thread(f"{ns}_c_{sel_id}", "campaign", sel_id, None, my_name, "💬 이 캠페인에 대한 의견·댓글·파일",
