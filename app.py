@@ -2199,10 +2199,13 @@ def load_fin_categories():
     return {c["id"]: c for c in SUPA.table("fin_account_categories").select("id,code,name,type").execute().data}
 
 
+DEPOSIT_MIN_AMOUNT = 3_000_000  # 업체 입금으로 볼 최소 금액(10/12 대표 지시)
+
+
 @st.cache_data(ttl=60)
 def load_client_deposits(since_iso):
     """같은 Supabase DB의 bank_transactions 중 '대표가 계정과목을 확정한 매출 입금'만.
-    조건: 입금(direction='in') + 분류가 매출(fin_account_categories.type='revenue') + 자동분류 아님(is_auto_categorized 가 True가 아님).
+    조건: 입금(direction='in') + 분류가 매출(fin_account_categories.type='revenue') + 자동분류 아님(is_auto_categorized 가 True가 아님) + 금액 DEPOSIT_MIN_AMOUNT 이상.
     분류 전·내부이체·이자 등은 제외. 계좌번호(account_label)는 가져오지 않는다."""
     cats = load_fin_categories()
     rows = (SUPA.table("bank_transactions").select("id,txn_date,amount,description,account_category_id,is_auto_categorized")
@@ -2212,6 +2215,8 @@ def load_client_deposits(since_iso):
     for r in rows:
         cat = cats.get(r.get("account_category_id"))
         if not cat or cat.get("type") != "revenue" or r.get("is_auto_categorized"):
+            continue
+        if float(r.get("amount") or 0) < DEPOSIT_MIN_AMOUNT:  # 체크입금·이자 같은 잔돈은 업체 입금이 아니라 제외
             continue
         out.append({**r, "category": cat["name"]})
     return out
@@ -2237,7 +2242,7 @@ def _to_date(v):
 
 def _match_deposits(deposits, camps, account_by_id):
     """입금 ↔ 인보이스 매칭(제안만, DB에 저장하지 않음). 이미 정해진 데이터(입금자명·금액·날짜)만 비교한다.
-    이름: 입금자명(은행이 앞 10자 안팎만 줌)이 브랜드명/캠페인명/인보이스 파일명과 서로 포함되면 후보.
+    이름: 입금자명(은행이 앞 10자 안팎만 줌)이 브랜드명/캠페인명/계약서·인보이스 파일명(계약서상 거래처명이 들어있는 경우가 많음)과 서로 포함되면 후보.
     금액: 인보이스 금액과 같거나 부가세 10% 포함액이면 '금액 일치'. 날짜: 입금일 − 인보이스 발행일(없으면 첨부일)."""
     res = []
     for d in deposits:
@@ -2246,27 +2251,28 @@ def _match_deposits(deposits, camps, account_by_id):
         dd = _to_date(d["txn_date"])
         best = None
         for c in camps:
-            if c.get("invoice_amount") is None or len(dn) < 2:
+            if len(dn) < 2:
                 continue
             brand = (account_by_id.get(c.get("account_id")) or {}).get("brand_name", "")
-            names = [_norm_company(x) for x in (brand, c.get("campaign_name"), c.get("invoice_name")) if x]
+            names = [_norm_company(x) for x in (brand, c.get("campaign_name"), c.get("contract_name"), c.get("invoice_name")) if x]
             if not any(n and (dn in n or n in dn) for n in names):
                 continue
-            inv = float(c["invoice_amount"])
-            amt_ok = c.get("invoice_currency") in (None, "KRW") and (abs(paid - inv) < 1 or abs(paid - round(inv * 1.1)) < 1)
+            inv = float(c["invoice_amount"]) if c.get("invoice_amount") is not None else None  # 인보이스가 아직 없어도 이름으로는 후보를 보여준다
+            amt_ok = inv is not None and c.get("invoice_currency") in (None, "KRW") and (abs(paid - inv) < 1 or abs(paid - round(inv * 1.1)) < 1)
             idate = _to_date(c.get("invoice_issue_date")) or _to_date(c.get("invoice_attached_at"))
             diff = (dd - idate).days if dd and idate else None
             date_ok = diff is not None and -3 <= diff <= 90
-            score = (amt_ok, date_ok, -abs(diff) if diff is not None else -9999)
+            score = (amt_ok, date_ok, inv is not None, -abs(diff) if diff is not None else -9999)
             if best is None or score > best[0]:
                 best = (score, c, brand, amt_ok, date_ok, diff, idate, bool(c.get("invoice_issue_date")))
         if best is None:
             res.append({"dep": d, "status": "❔ 매칭 없음"})
             continue
         _, c, brand, amt_ok, date_ok, diff, idate, has_issue = best
-        status = "✅ 일치" if amt_ok and date_ok else ("🔎 후보(금액 불일치)" if date_ok else "🔎 후보(확인 필요)")
+        status = ("✅ 일치" if amt_ok and date_ok else "🔎 후보(인보이스 없음)" if c.get("invoice_amount") is None
+                  else "🔎 후보(금액 불일치)" if date_ok else "🔎 후보(확인 필요)")
         res.append({"dep": d, "status": status, "brand": brand, "campaign": c["campaign_name"], "campaign_id": c["id"], "inv_no": c.get("invoice_number"),
-                    "inv_amt": float(c["invoice_amount"]), "idate": idate, "has_issue": has_issue, "diff": diff, "amt_ok": amt_ok})
+                    "inv_amt": float(c["invoice_amount"]) if c.get("invoice_amount") is not None else None, "idate": idate, "has_issue": has_issue, "diff": diff, "amt_ok": amt_ok})
     return res
 
 
@@ -3804,7 +3810,7 @@ if _nav == "mywork":
             if my_name not in INVOICE_EDITORS:  # 김선재(+테스트 계정 가상인턴)만. 다른 직원에겐 보이지 않는다
                 st.info("이 화면은 세일즈 담당자만 볼 수 있어요.")
             else:
-                st.caption("대표님이 계정과목을 **매출로 확정한** 입금내역만 가져와서, 입금자명·금액·날짜로 등록된 인보이스와 맞춰봐요. "
+                st.caption(f"대표님이 계정과목을 **매출로 확정한** 입금 중 **{DEPOSIT_MIN_AMOUNT // 10000:,}만 원 이상**만 가져와서, 입금자명·금액·날짜로 등록된 인보이스와 맞춰봐요. "
                            "맞춰보기만 하고 저장은 하지 않아요. 계좌번호는 표시하지 않고, 최대 1분 늦게 반영될 수 있어요.")
                 _dp_days = st.radio("기간", [30, 90, 365], format_func=lambda d: f"최근 {d}일", horizontal=True, key="dep_days")
                 try:
@@ -3813,7 +3819,7 @@ if _nav == "mywork":
                     st.error(f"❌ 입금내역을 불러오지 못했어요 ({type(e).__name__}: {e})")
                     _deps = []
                 if not _deps:
-                    st.info("이 기간에 대표님이 매출로 확정한 입금 내역이 없어요.")
+                    st.info("이 기간에 대표님이 매출로 확정한 입금(300만 원 이상)이 없어요.")
                 else:
                     _m = _match_deposits(_deps, load_sales_campaigns(), account_by_id)
                     _links, _links_err = load_deposit_links()
@@ -3835,7 +3841,7 @@ if _nav == "mywork":
                             "입금일": str(d["txn_date"])[:10], "입금자": d["description"] or "-", "금액": f"₩{float(d['amount'] or 0):,.0f}",
                             "분류": d["category"], "매칭": x["status"],
                             "브랜드·캠페인": f"{x['brand']} · {x['campaign']}" if x.get("campaign") else "-",
-                            "인보이스": (f"{x.get('inv_no') or '번호없음'} / {x['inv_amt']:,.0f}" if x.get("campaign") else "-"),
+                            "인보이스": (f"{x.get('inv_no') or '번호없음'} / {x['inv_amt']:,.0f}" if x.get("inv_amt") is not None else "미등록") if x.get("campaign") else "-",
                             "발행일→입금": (f"{diff}일 후" + ("" if x["has_issue"] else " (첨부일 기준)")) if diff is not None else "-",
                         })
                     _dep_df = pd.DataFrame(_rows)
