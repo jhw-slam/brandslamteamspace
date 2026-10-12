@@ -1622,6 +1622,66 @@ def _payment_template_xlsx():
     return buf.getvalue()
 
 
+_LINK_END = r"\s<>\"'，。、）)】」"
+_URL_RX = re.compile(r"https?://[^" + _LINK_END + r"]+", re.I)
+_BARE_RX = re.compile(r"(?<![\w@.])((?:[a-z0-9-]+\.)+[a-z]{2,}/[^" + _LINK_END + r"]*)", re.I)
+_QUERY_FREE_HOSTS = ("instagram.com", "tiktok.com", "xiaohongshu.com", "xhslink.com", "douyin.com", "youtu.be")
+_TRACK_PARAMS = ("utm_", "fbclid", "igshid", "igsh", "si", "share_id", "xsec_", "app_platform", "share_from")
+
+
+def _extract_link(text):
+    """칸에 적힌 글에서 링크를 꺼낸다. 샤오홍슈 공유문구('【제목】 😆 xxx 😆 http://xhslink.com/…')처럼 글이 섞여 있어도 http 링크만 뽑고,
+    'xhslink.com/abc'처럼 http가 빠진 것도 받는다. 링크가 안 보이면 None. 접속해서 확인하지는 않는다(샤오홍슈는 접근이 안 돼서) — 담당자를 믿는다."""
+    t = str(text or "").strip()
+    m = _URL_RX.search(t)
+    if m:
+        return m.group(0).rstrip(".,;")
+    m = _BARE_RX.search(t)
+    return ("https://" + m.group(1).rstrip(".,;")) if m else None
+
+
+def _norm_link(url):
+    """같은 콘텐츠인지 비교하기 위한 값: 소문자·www/끝 슬래시·추적용 꼬리표(utm, xsec_token 등)·#뒷부분 제거."""
+    from urllib.parse import urlsplit, parse_qsl
+    u = urlsplit(url.strip())
+    host = (u.hostname or "").lower().removeprefix("www.")
+    path = u.path.rstrip("/")
+    if host.endswith(_QUERY_FREE_HOSTS):
+        return host + path
+    q = "&".join(f"{k}={v}" for k, v in sorted(parse_qsl(u.query)) if not k.lower().startswith(_TRACK_PARAMS))
+    return host + path + ("?" + q if q else "")
+
+
+@st.cache_data(ttl=10)
+def load_existing_links():
+    """이미 등록된 송금의 콘텐츠 링크(정규화한 값 집합). 같은 링크를 두 번 쓸 수 없다."""
+    rows = SUPA.table("payment_requests").select("content_link").not_.is_("content_link", "null").limit(20000).execute().data
+    out = set()
+    for r in rows:
+        u = _extract_link(r.get("content_link"))
+        if u:
+            out.add(_norm_link(u))
+    return out
+
+
+def _check_link(r, idx, existing, seen):
+    """링크가 있으면 정리해서 r에 넣고, 문제(링크 아님·이미 등록·이 신청서 안에서 중복)가 있으면 문구를, 없으면 None을 돌려준다."""
+    raw = r.get("content_link")
+    if not raw:
+        return None
+    u = _extract_link(raw)
+    if not u:
+        return f"'{str(raw)[:40]}'에서 링크를 찾지 못했어요. 인스타·틱톡·샤오홍슈 등 업로드된 콘텐츠 링크를 붙여넣어주세요."
+    r["content_link"] = u
+    k = _norm_link(u)
+    if k in existing:
+        return "이미 등록된 콘텐츠 링크예요. 같은 링크는 두 번 쓸 수 없어요 — 다른 링크이거나 이미 올린 건이 아닌지 확인해주세요."
+    if seen.get(k, idx) != idx:
+        return f"이 신청서의 {seen[k] + 1}번째 건과 같은 링크예요. 같은 링크는 한 번만 쓸 수 있어요."
+    seen[k] = idx
+    return None
+
+
 def _flash(msg):
     """성공 메시지를 '다음 화면'에 보여준다. (st.success 바로 뒤에 st.rerun()/refresh()를 하면 메시지가 사라지기 때문)"""
     st.session_state["flash_msg"] = msg
@@ -3384,8 +3444,18 @@ if _nav == "finance":
         st.markdown(f"**{len(pay_preview)}건 확인 중** — 빠진 항목은 아래에서 바로 채워주세요.")
 
         complete_rows = []
+        try:
+            _existing_links = load_existing_links()
+        except Exception as e:
+            _existing_links = set()
+            st.warning(f"기존 링크와 겹치는지 확인하지 못했어요 ({type(e).__name__}: {e}) — 등록할 때 다시 확인해요.")
+        _seen_links = {}
         with st.form("pay_review_form"):
             for idx, r in enumerate(pay_preview):
+                r["link_err"] = _check_link(r, idx, _existing_links, _seen_links)
+                if r["link_err"]:  # 문제 있는 링크는 비운 걸로 취급 → 아래 입력칸에서 바로 고치게
+                    r["link_bad"] = r["content_link"]
+                    r["content_link"] = None
                 missing = _missing_fields(r)
                 with st.container(border=True):
                     c1, c2 = st.columns([2, 1])
@@ -3396,12 +3466,19 @@ if _nav == "finance":
                     elif r.get("payment_method_raw"):
                         c1.warning("⏳ 페이팔이 아니라서 송금까지 **최대 1개월** 걸릴 수 있어요 — 별도 송금일정으로 처리됩니다.")
 
+                    if r.get("link_err"):
+                        st.error(f"🔗 콘텐츠 링크: {r['link_err']}")
                     if missing:
                         st.error(f"🚫 빠진 항목: {', '.join(FIELD_LABEL[f] for f in missing)} — 채워야 등록 가능")
 
                     # 빠진 필드를 그 자리에서 바로 채울 수 있게
                     if "content_link" in missing:
-                        r["content_link"] = st.text_input("콘텐츠 링크", key=f"fix_content_{_pv}_{idx}", placeholder="인스타/틱톡 업로드 링크") or None
+                        r["content_link"] = st.text_input("콘텐츠 링크", key=f"fix_content_{_pv}_{idx}", placeholder="인스타/틱톡/샤오홍슈 업로드 링크 (링크만 있으면 돼요)") or None
+                        if r["content_link"]:  # 방금 고쳐 쓴 링크도 같은 기준으로 다시 확인
+                            r["link_err"] = _check_link(r, idx, _existing_links, _seen_links)
+                            if r["link_err"]:
+                                st.error(f"🔗 {r['link_err']}")
+                                r["content_link"] = None
                     if "id_doc_link" in missing:
                         r["id_doc_link"] = st.text_input("신분증 사본 링크", key=f"fix_iddoc_{_pv}_{idx}", placeholder="구글드라이브 링크 등") or None
                     if "scheduled_date" in missing:
@@ -3462,7 +3539,7 @@ if _nav == "finance":
                     r["contract_confirmed"] = cc2.checkbox("계약서 확인함(또는 해당없음)", key=f"contract_confirm_{_pv}_{idx}")
 
                     pay_preview[idx] = r
-                    fully_checked = not _missing_fields(r) and r["id_doc_confirmed"] and r["contract_confirmed"] and not r.get("ratio_err")
+                    fully_checked = not _missing_fields(r) and r["id_doc_confirmed"] and r["contract_confirmed"] and not r.get("ratio_err") and not r.get("link_err")
                     if not fully_checked:
                         missing_checks = []
                         if not r["id_doc_confirmed"]:
@@ -3548,10 +3625,19 @@ if _nav == "finance":
                 else:
                     batch_id = str(uuid.uuid4())
                     all_brands, saved_keys, save_err = set(), set(), None
+                    load_existing_links.clear()
+                    try:
+                        _fresh_links = load_existing_links()
+                    except Exception:
+                        _fresh_links = set()
                     for r in valid_rows:
                         camp_ids = r.get("campaign_ids") or []
                         row_brands = list(dict.fromkeys(camp_by_id[i]["brand"] for i in camp_ids if i in camp_by_id))
                         try:
+                            # 등록 직전에 한 번 더: 그 사이 다른 사람이 같은 링크를 올렸을 수 있다
+                            _lk = _extract_link(r.get("content_link"))
+                            if _lk and _norm_link(_lk) in _fresh_links:
+                                raise RuntimeError("이미 등록된 콘텐츠 링크예요(같은 링크는 두 번 쓸 수 없어요).")
                             ins = SUPA.table("payment_requests").insert({
                                 "influencer_name": r.get("influencer_name"),
                                 "paypal_email": r.get("paypal_email"), "notification_email": r.get("notification_email"),
