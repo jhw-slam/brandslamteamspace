@@ -1687,6 +1687,24 @@ def _flash(msg):
     st.session_state["flash_msg"] = msg
 
 
+def _log_upload_attempt(person, stage, file_name=None, n_rows=None, n_ok=None, n_blocked=None, missing=None, detail=None, kind="payment"):
+    """직원이 송금정보를 불러오거나 등록을 시도한 '흔적'을 남긴다(대표님이 개선 지시를 하려고 보는 기록).
+    금액·이름·계좌·링크는 넣지 않고 건수와 빠진 항목 이름만 저장. 테이블이 없거나 실패해도 직원 화면은 절대 막지 않는다."""
+    try:
+        if stage == "loaded":  # 새 파일을 불러오면 새 작업 흐름
+            st.session_state.pop("_attempt_sid", None)
+        sid = st.session_state.setdefault("_attempt_sid", str(uuid.uuid4()))
+        SUPA.table("staff_upload_attempts").insert({
+            "person": person, "kind": kind, "stage": stage, "file_name": file_name,
+            "n_rows": n_rows, "n_ok": n_ok, "n_blocked": n_blocked,
+            "missing": missing or None, "detail": (str(detail)[:500] if detail else None), "session_id": sid,
+        }).execute()
+        if stage == "registered":  # 끝까지 갔으면 흐름 종료
+            st.session_state.pop("_attempt_sid", None)
+    except Exception:
+        pass
+
+
 @st.cache_data(ttl=15)
 def load_hub_data():
     """모든 브랜드의 캠페인·주차루틴(캘린더용). 반환: (계정, 캠페인, 주차루틴, 에러문구)"""
@@ -3168,6 +3186,7 @@ if _nav == "finance":
             std_sheets, std_err = _read_uploaded_sheet_file(std_file)
             if std_sheets is None:
                 st.error(f"❌ {std_err}")
+                _log_upload_attempt(my_name, "parse_failed", file_name=std_file.name, detail=std_err)
             else:
                 std_existing = {
                     r["dedup_key"] for r in SUPA.table("payment_requests").select("dedup_key").execute().data if r.get("dedup_key")
@@ -3175,11 +3194,15 @@ if _nav == "finance":
                 std_rows, std_problems, std_dup = _parse_standard_payment_sheets(std_sheets, std_existing)
                 st.session_state["pay_std_problems"] = std_problems
                 if not std_rows:
+                    _log_upload_attempt(my_name, "parse_failed", file_name=std_file.name, n_rows=0,
+                                        detail="등록할 행을 못 찾음" + (f" (이미 등록된 {std_dup}건 제외)" if std_dup else ""))
                     st.error(
                         "❌ 등록할 행을 못 찾았어요. 표준 양식의 제목줄(이름·금액 열)이 있는지 확인해주세요."
                         + (f" (이미 등록된 {std_dup}건은 제외)" if std_dup else "")
                     )
                 else:
+                    _log_upload_attempt(my_name, "loaded", file_name=std_file.name, n_rows=len(std_rows), n_blocked=len(std_problems) or None,
+                                        detail=("읽지 못한 행: " + " / ".join(str(x) for x in std_problems[:3])) if std_problems else None)
                     st.session_state["pay_ver"] = st.session_state.get("pay_ver", 0) + 1  # 이전 입력값이 남지 않게 입력칸을 새로 만든다
                     st.session_state["payment_rows_preview"] = std_rows
                     st.session_state.pop("payment_mapping_desc", None)
@@ -3560,6 +3583,17 @@ if _nav == "finance":
 
         st.session_state["payment_rows_preview"] = pay_preview
         valid_rows = complete_rows
+        _miss_cnt = {}
+        for _r in pay_preview:
+            for _f in _missing_fields(_r):
+                _miss_cnt[FIELD_LABEL[_f]] = _miss_cnt.get(FIELD_LABEL[_f], 0) + 1
+            if _r.get("link_err"):
+                _miss_cnt["콘텐츠링크 오류"] = _miss_cnt.get("콘텐츠링크 오류", 0) + 1
+        _rv_key = (_pv, len(valid_rows), len(pay_preview), tuple(sorted(_miss_cnt.items())))
+        if st.session_state.get("_attempt_review_key") != _rv_key:  # 상태가 바뀔 때만 한 줄 (화면이 다시 그려질 때마다 쌓이지 않게)
+            st.session_state["_attempt_review_key"] = _rv_key
+            _log_upload_attempt(my_name, "review", n_rows=len(pay_preview), n_ok=len(valid_rows),
+                                n_blocked=len(pay_preview) - len(valid_rows), missing=_miss_cnt)
         st.markdown(
             f"**준비 상태: 등록 가능 {len(valid_rows)}건 / 전체 {len(pay_preview)}건**"
             + ("" if len(valid_rows) == len(pay_preview) else " — 위 입력칸을 채우고 '입력 내용 반영하기'를 눌러주세요")
@@ -3626,8 +3660,10 @@ if _nav == "finance":
                 total_ok = abs(confirm_total - batch_total) < 1 if len(by_currency) == 1 else True
                 if not double_check:
                     st.error("'위 내용을 확인했습니다'에 체크해야 등록할 수 있어요.")
+                    _log_upload_attempt(my_name, "register_blocked", n_rows=len(pay_preview), n_ok=len(valid_rows), detail="확인 체크 안 함")
                 elif not total_ok:
                     st.error(f"입력하신 금액이 합계({batch_total:,.0f})와 달라요 — 다시 확인해주세요.")
+                    _log_upload_attempt(my_name, "register_blocked", n_rows=len(pay_preview), n_ok=len(valid_rows), detail="합계 재입력이 맞지 않음")
                 else:
                     batch_id = str(uuid.uuid4())
                     all_brands, saved_keys, save_err = set(), set(), None
@@ -3687,6 +3723,8 @@ if _nav == "finance":
                             "person": "구정회", "category": "마진데이터",
                             "title": f"[지출발생] {brands_txt} · 총 {saved_total_line} · {len(saved_keys)}건 — 마진율 반영 필요",
                         }).execute()
+                    _log_upload_attempt(my_name, "failed" if save_err else "registered", n_rows=len(valid_rows), n_ok=len(saved_keys),
+                                        n_blocked=(len(valid_rows) - len(saved_keys)) or None, detail=save_err)
                     if save_err:
                         # 일부만 저장됐으면 저장된 건은 목록에서 빼서, 다시 눌러도 중복 저장되지 않게 한다
                         st.session_state["payment_rows_preview"] = [x for x in pay_preview if x.get("dedup_key") not in saved_keys]
