@@ -1,6 +1,7 @@
 import os
 import io
 import re
+import unicodedata
 import html
 import calendar
 import json
@@ -953,8 +954,8 @@ def _render_invoice_section(c, brand, can_edit, my_name, refresh):
         if data is None:
             return
         if st.button("📌 이 인보이스로 확정", type="primary", key=f"{ns}_save"):
-            if not data["amount"] or not data["currency"]:
-                st.error("청구 금액과 통화를 확인해서 선택해주세요. (결제 정보는 자동으로 확정하지 않아요)")
+            if not data["amount"] or not data["currency"] or not data.get("vat_type"):
+                st.error("청구 금액·통화·부가세 구분을 확인해서 선택해주세요. (결제 정보는 자동으로 확정하지 않아요)")
                 return
             try:
                 url, name = _invoice_store_file(data, cid)
@@ -965,13 +966,16 @@ def _render_invoice_section(c, brand, can_edit, my_name, refresh):
                 SUPA.table("sales_campaigns").update(_invoice_columns(data, url, name, my_name)).eq("id", cid).execute()
             except Exception as e:
                 st.error(
-                    "인보이스를 저장하지 못했어요. DB에 인보이스 칸(migrations/20261006_sales_campaigns_invoice_columns.sql)이 "
+                    "인보이스를 저장하지 못했어요. DB에 인보이스 칸(migrations/20261006_sales_campaigns_invoice_columns.sql, 20261009_margin_data_collection.sql)이 "
                     f"적용돼 있는지 확인해주세요. ({type(e).__name__}: {e})"
                 )
                 return
             for k in ("res", "sig", "parsed", "amt_opts"):
                 st.session_state.pop(f"{ns}_{k}", None)
             refresh()
+
+
+VAT_TYPES = ["별도 (공급가, 입금 때 +10%)", "포함 (공급가+부가세 합계)", "해당없음 (해외·면세)"]
 
 
 def _invoice_input_ui(ns, brand, campaign_name, open_date):
@@ -1027,7 +1031,12 @@ def _invoice_input_ui(ns, brand, campaign_name, open_date):
         final_amt = v or None
     elif amt_pick:
         final_amt = amts[opts.index(amt_pick)]
-    return {"up": up, "picked": picked, "number": inv_no.strip() or None, "currency": inv_cur, "amount": final_amt}
+    v1, v2 = st.columns(2)
+    issue = v1.date_input("인보이스 발행일 (입금내역과 맞출 때 써요)", value=None, key=f"{ns}_issue")
+    vat_type = v2.selectbox("청구 금액의 부가세 (확인 필수)", VAT_TYPES, index=None, placeholder="선택", key=f"{ns}_vat",
+                            help="마진율은 부가세를 뺀 금액으로 계산해야 해서, 위 청구 금액에 부가세가 들어있는지 꼭 골라주세요. 추측하지 않아요.")
+    return {"up": up, "picked": picked, "number": inv_no.strip() or None, "currency": inv_cur, "amount": final_amt,
+            "issue_date": issue, "vat_type": vat_type}
 
 
 def _invoice_store_file(data, folder_id):
@@ -1046,6 +1055,8 @@ def _invoice_columns(data, url, name, my_name):
         "invoice_url": url, "invoice_name": name, "invoice_number": data["number"],
         "invoice_amount": data["amount"], "invoice_currency": data["currency"],
         "invoice_attached_by": my_name, "invoice_attached_at": datetime.utcnow().isoformat() + "Z",
+        **({"invoice_issue_date": data["issue_date"].isoformat()} if data.get("issue_date") else {}),
+        **({"invoice_vat_type": data["vat_type"]} if data.get("vat_type") else {}),  # 칸이 아직 없는 DB에서도 날짜를 안 적으면 저장됨
     }
 
 
@@ -1844,29 +1855,48 @@ def _suggest_campaign_ids(brand_text, camps):
     return picks
 
 
-def _split_payment_ratio(amount, n):
-    """한 송금(콘텐츠 비용)을 n개 캠페인에 균등 배분한다. [(비율, 금액)] — 합이 정확히 1, 정확히 amount가 되게 마지막에 나머지를 붙인다."""
+def _parse_ratio_text(text, n):
+    """'50,30,20' 같은 배분비율(%) 입력을 읽는다. 비워두면 (None, None)=균등. 개수가 n과 다르거나 합이 100이 아니면 에러 문구."""
+    t = (text or "").replace("%", " ").replace(",", " ").strip()
+    if not t:
+        return None, None
+    try:
+        w = [float(x) for x in t.split()]
+    except ValueError:
+        return None, "배분비율은 숫자로만 적어주세요 (예: 50, 30, 20)."
+    if len(w) != n:
+        return None, f"캠페인이 {n}개라 비율도 {n}개를 적어주세요 (선택한 순서대로)."
+    if any(x <= 0 for x in w) or abs(sum(w) - 100) > 0.01:
+        return None, f"비율은 모두 0보다 크고 합이 100이어야 해요 (지금 합계 {sum(w):g})."
+    return w, None
+
+
+def _split_payment_ratio(amount, n, weights=None):
+    """한 송금(콘텐츠 비용)을 n개 캠페인에 나눈다. weights(%)가 없으면 균등. [(비율, 금액)] — 합이 정확히 1, 정확히 amount가 되게 마지막에 나머지를 붙인다."""
     amount = float(amount or 0)
+    shares = [w / 100 for w in weights] if weights else [1 / n] * n
     out, used_r, used_a = [], 0.0, 0.0
     for i in range(n):
         if i == n - 1:
             r, a = round(1 - used_r, 6), round(amount - used_a, 2)
         else:
-            r, a = round(1 / n, 6), round(amount / n, 2)
+            r, a = round(shares[i], 6), round(amount * shares[i], 2)
         used_r += r
         used_a += a
         out.append((r, a))
     return out
 
 
-def _save_payment_matches(payment_id, amount, currency, campaign_ids, my_name):
-    """송금과 캠페인의 연결을 저장한다(균등 배분). 반환: 에러 문구(성공이면 None)"""
+def _save_payment_matches(payment_id, amount, currency, campaign_ids, my_name, weights=None):
+    """송금과 캠페인의 연결을 저장한다(기본 균등, weights(%)가 있으면 그 비율). 반환: 에러 문구(성공이면 None)"""
     ids = list(dict.fromkeys(campaign_ids or []))
     if not ids:
         return "연결할 캠페인을 하나 이상 선택해주세요."
+    if weights is not None and len(weights) != len(ids):
+        return "배분비율 개수와 캠페인 개수가 달라요."
     rows = [{"payment_request_id": payment_id, "campaign_id": cid, "ratio": r, "allocated_amount": a,
              "currency": currency or "KRW", "matched_by": my_name}
-            for cid, (r, a) in zip(ids, _split_payment_ratio(amount, len(ids)))]
+            for cid, (r, a) in zip(ids, _split_payment_ratio(amount, len(ids), weights))]
     try:
         SUPA.table("payment_request_campaigns").insert(rows).execute()
     except Exception as e:
@@ -2102,6 +2132,95 @@ def load_okr():
     org = SUPA.table("okr_org").select("*").order("person").execute().data
     items = SUPA.table("okr_items").select("*").order("person").execute().data
     return org, items
+
+
+@st.cache_data(ttl=300)
+def load_fin_categories():
+    return {c["id"]: c for c in SUPA.table("fin_account_categories").select("id,code,name,type").execute().data}
+
+
+@st.cache_data(ttl=60)
+def load_client_deposits(since_iso):
+    """같은 Supabase DB의 bank_transactions 중 '대표가 계정과목을 확정한 매출 입금'만.
+    조건: 입금(direction='in') + 분류가 매출(fin_account_categories.type='revenue') + 자동분류 아님(is_auto_categorized 가 True가 아님).
+    분류 전·내부이체·이자 등은 제외. 계좌번호(account_label)는 가져오지 않는다."""
+    cats = load_fin_categories()
+    rows = (SUPA.table("bank_transactions").select("id,txn_date,amount,description,account_category_id,is_auto_categorized")
+            .eq("direction", "in").gte("txn_date", since_iso).not_.is_("account_category_id", "null")
+            .order("txn_date", desc=True).limit(500).execute().data)
+    out = []
+    for r in rows:
+        cat = cats.get(r.get("account_category_id"))
+        if not cat or cat.get("type") != "revenue" or r.get("is_auto_categorized"):
+            continue
+        out.append({**r, "category": cat["name"]})
+    return out
+
+
+_NAME_NOISE = re.compile(r"주식회사|유한회사|유한책임회사|\(주\)|\(유\)|㈜|체크입금|[\s()\[\]·.,\-_/]")
+_BANK_PREFIX = re.compile(r"^(국민|기업|신한|우리|하나|농협|카카오|토스)")
+
+
+def _norm_company(text):
+    """은행 입금자명과 브랜드명을 비교하기 좋게 다듬는다(전각→반각, '(주)'·'주식회사'·은행이름 앞붙임·공백 제거)."""
+    t = unicodedata.normalize("NFKC", str(text or "")).lower()
+    t = _NAME_NOISE.sub("", t)
+    return _BANK_PREFIX.sub("", t)  # 입금자명 앞에 붙는 은행 이름만 제거
+
+
+def _to_date(v):
+    try:
+        return date.fromisoformat(str(v)[:10]) if v else None
+    except ValueError:
+        return None
+
+
+def _match_deposits(deposits, camps, account_by_id):
+    """입금 ↔ 인보이스 매칭(제안만, DB에 저장하지 않음). 이미 정해진 데이터(입금자명·금액·날짜)만 비교한다.
+    이름: 입금자명(은행이 앞 10자 안팎만 줌)이 브랜드명/캠페인명/인보이스 파일명과 서로 포함되면 후보.
+    금액: 인보이스 금액과 같거나 부가세 10% 포함액이면 '금액 일치'. 날짜: 입금일 − 인보이스 발행일(없으면 첨부일)."""
+    res = []
+    for d in deposits:
+        dn = _norm_company(d["description"])
+        paid = float(d["amount"] or 0)
+        dd = _to_date(d["txn_date"])
+        best = None
+        for c in camps:
+            if c.get("invoice_amount") is None or len(dn) < 2:
+                continue
+            brand = (account_by_id.get(c.get("account_id")) or {}).get("brand_name", "")
+            names = [_norm_company(x) for x in (brand, c.get("campaign_name"), c.get("invoice_name")) if x]
+            if not any(n and (dn in n or n in dn) for n in names):
+                continue
+            inv = float(c["invoice_amount"])
+            amt_ok = c.get("invoice_currency") in (None, "KRW") and (abs(paid - inv) < 1 or abs(paid - round(inv * 1.1)) < 1)
+            idate = _to_date(c.get("invoice_issue_date")) or _to_date(c.get("invoice_attached_at"))
+            diff = (dd - idate).days if dd and idate else None
+            date_ok = diff is not None and -3 <= diff <= 90
+            score = (amt_ok, date_ok, -abs(diff) if diff is not None else -9999)
+            if best is None or score > best[0]:
+                best = (score, c, brand, amt_ok, date_ok, diff, idate, bool(c.get("invoice_issue_date")))
+        if best is None:
+            res.append({"dep": d, "status": "❔ 매칭 없음"})
+            continue
+        _, c, brand, amt_ok, date_ok, diff, idate, has_issue = best
+        status = "✅ 일치" if amt_ok and date_ok else ("🔎 후보(금액 불일치)" if date_ok else "🔎 후보(확인 필요)")
+        res.append({"dep": d, "status": status, "brand": brand, "campaign": c["campaign_name"], "campaign_id": c["id"], "inv_no": c.get("invoice_number"),
+                    "inv_amt": float(c["invoice_amount"]), "idate": idate, "has_issue": has_issue, "diff": diff, "amt_ok": amt_ok})
+    return res
+
+
+@st.cache_data(ttl=30)
+def load_deposit_links():
+    """입금 확인(campaign_deposit_links): {bank_transaction_id: [(campaign_id, allocated_amount)]}. 테이블이 아직 없으면 (None, 에러문구)."""
+    try:
+        rows = SUPA.table("campaign_deposit_links").select("bank_transaction_id,campaign_id,allocated_amount").limit(5000).execute().data
+    except Exception as e:
+        return None, f"{type(e).__name__}: {e}"
+    out = {}
+    for r in rows:
+        out.setdefault(r["bank_transaction_id"], []).append((r["campaign_id"], float(r["allocated_amount"] or 0)))
+    return out, None
 
 
 @st.cache_data(ttl=30)
@@ -3299,9 +3418,21 @@ if _nav == "finance":
                             format_func=lambda i: camp_label_by_id.get(i, i), key=f"campaigns_{_pv}_{idx}",
                             help="이 콘텐츠 비용은 선택한 캠페인에 균등하게 나뉘어 마진 계산에 쓰여요. 파일에 적힌 브랜드는 참고용으로 미리 골라드려요.",
                         )
-                        if len(r["campaign_ids"]) > 1 and r.get("amount"):
-                            r_amt = float(r["amount"]) / len(r["campaign_ids"])
-                            st.caption(f"📊 {len(r['campaign_ids'])}개 캠페인에 균등 배분 → 캠페인당 약 {r_amt:,.0f} ({r.get('currency') or 'KRW'})")
+                        r["ratio_err"], r["ratio_weights"] = None, None
+                        if len(r["campaign_ids"]) > 1:
+                            r["ratio_text"] = st.text_input(
+                                "PPL 배분비율 % (선택 — 비우면 균등)", value=r.get("ratio_text") or "", key=f"ratio_{_pv}_{idx}",
+                                placeholder="예: 50, 30, 20 (위에서 고른 순서대로, 합 100)",
+                                help="한 콘텐츠에 여러 브랜드가 나올 때 노출 비중대로 비용을 나눠요. 마진율 계산에 그대로 쓰여요.")
+                            _w, r["ratio_err"] = _parse_ratio_text(r["ratio_text"], len(r["campaign_ids"]))
+                            r["ratio_weights"] = _w
+                            if r["ratio_err"]:
+                                st.error(r["ratio_err"])
+                            elif r.get("amount"):
+                                _shares = _split_payment_ratio(r["amount"], len(r["campaign_ids"]), _w)
+                                st.caption("📊 " + ("비율대로" if _w else "균등") + " 배분 → " + " / ".join(
+                                    f"{camp_label_by_id.get(i, '?').split(' · 오픈')[0]} {a:,.0f}" for i, (_, a) in zip(r["campaign_ids"], _shares))
+                                    + f" ({r.get('currency') or 'KRW'})")
                     elif match_err:
                         st.error(f"캠페인 목록을 불러오지 못했어요 ({match_err})")
                     else:
@@ -3331,7 +3462,7 @@ if _nav == "finance":
                     r["contract_confirmed"] = cc2.checkbox("계약서 확인함(또는 해당없음)", key=f"contract_confirm_{_pv}_{idx}")
 
                     pay_preview[idx] = r
-                    fully_checked = not _missing_fields(r) and r["id_doc_confirmed"] and r["contract_confirmed"]
+                    fully_checked = not _missing_fields(r) and r["id_doc_confirmed"] and r["contract_confirmed"] and not r.get("ratio_err")
                     if not fully_checked:
                         missing_checks = []
                         if not r["id_doc_confirmed"]:
@@ -3365,6 +3496,7 @@ if _nav == "finance":
                 "이름": r.get("influencer_name"), "금액": f"{float(r.get('amount') or 0):,.0f}", "통화": r.get("currency", "KRW"),
                 "결제수단": r.get("payment_method_raw"),
                 "매칭 캠페인": " / ".join(camp_label_by_id.get(i, "?").split(" · 오픈")[0] for i in r.get("campaign_ids") or []),
+                "배분": ("비율 " + "/".join(f"{w:g}" for w in r["ratio_weights"])) if r.get("ratio_weights") else ("균등" if len(r.get("campaign_ids") or []) > 1 else "-"),
                 "송금예정일": r.get("scheduled_date"),
                 "콘텐츠링크": r.get("content_link"),
             } for r in valid_rows]), hide_index=True, use_container_width=True)
@@ -3437,7 +3569,7 @@ if _nav == "finance":
                                 "submitted_by": my_name,
                             }).execute()
                             # 캠페인 연결이 없으면 마진 계산에서 빠지므로, 연결 저장에 실패하면 이 송금도 저장하지 않는다
-                            link_err = _save_payment_matches(ins.data[0]["id"], r.get("amount"), r.get("currency", "KRW"), camp_ids, my_name)
+                            link_err = _save_payment_matches(ins.data[0]["id"], r.get("amount"), r.get("currency", "KRW"), camp_ids, my_name, r.get("ratio_weights"))
                             if link_err:
                                 try:
                                     SUPA.table("payment_requests").delete().eq("id", ins.data[0]["id"]).execute()
@@ -3572,7 +3704,7 @@ if _nav == "mywork":
         account_by_id = {a["id"]: a for a in all_sales_accounts}
         STATUS_OPTS_ACC = ["협상중", "계약완료", "운영중", "종료", "이탈"]
 
-        _SALES_NAV = {"reg": "📝 캠페인 등록", "big": "🗓️ 큰 캘린더", "fc": "🔮 다음달 예측", "cal": "📅 일정 한눈에보기",
+        _SALES_NAV = {"reg": "📝 캠페인 등록", "big": "🗓️ 큰 캘린더", "fc": "🔮 다음달 예측", "cal": "📅 일정 한눈에보기", "dep": "💰 최근 입금내역",
                       "acc": "🏢 계정 관리", "issue": "🐛 이슈", "camp": "🚀 캠페인·주차루틴"}
         _snav = st.radio("세일즈 화면", list(_SALES_NAV), format_func=_SALES_NAV.get, horizontal=True,
                          key="sales_nav", label_visibility="collapsed")
@@ -3581,6 +3713,99 @@ if _nav == "mywork":
         if _snav == "big":
             st.caption("모든 직원의 '📋 캠페인' 탭에도 똑같이 보여요. 여기서 등록한 캠페인과 인보이스가 그대로 반영됩니다.")
             _render_campaign_hub("hubsales", my_name, True, mine_filter=True)
+
+        if _snav == "dep":
+            if my_name not in INVOICE_EDITORS:  # 김선재(+테스트 계정 가상인턴)만. 다른 직원에겐 보이지 않는다
+                st.info("이 화면은 세일즈 담당자만 볼 수 있어요.")
+            else:
+                st.caption("대표님이 계정과목을 **매출로 확정한** 입금내역만 가져와서, 입금자명·금액·날짜로 등록된 인보이스와 맞춰봐요. "
+                           "맞춰보기만 하고 저장은 하지 않아요. 계좌번호는 표시하지 않고, 최대 1분 늦게 반영될 수 있어요.")
+                _dp_days = st.radio("기간", [30, 90, 365], format_func=lambda d: f"최근 {d}일", horizontal=True, key="dep_days")
+                try:
+                    _deps = load_client_deposits((date.today() - timedelta(days=_dp_days)).isoformat())
+                except Exception as e:
+                    st.error(f"❌ 입금내역을 불러오지 못했어요 ({type(e).__name__}: {e})")
+                    _deps = []
+                if not _deps:
+                    st.info("이 기간에 대표님이 매출로 확정한 입금 내역이 없어요.")
+                else:
+                    _m = _match_deposits(_deps, load_sales_campaigns(), account_by_id)
+                    _links, _links_err = load_deposit_links()
+                    _camp_label = {c["id"]: f"{(account_by_id.get(c.get('account_id')) or {}).get('brand_name', '?')} · {c['campaign_name']}"
+                                   for c in load_sales_campaigns()}
+                    for x in _m:
+                        if _links and x["dep"]["id"] in _links:
+                            x["status"] = "✔ 확인 저장됨"
+                    _mon = date.today().strftime("%Y-%m")
+                    dm1, dm2, dm3 = st.columns(3)
+                    dm1.metric("이번 달 입금 합계", f"₩{sum(float(d['amount'] or 0) for d in _deps if str(d['txn_date'])[:7] == _mon):,.0f}")
+                    dm2.metric("인보이스와 일치", f"{sum(1 for x in _m if x['status'] == '✅ 일치')}건")
+                    dm3.metric("확인 저장 완료", f"{sum(1 for x in _m if x['status'] == '✔ 확인 저장됨')}건")
+                    _rows = []
+                    for x in _m:
+                        d = x["dep"]
+                        diff = x.get("diff")
+                        _rows.append({
+                            "입금일": str(d["txn_date"])[:10], "입금자": d["description"] or "-", "금액": f"₩{float(d['amount'] or 0):,.0f}",
+                            "분류": d["category"], "매칭": x["status"],
+                            "브랜드·캠페인": f"{x['brand']} · {x['campaign']}" if x.get("campaign") else "-",
+                            "인보이스": (f"{x.get('inv_no') or '번호없음'} / {x['inv_amt']:,.0f}" if x.get("campaign") else "-"),
+                            "발행일→입금": (f"{diff}일 후" + ("" if x["has_issue"] else " (첨부일 기준)")) if diff is not None else "-",
+                        })
+                    _dep_df = pd.DataFrame(_rows)
+                    st.dataframe(_dep_df, hide_index=True, use_container_width=True)
+                    st.caption("✅ 일치 = 이름이 비슷하고, 금액이 인보이스와 같거나 부가세 10% 포함액이며, 입금일이 발행일 −3일~+90일 안. 은행은 입금자명을 앞 10자 안팎만 줘서 '후보'로 뜨는 건 눈으로 확인해주세요.")
+                    st.download_button("📥 CSV로 받기", _dep_df.to_csv(index=False).encode("utf-8-sig"),
+                                       file_name="업체입금_인보이스매칭.csv", mime="text/csv", key="dep_csv")
+
+                    # ── 입금 확인 저장: 김선재가 '이 입금은 이 캠페인 몫'이라고 확정한 것만 DB에 남긴다(현금기준 캠페인 매출의 근거) ──
+                    st.markdown("#### ✅ 입금 확인하기")
+                    if _links_err:
+                        st.warning("입금 확인을 저장하는 칸이 아직 DB에 없어요. `migrations/20261009_margin_data_collection.sql`을 적용하면 이 기능이 켜져요. "
+                                   f"({_links_err[:120]})")
+                    else:
+                        _todo = [x for x in _m if x["status"] != "✔ 확인 저장됨"][:30]
+                        if not _todo:
+                            st.success("확인할 입금이 없어요. 모두 확인 저장됐어요.")
+                        else:
+                            st.caption("입금마다 어느 캠페인 몫인지 골라주세요(비워두면 저장 안 함). 한 입금이 여러 캠페인 몫이면 여러 개 고르고, 비율(%)을 적으면 그 비율로, 비우면 균등하게 나눠요. 아래 '확인 저장'을 눌러야 저장돼요.")
+                            _opts = list(_camp_label)
+                            with st.form("dep_confirm_form"):
+                                _picks = {}
+                                for x in _todo:
+                                    d = x["dep"]
+                                    with st.container(border=True):
+                                        st.markdown(f"**{str(d['txn_date'])[:10]} · {d['description'] or '-'} · ₩{float(d['amount'] or 0):,.0f}** — {x['status']}")
+                                        dflt = [x["campaign_id"]] if x["status"] == "✅ 일치" and x.get("campaign_id") in _camp_label else []  # 이름·금액·날짜 모두 맞은 것만 미리 골라둠
+                                        sel = st.multiselect("캠페인", _opts, default=dflt, format_func=lambda i: _camp_label.get(i, i), key=f"depsel_{d['id']}")
+                                        rt = st.text_input("비율 % (선택)", key=f"deprt_{d['id']}", placeholder="여러 캠페인일 때만, 예: 60, 40")
+                                        _picks[d["id"]] = (d, sel, rt)
+                                dep_save = st.form_submit_button("✅ 선택한 입금 확인 저장 (여기서 저장돼요)", type="primary")
+                            if dep_save:
+                                _rows, _errs = [], []
+                                for did, (d, sel, rt) in _picks.items():
+                                    if not sel:
+                                        continue
+                                    w, werr = _parse_ratio_text(rt, len(sel)) if len(sel) > 1 else (None, None)
+                                    if werr:
+                                        _errs.append(f"{d['description']}: {werr}")
+                                        continue
+                                    for cid, (r_, a_) in zip(sel, _split_payment_ratio(d["amount"], len(sel), w)):
+                                        _rows.append({"bank_transaction_id": did, "campaign_id": cid, "ratio": r_,
+                                                      "allocated_amount": a_, "matched_by": my_name})
+                                if _errs:
+                                    st.error("비율을 확인해주세요 — " + " / ".join(_errs))
+                                elif not _rows:
+                                    st.info("고른 입금이 없어요.")
+                                else:
+                                    try:
+                                        SUPA.table("campaign_deposit_links").insert(_rows).execute()
+                                    except Exception as e:
+                                        st.error(f"입금 확인을 저장하지 못했어요 ({type(e).__name__}: {e})")
+                                    else:
+                                        load_deposit_links.clear()
+                                        _flash(f"입금 {len({r['bank_transaction_id'] for r in _rows})}건을 캠페인에 연결해 저장했어요.")
+                                        st.rerun()
 
         if _snav == "fc":
             _t = date.today()
@@ -3837,8 +4062,8 @@ if _nav == "mywork":
                         st.error("캠페인명을 입력해주세요.")
                     elif camp_brand == NEW_BRAND and not new_brand_name.strip():
                         st.error("새 브랜드명을 입력해주세요.")
-                    elif inv_data and (not inv_data["amount"] or not inv_data["currency"]):
-                        st.error("인보이스의 청구 금액과 통화를 확인해서 선택해주세요. (결제 정보는 자동으로 확정하지 않아요) — 인보이스를 나중에 첨부하려면 위 인보이스 파일 선택을 비워주세요.")
+                    elif inv_data and (not inv_data["amount"] or not inv_data["currency"] or not inv_data.get("vat_type")):
+                        st.error("인보이스의 청구 금액·통화·부가세 구분을 확인해서 선택해주세요. (결제 정보는 자동으로 확정하지 않아요) — 인보이스를 나중에 첨부하려면 위 인보이스 파일 선택을 비워주세요.")
                     else:
                         if camp_brand == NEW_BRAND:
                             nb = new_brand_name.strip()
