@@ -1622,9 +1622,87 @@ def _payment_template_xlsx():
     return buf.getvalue()
 
 
+_LINK_END = r"\s<>\"'，。、）)】」"
+_URL_RX = re.compile(r"https?://[^" + _LINK_END + r"]+", re.I)
+_BARE_RX = re.compile(r"(?<![\w@.])((?:[a-z0-9-]+\.)+[a-z]{2,}/[^" + _LINK_END + r"]*)", re.I)
+_QUERY_FREE_HOSTS = ("instagram.com", "tiktok.com", "xiaohongshu.com", "xhslink.com", "douyin.com", "youtu.be")
+_TRACK_PARAMS = ("utm_", "fbclid", "igshid", "igsh", "si", "share_id", "xsec_", "app_platform", "share_from")
+
+
+def _extract_link(text):
+    """칸에 적힌 글에서 링크를 꺼낸다. 샤오홍슈 공유문구('【제목】 😆 xxx 😆 http://xhslink.com/…')처럼 글이 섞여 있어도 http 링크만 뽑고,
+    'xhslink.com/abc'처럼 http가 빠진 것도 받는다. 링크가 안 보이면 None. 접속해서 확인하지는 않는다(샤오홍슈는 접근이 안 돼서) — 담당자를 믿는다."""
+    t = str(text or "").strip()
+    m = _URL_RX.search(t)
+    if m:
+        return m.group(0).rstrip(".,;")
+    m = _BARE_RX.search(t)
+    return ("https://" + m.group(1).rstrip(".,;")) if m else None
+
+
+def _norm_link(url):
+    """같은 콘텐츠인지 비교하기 위한 값: 소문자·www/끝 슬래시·추적용 꼬리표(utm, xsec_token 등)·#뒷부분 제거."""
+    from urllib.parse import urlsplit, parse_qsl
+    u = urlsplit(url.strip())
+    host = (u.hostname or "").lower().removeprefix("www.")
+    path = u.path.rstrip("/")
+    if host.endswith(_QUERY_FREE_HOSTS):
+        return host + path
+    q = "&".join(f"{k}={v}" for k, v in sorted(parse_qsl(u.query)) if not k.lower().startswith(_TRACK_PARAMS))
+    return host + path + ("?" + q if q else "")
+
+
+@st.cache_data(ttl=10)
+def load_existing_links():
+    """이미 등록된 송금의 콘텐츠 링크(정규화한 값 집합). 같은 링크를 두 번 쓸 수 없다."""
+    rows = SUPA.table("payment_requests").select("content_link").not_.is_("content_link", "null").limit(20000).execute().data
+    out = set()
+    for r in rows:
+        u = _extract_link(r.get("content_link"))
+        if u:
+            out.add(_norm_link(u))
+    return out
+
+
+def _check_link(r, idx, existing, seen):
+    """링크가 있으면 정리해서 r에 넣고, 문제(링크 아님·이미 등록·이 신청서 안에서 중복)가 있으면 문구를, 없으면 None을 돌려준다."""
+    raw = r.get("content_link")
+    if not raw:
+        return None
+    u = _extract_link(raw)
+    if not u:
+        return f"'{str(raw)[:40]}'에서 링크를 찾지 못했어요. 인스타·틱톡·샤오홍슈 등 업로드된 콘텐츠 링크를 붙여넣어주세요."
+    r["content_link"] = u
+    k = _norm_link(u)
+    if k in existing:
+        return "이미 등록된 콘텐츠 링크예요. 같은 링크는 두 번 쓸 수 없어요 — 다른 링크이거나 이미 올린 건이 아닌지 확인해주세요."
+    if seen.get(k, idx) != idx:
+        return f"이 신청서의 {seen[k] + 1}번째 건과 같은 링크예요. 같은 링크는 한 번만 쓸 수 있어요."
+    seen[k] = idx
+    return None
+
+
 def _flash(msg):
     """성공 메시지를 '다음 화면'에 보여준다. (st.success 바로 뒤에 st.rerun()/refresh()를 하면 메시지가 사라지기 때문)"""
     st.session_state["flash_msg"] = msg
+
+
+def _log_upload_attempt(person, stage, file_name=None, n_rows=None, n_ok=None, n_blocked=None, missing=None, detail=None, kind="payment"):
+    """직원이 송금정보를 불러오거나 등록을 시도한 '흔적'을 남긴다(대표님이 개선 지시를 하려고 보는 기록).
+    금액·이름·계좌·링크는 넣지 않고 건수와 빠진 항목 이름만 저장. 테이블이 없거나 실패해도 직원 화면은 절대 막지 않는다."""
+    try:
+        if stage == "loaded":  # 새 파일을 불러오면 새 작업 흐름
+            st.session_state.pop("_attempt_sid", None)
+        sid = st.session_state.setdefault("_attempt_sid", str(uuid.uuid4()))
+        SUPA.table("staff_upload_attempts").insert({
+            "person": person, "kind": kind, "stage": stage, "file_name": file_name,
+            "n_rows": n_rows, "n_ok": n_ok, "n_blocked": n_blocked,
+            "missing": missing or None, "detail": (str(detail)[:500] if detail else None), "session_id": sid,
+        }).execute()
+        if stage == "registered":  # 끝까지 갔으면 흐름 종료
+            st.session_state.pop("_attempt_sid", None)
+    except Exception:
+        pass
 
 
 @st.cache_data(ttl=15)
@@ -2139,10 +2217,13 @@ def load_fin_categories():
     return {c["id"]: c for c in SUPA.table("fin_account_categories").select("id,code,name,type").execute().data}
 
 
+DEPOSIT_MIN_AMOUNT = 3_000_000  # 업체 입금으로 볼 최소 금액(10/12 대표 지시)
+
+
 @st.cache_data(ttl=60)
 def load_client_deposits(since_iso):
     """같은 Supabase DB의 bank_transactions 중 '대표가 계정과목을 확정한 매출 입금'만.
-    조건: 입금(direction='in') + 분류가 매출(fin_account_categories.type='revenue') + 자동분류 아님(is_auto_categorized 가 True가 아님).
+    조건: 입금(direction='in') + 분류가 매출(fin_account_categories.type='revenue') + 자동분류 아님(is_auto_categorized 가 True가 아님) + 금액 DEPOSIT_MIN_AMOUNT 이상.
     분류 전·내부이체·이자 등은 제외. 계좌번호(account_label)는 가져오지 않는다."""
     cats = load_fin_categories()
     rows = (SUPA.table("bank_transactions").select("id,txn_date,amount,description,account_category_id,is_auto_categorized")
@@ -2152,6 +2233,8 @@ def load_client_deposits(since_iso):
     for r in rows:
         cat = cats.get(r.get("account_category_id"))
         if not cat or cat.get("type") != "revenue" or r.get("is_auto_categorized"):
+            continue
+        if float(r.get("amount") or 0) < DEPOSIT_MIN_AMOUNT:  # 체크입금·이자 같은 잔돈은 업체 입금이 아니라 제외
             continue
         out.append({**r, "category": cat["name"]})
     return out
@@ -2177,7 +2260,7 @@ def _to_date(v):
 
 def _match_deposits(deposits, camps, account_by_id):
     """입금 ↔ 인보이스 매칭(제안만, DB에 저장하지 않음). 이미 정해진 데이터(입금자명·금액·날짜)만 비교한다.
-    이름: 입금자명(은행이 앞 10자 안팎만 줌)이 브랜드명/캠페인명/인보이스 파일명과 서로 포함되면 후보.
+    이름: 입금자명(은행이 앞 10자 안팎만 줌)이 브랜드명/캠페인명/계약서·인보이스 파일명(계약서상 거래처명이 들어있는 경우가 많음)과 서로 포함되면 후보.
     금액: 인보이스 금액과 같거나 부가세 10% 포함액이면 '금액 일치'. 날짜: 입금일 − 인보이스 발행일(없으면 첨부일)."""
     res = []
     for d in deposits:
@@ -2186,27 +2269,28 @@ def _match_deposits(deposits, camps, account_by_id):
         dd = _to_date(d["txn_date"])
         best = None
         for c in camps:
-            if c.get("invoice_amount") is None or len(dn) < 2:
+            if len(dn) < 2:
                 continue
             brand = (account_by_id.get(c.get("account_id")) or {}).get("brand_name", "")
-            names = [_norm_company(x) for x in (brand, c.get("campaign_name"), c.get("invoice_name")) if x]
+            names = [_norm_company(x) for x in (brand, c.get("campaign_name"), c.get("contract_name"), c.get("invoice_name")) if x]
             if not any(n and (dn in n or n in dn) for n in names):
                 continue
-            inv = float(c["invoice_amount"])
-            amt_ok = c.get("invoice_currency") in (None, "KRW") and (abs(paid - inv) < 1 or abs(paid - round(inv * 1.1)) < 1)
+            inv = float(c["invoice_amount"]) if c.get("invoice_amount") is not None else None  # 인보이스가 아직 없어도 이름으로는 후보를 보여준다
+            amt_ok = inv is not None and c.get("invoice_currency") in (None, "KRW") and (abs(paid - inv) < 1 or abs(paid - round(inv * 1.1)) < 1)
             idate = _to_date(c.get("invoice_issue_date")) or _to_date(c.get("invoice_attached_at"))
             diff = (dd - idate).days if dd and idate else None
             date_ok = diff is not None and -3 <= diff <= 90
-            score = (amt_ok, date_ok, -abs(diff) if diff is not None else -9999)
+            score = (amt_ok, date_ok, inv is not None, -abs(diff) if diff is not None else -9999)
             if best is None or score > best[0]:
                 best = (score, c, brand, amt_ok, date_ok, diff, idate, bool(c.get("invoice_issue_date")))
         if best is None:
             res.append({"dep": d, "status": "❔ 매칭 없음"})
             continue
         _, c, brand, amt_ok, date_ok, diff, idate, has_issue = best
-        status = "✅ 일치" if amt_ok and date_ok else ("🔎 후보(금액 불일치)" if date_ok else "🔎 후보(확인 필요)")
+        status = ("✅ 일치" if amt_ok and date_ok else "🔎 후보(인보이스 없음)" if c.get("invoice_amount") is None
+                  else "🔎 후보(금액 불일치)" if date_ok else "🔎 후보(확인 필요)")
         res.append({"dep": d, "status": status, "brand": brand, "campaign": c["campaign_name"], "campaign_id": c["id"], "inv_no": c.get("invoice_number"),
-                    "inv_amt": float(c["invoice_amount"]), "idate": idate, "has_issue": has_issue, "diff": diff, "amt_ok": amt_ok})
+                    "inv_amt": float(c["invoice_amount"]) if c.get("invoice_amount") is not None else None, "idate": idate, "has_issue": has_issue, "diff": diff, "amt_ok": amt_ok})
     return res
 
 
@@ -3102,6 +3186,7 @@ if _nav == "finance":
             std_sheets, std_err = _read_uploaded_sheet_file(std_file)
             if std_sheets is None:
                 st.error(f"❌ {std_err}")
+                _log_upload_attempt(my_name, "parse_failed", file_name=std_file.name, detail=std_err)
             else:
                 std_existing = {
                     r["dedup_key"] for r in SUPA.table("payment_requests").select("dedup_key").execute().data if r.get("dedup_key")
@@ -3109,11 +3194,15 @@ if _nav == "finance":
                 std_rows, std_problems, std_dup = _parse_standard_payment_sheets(std_sheets, std_existing)
                 st.session_state["pay_std_problems"] = std_problems
                 if not std_rows:
+                    _log_upload_attempt(my_name, "parse_failed", file_name=std_file.name, n_rows=0,
+                                        detail="등록할 행을 못 찾음" + (f" (이미 등록된 {std_dup}건 제외)" if std_dup else ""))
                     st.error(
                         "❌ 등록할 행을 못 찾았어요. 표준 양식의 제목줄(이름·금액 열)이 있는지 확인해주세요."
                         + (f" (이미 등록된 {std_dup}건은 제외)" if std_dup else "")
                     )
                 else:
+                    _log_upload_attempt(my_name, "loaded", file_name=std_file.name, n_rows=len(std_rows), n_blocked=len(std_problems) or None,
+                                        detail=("읽지 못한 행: " + " / ".join(str(x) for x in std_problems[:3])) if std_problems else None)
                     st.session_state["pay_ver"] = st.session_state.get("pay_ver", 0) + 1  # 이전 입력값이 남지 않게 입력칸을 새로 만든다
                     st.session_state["payment_rows_preview"] = std_rows
                     st.session_state.pop("payment_mapping_desc", None)
@@ -3384,8 +3473,18 @@ if _nav == "finance":
         st.markdown(f"**{len(pay_preview)}건 확인 중** — 빠진 항목은 아래에서 바로 채워주세요.")
 
         complete_rows = []
+        try:
+            _existing_links = load_existing_links()
+        except Exception as e:
+            _existing_links = set()
+            st.warning(f"기존 링크와 겹치는지 확인하지 못했어요 ({type(e).__name__}: {e}) — 등록할 때 다시 확인해요.")
+        _seen_links = {}
         with st.form("pay_review_form"):
             for idx, r in enumerate(pay_preview):
+                r["link_err"] = _check_link(r, idx, _existing_links, _seen_links)
+                if r["link_err"]:  # 문제 있는 링크는 비운 걸로 취급 → 아래 입력칸에서 바로 고치게
+                    r["link_bad"] = r["content_link"]
+                    r["content_link"] = None
                 missing = _missing_fields(r)
                 with st.container(border=True):
                     c1, c2 = st.columns([2, 1])
@@ -3396,12 +3495,19 @@ if _nav == "finance":
                     elif r.get("payment_method_raw"):
                         c1.warning("⏳ 페이팔이 아니라서 송금까지 **최대 1개월** 걸릴 수 있어요 — 별도 송금일정으로 처리됩니다.")
 
+                    if r.get("link_err"):
+                        st.error(f"🔗 콘텐츠 링크: {r['link_err']}")
                     if missing:
                         st.error(f"🚫 빠진 항목: {', '.join(FIELD_LABEL[f] for f in missing)} — 채워야 등록 가능")
 
                     # 빠진 필드를 그 자리에서 바로 채울 수 있게
                     if "content_link" in missing:
-                        r["content_link"] = st.text_input("콘텐츠 링크", key=f"fix_content_{_pv}_{idx}", placeholder="인스타/틱톡 업로드 링크") or None
+                        r["content_link"] = st.text_input("콘텐츠 링크", key=f"fix_content_{_pv}_{idx}", placeholder="인스타/틱톡/샤오홍슈 업로드 링크 (링크만 있으면 돼요)") or None
+                        if r["content_link"]:  # 방금 고쳐 쓴 링크도 같은 기준으로 다시 확인
+                            r["link_err"] = _check_link(r, idx, _existing_links, _seen_links)
+                            if r["link_err"]:
+                                st.error(f"🔗 {r['link_err']}")
+                                r["content_link"] = None
                     if "id_doc_link" in missing:
                         r["id_doc_link"] = st.text_input("신분증 사본 링크", key=f"fix_iddoc_{_pv}_{idx}", placeholder="구글드라이브 링크 등") or None
                     if "scheduled_date" in missing:
@@ -3462,7 +3568,7 @@ if _nav == "finance":
                     r["contract_confirmed"] = cc2.checkbox("계약서 확인함(또는 해당없음)", key=f"contract_confirm_{_pv}_{idx}")
 
                     pay_preview[idx] = r
-                    fully_checked = not _missing_fields(r) and r["id_doc_confirmed"] and r["contract_confirmed"] and not r.get("ratio_err")
+                    fully_checked = not _missing_fields(r) and r["id_doc_confirmed"] and r["contract_confirmed"] and not r.get("ratio_err") and not r.get("link_err")
                     if not fully_checked:
                         missing_checks = []
                         if not r["id_doc_confirmed"]:
@@ -3477,6 +3583,17 @@ if _nav == "finance":
 
         st.session_state["payment_rows_preview"] = pay_preview
         valid_rows = complete_rows
+        _miss_cnt = {}
+        for _r in pay_preview:
+            for _f in _missing_fields(_r):
+                _miss_cnt[FIELD_LABEL[_f]] = _miss_cnt.get(FIELD_LABEL[_f], 0) + 1
+            if _r.get("link_err"):
+                _miss_cnt["콘텐츠링크 오류"] = _miss_cnt.get("콘텐츠링크 오류", 0) + 1
+        _rv_key = (_pv, len(valid_rows), len(pay_preview), tuple(sorted(_miss_cnt.items())))
+        if st.session_state.get("_attempt_review_key") != _rv_key:  # 상태가 바뀔 때만 한 줄 (화면이 다시 그려질 때마다 쌓이지 않게)
+            st.session_state["_attempt_review_key"] = _rv_key
+            _log_upload_attempt(my_name, "review", n_rows=len(pay_preview), n_ok=len(valid_rows),
+                                n_blocked=len(pay_preview) - len(valid_rows), missing=_miss_cnt)
         st.markdown(
             f"**준비 상태: 등록 가능 {len(valid_rows)}건 / 전체 {len(pay_preview)}건**"
             + ("" if len(valid_rows) == len(pay_preview) else " — 위 입력칸을 채우고 '입력 내용 반영하기'를 눌러주세요")
@@ -3543,15 +3660,26 @@ if _nav == "finance":
                 total_ok = abs(confirm_total - batch_total) < 1 if len(by_currency) == 1 else True
                 if not double_check:
                     st.error("'위 내용을 확인했습니다'에 체크해야 등록할 수 있어요.")
+                    _log_upload_attempt(my_name, "register_blocked", n_rows=len(pay_preview), n_ok=len(valid_rows), detail="확인 체크 안 함")
                 elif not total_ok:
                     st.error(f"입력하신 금액이 합계({batch_total:,.0f})와 달라요 — 다시 확인해주세요.")
+                    _log_upload_attempt(my_name, "register_blocked", n_rows=len(pay_preview), n_ok=len(valid_rows), detail="합계 재입력이 맞지 않음")
                 else:
                     batch_id = str(uuid.uuid4())
                     all_brands, saved_keys, save_err = set(), set(), None
+                    load_existing_links.clear()
+                    try:
+                        _fresh_links = load_existing_links()
+                    except Exception:
+                        _fresh_links = set()
                     for r in valid_rows:
                         camp_ids = r.get("campaign_ids") or []
                         row_brands = list(dict.fromkeys(camp_by_id[i]["brand"] for i in camp_ids if i in camp_by_id))
                         try:
+                            # 등록 직전에 한 번 더: 그 사이 다른 사람이 같은 링크를 올렸을 수 있다
+                            _lk = _extract_link(r.get("content_link"))
+                            if _lk and _norm_link(_lk) in _fresh_links:
+                                raise RuntimeError("이미 등록된 콘텐츠 링크예요(같은 링크는 두 번 쓸 수 없어요).")
                             ins = SUPA.table("payment_requests").insert({
                                 "influencer_name": r.get("influencer_name"),
                                 "paypal_email": r.get("paypal_email"), "notification_email": r.get("notification_email"),
@@ -3595,6 +3723,8 @@ if _nav == "finance":
                             "person": "구정회", "category": "마진데이터",
                             "title": f"[지출발생] {brands_txt} · 총 {saved_total_line} · {len(saved_keys)}건 — 마진율 반영 필요",
                         }).execute()
+                    _log_upload_attempt(my_name, "failed" if save_err else "registered", n_rows=len(valid_rows), n_ok=len(saved_keys),
+                                        n_blocked=(len(valid_rows) - len(saved_keys)) or None, detail=save_err)
                     if save_err:
                         # 일부만 저장됐으면 저장된 건은 목록에서 빼서, 다시 눌러도 중복 저장되지 않게 한다
                         st.session_state["payment_rows_preview"] = [x for x in pay_preview if x.get("dedup_key") not in saved_keys]
@@ -3718,7 +3848,7 @@ if _nav == "mywork":
             if my_name not in INVOICE_EDITORS:  # 김선재(+테스트 계정 가상인턴)만. 다른 직원에겐 보이지 않는다
                 st.info("이 화면은 세일즈 담당자만 볼 수 있어요.")
             else:
-                st.caption("대표님이 계정과목을 **매출로 확정한** 입금내역만 가져와서, 입금자명·금액·날짜로 등록된 인보이스와 맞춰봐요. "
+                st.caption(f"대표님이 계정과목을 **매출로 확정한** 입금 중 **{DEPOSIT_MIN_AMOUNT // 10000:,}만 원 이상**만 가져와서, 입금자명·금액·날짜로 등록된 인보이스와 맞춰봐요. "
                            "맞춰보기만 하고 저장은 하지 않아요. 계좌번호는 표시하지 않고, 최대 1분 늦게 반영될 수 있어요.")
                 _dp_days = st.radio("기간", [30, 90, 365], format_func=lambda d: f"최근 {d}일", horizontal=True, key="dep_days")
                 try:
@@ -3727,7 +3857,7 @@ if _nav == "mywork":
                     st.error(f"❌ 입금내역을 불러오지 못했어요 ({type(e).__name__}: {e})")
                     _deps = []
                 if not _deps:
-                    st.info("이 기간에 대표님이 매출로 확정한 입금 내역이 없어요.")
+                    st.info("이 기간에 대표님이 매출로 확정한 입금(300만 원 이상)이 없어요.")
                 else:
                     _m = _match_deposits(_deps, load_sales_campaigns(), account_by_id)
                     _links, _links_err = load_deposit_links()
@@ -3749,7 +3879,7 @@ if _nav == "mywork":
                             "입금일": str(d["txn_date"])[:10], "입금자": d["description"] or "-", "금액": f"₩{float(d['amount'] or 0):,.0f}",
                             "분류": d["category"], "매칭": x["status"],
                             "브랜드·캠페인": f"{x['brand']} · {x['campaign']}" if x.get("campaign") else "-",
-                            "인보이스": (f"{x.get('inv_no') or '번호없음'} / {x['inv_amt']:,.0f}" if x.get("campaign") else "-"),
+                            "인보이스": (f"{x.get('inv_no') or '번호없음'} / {x['inv_amt']:,.0f}" if x.get("inv_amt") is not None else "미등록") if x.get("campaign") else "-",
                             "발행일→입금": (f"{diff}일 후" + ("" if x["has_issue"] else " (첨부일 기준)")) if diff is not None else "-",
                         })
                     _dep_df = pd.DataFrame(_rows)
