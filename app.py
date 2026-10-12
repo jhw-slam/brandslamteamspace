@@ -1780,6 +1780,84 @@ def _render_hub_thread(ns, target_type, target_id, target_date, my_name, heading
 _TASK_ICON = {"예정": "⚪", "진행중": "🟠", "완료": "✅"}
 
 
+def _brands_from_placements(link):
+    """같은 콘텐츠 링크로 이미 '인플루언서 매칭 현황'에 올라와 있는 브랜드들(한 콘텐츠에 여러 브랜드=PPL). 캠페인 연계 추천에만 쓴다."""
+    u = _extract_link(link)
+    if not u:
+        return ""
+    k = _norm_link(u)
+    out = []
+    for p in load_placements():
+        pu = _extract_link(p.get("content_link"))
+        if pu and _norm_link(pu) == k and p.get("brand_name") and p["brand_name"] not in out:
+            out.append(p["brand_name"])
+    return ", ".join(out)
+
+
+def _render_influencer_records(my_name):
+    """① 성과기록: 구글시트에서 불러온 '인플루언서 매칭 현황' 중 업로드 끝난 건의 빈칸(조회수·좋아요·저장·업로드일·단가)을 한 표에서 채우고 한 번에 저장."""
+    st.subheader("① 성과기록 — 빈칸 채우기")
+    mine = [p for p in load_placements() if p.get("assigned_to") == my_name and p.get("status") == "업로드완료"]
+    _F = ("views", "likes", "saves")
+    blank = [p for p in mine if any(p.get(f) is None for f in _F)]
+    m1, m2 = st.columns(2)
+    m1.metric("업로드 완료", f"{len(mine)}건")
+    m2.metric("성과 빈칸 있는 건", f"{len(blank)}건")
+    only_blank = st.checkbox("빈칸 있는 것만 보기", value=True, key="rec_only_blank")
+    shown = (blank if only_blank else mine)
+    shown = sorted(shown, key=lambda p: str(p.get("updated_at") or p.get("created_at") or ""), reverse=True)[:40]
+    if not shown:
+        st.success("채울 빈칸이 없어요." if only_blank else "업로드 완료된 건이 아직 없어요. 캠페인 탭에서 구글시트를 불러와주세요.")
+        return
+    cols = ["브랜드", "인플루언서", "콘텐츠링크", "업로드일", "조회수", "좋아요", "저장", "단가(원)"]
+    def _row(p):
+        return {"브랜드": p.get("brand_name"), "인플루언서": p.get("influencer_name"), "콘텐츠링크": p.get("content_link"),
+                "업로드일": pd.to_datetime(p["actual_upload_date"]).date() if p.get("actual_upload_date") else None,
+                "조회수": p.get("views"), "좋아요": p.get("likes"), "저장": p.get("saves"),
+                "단가(원)": float(p["unit_price"]) if p.get("unit_price") is not None else None}
+    base = pd.DataFrame([_row(p) for p in shown], columns=cols)
+    st.caption(f"최근 업데이트순 앞 {len(shown)}건 · 칸을 눌러 채우고, 아래 저장을 눌러야 반영돼요(저장 전에는 DB가 바뀌지 않아요). 브랜드·링크는 수정할 수 없어요.")
+    with st.form("rec_form"):
+        edited = st.data_editor(
+            base, hide_index=True, use_container_width=True, key=f"rec_editor_{len(shown)}_{only_blank}",
+            disabled=["브랜드", "인플루언서", "콘텐츠링크"],
+            column_config={"콘텐츠링크": st.column_config.LinkColumn("콘텐츠링크"), "업로드일": st.column_config.DateColumn("업로드일"),
+                           "조회수": st.column_config.NumberColumn(min_value=0, step=1), "좋아요": st.column_config.NumberColumn(min_value=0, step=1),
+                           "저장": st.column_config.NumberColumn(min_value=0, step=1), "단가(원)": st.column_config.NumberColumn(min_value=0, step=1000)},
+        )
+        saved = st.form_submit_button("💾 성과기록 저장 (여기서 저장돼요)", type="primary")
+    if not saved:
+        return
+    changed, errs = 0, []
+    fmap = {"조회수": "views", "좋아요": "likes", "저장": "saves", "단가(원)": "unit_price"}
+    for i, p in enumerate(shown):
+        upd = {}
+        for c, f in fmap.items():
+            new, old = edited.iloc[i][c], base.iloc[i][c]
+            if pd.isna(new) and pd.isna(old):
+                continue
+            if pd.isna(new) != pd.isna(old) or float(new) != float(old):
+                upd[f] = None if pd.isna(new) else (float(new) if f == "unit_price" else int(new))
+        nd, od = edited.iloc[i]["업로드일"], base.iloc[i]["업로드일"]
+        if (pd.isna(nd) != pd.isna(od)) or (not pd.isna(nd) and nd != od):
+            upd["actual_upload_date"] = None if pd.isna(nd) else pd.Timestamp(nd).date().isoformat()
+        if not upd:
+            continue
+        try:
+            SUPA.table("influencer_placements").update(upd).eq("id", p["id"]).execute()
+            changed += 1
+        except Exception as e:
+            errs.append(f"{p.get('influencer_name')}: {type(e).__name__}: {e}")
+    if errs:
+        st.error("일부를 저장하지 못했어요 — " + " / ".join(errs[:3]))
+    if changed:
+        load_placements.clear()
+        _flash(f"성과기록 {changed}건을 저장했어요.")
+        st.rerun()
+    elif not errs:
+        st.info("바뀐 칸이 없어요.")
+
+
 def _hub_refresh():
     """캠페인 수정(인보이스·입금 연결) 뒤: 관련 캐시를 비우고 다시 그린다."""
     load_hub_data.clear(); load_match_campaigns.clear()
@@ -2468,6 +2546,12 @@ _NAV = [
     ("board", "📮 요청 게시판" + (f" ⚠️{_my_overdue}" if _my_overdue else "")),
     ("leave", "🏖️ 휴가"), ("summary", "📊 요약"), ("org", "🏢 조직도"),
 ]
+if my_role == "influencer":  # 곽재선: 핵심 업무(인플루언서 성과기록→캠페인 연계→비용→보고)가 맨 앞, '내 업무' 메뉴는 없음
+    _lead = [x for x in _NAV if x[0] == "finance"]
+    _NAV = _lead + [x for x in _NAV if x[0] not in ("finance", "mywork")]
+    if st.session_state.get("_nav_for") != my_name:  # 이름을 고른 처음 한 번만 핵심 화면으로
+        st.session_state["main_nav"] = "finance"
+        st.session_state["_nav_for"] = my_name
 _NAV_LABEL = dict(_NAV)
 # 선택한 화면만 실행(느림 개선): st.tabs는 안 보이는 탭까지 매번 전부 실행해서 라디오로 교체
 _nav = st.radio("화면", [k for k, _ in _NAV], format_func=_NAV_LABEL.get, horizontal=True,
@@ -3202,45 +3286,48 @@ if _nav == "finance":
     # ══════════════════════════════════════════════════════════
     # 📢 예정입출금 신고 (구 12_지출예정보고 통합)
     # ══════════════════════════════════════════════════════════
-    st.subheader("📢 예정입출금 신고")
-    st.caption("\"이런 돈이 곧 나갈/들어올 것 같다\" 싶은 게 있으면 짧게 남겨주세요. 재무캘린더 대시보드에 바로 반영돼요.")
+    if my_role == "influencer":
+        _render_influencer_records(my_name)
+        st.divider()
+    with st.expander("📢 예정입출금 신고 (곧 나갈/들어올 돈이 있을 때만)", expanded=False):
+        st.caption("\"이런 돈이 곧 나갈/들어올 것 같다\" 싶은 게 있으면 짧게 남겨주세요. 재무캘린더 대시보드에 바로 반영돼요.")
 
-    with st.form("cash_forecast_form", clear_on_submit=True):
-        fcc1, fcc2, fcc3 = st.columns(3)
-        direction_label = fcc1.radio("구분", ["지출 예정", "수입 예정"], horizontal=True)
-        fc_amount = fcc2.number_input("예상 금액", min_value=0, step=10000, format="%d")
-        fc_date = fcc3.date_input("예상 날짜", value=date.today())
-        fc_reason = st.text_area("무슨 건인지 짧게 적어주세요", placeholder="예: OO브랜드 8월 캠페인 잔금")
-        fc_submitted = st.form_submit_button("📝 등록하기", type="primary", use_container_width=True)
+        with st.form("cash_forecast_form", clear_on_submit=True):
+            fcc1, fcc2, fcc3 = st.columns(3)
+            direction_label = fcc1.radio("구분", ["지출 예정", "수입 예정"], horizontal=True)
+            fc_amount = fcc2.number_input("예상 금액", min_value=0, step=10000, format="%d")
+            fc_date = fcc3.date_input("예상 날짜", value=date.today())
+            fc_reason = st.text_area("무슨 건인지 짧게 적어주세요", placeholder="예: OO브랜드 8월 캠페인 잔금")
+            fc_submitted = st.form_submit_button("📝 등록하기", type="primary", use_container_width=True)
 
-    if fc_submitted:
-        if fc_amount <= 0:
-            st.error("금액을 입력해주세요.")
-        elif not fc_reason.strip():
-            st.error("무슨 건인지 간단히 적어주세요.")
-        else:
-            SUPA.table("fin_cash_forecasts").insert({
-                "direction": "out" if direction_label == "지출 예정" else "in",
-                "amount": fc_amount, "expected_date": fc_date.isoformat(),
-                "reason": fc_reason.strip(), "submitted_by": my_name, "status": "open",
-            }).execute()
-            _flash("등록 완료!")
-            refresh()
+        if fc_submitted:
+            if fc_amount <= 0:
+                st.error("금액을 입력해주세요.")
+            elif not fc_reason.strip():
+                st.error("무슨 건인지 간단히 적어주세요.")
+            else:
+                SUPA.table("fin_cash_forecasts").insert({
+                    "direction": "out" if direction_label == "지출 예정" else "in",
+                    "amount": fc_amount, "expected_date": fc_date.isoformat(),
+                    "reason": fc_reason.strip(), "submitted_by": my_name, "status": "open",
+                }).execute()
+                _flash("등록 완료!")
+                refresh()
 
-    recent_fc = load_forecasts()
-    if recent_fc:
-        with st.expander(f"최근 신고 {len(recent_fc)}건 보기"):
-            for f in recent_fc:
-                status_label = {"open": "🟡 대기중", "resolved": "✅ 처리완료", "dismissed": "🗑️ 취소됨"}.get(f["status"], f["status"])
-                direction_kr = "지출" if f["direction"] == "out" else "수입"
-                st.caption(f"{f['expected_date']} · {direction_kr} · ₩{float(f['amount']):,.0f} · {status_label} · {f.get('submitted_by') or ''} · {f.get('reason') or ''}")
+        recent_fc = load_forecasts()
+        if recent_fc:
+            with st.expander(f"최근 신고 {len(recent_fc)}건 보기"):
+                for f in recent_fc:
+                    status_label = {"open": "🟡 대기중", "resolved": "✅ 처리완료", "dismissed": "🗑️ 취소됨"}.get(f["status"], f["status"])
+                    direction_kr = "지출" if f["direction"] == "out" else "수입"
+                    st.caption(f"{f['expected_date']} · {direction_kr} · ₩{float(f['amount']):,.0f} · {status_label} · {f.get('submitted_by') or ''} · {f.get('reason') or ''}")
 
-    st.divider()
+        st.divider()
 
     # ══════════════════════════════════════════════════════════
     # 📥 인플루언서 송금정보 — 구글시트에서 바로 읽어오기
     # ══════════════════════════════════════════════════════════
-    st.subheader("📥 인플루언서 송금정보 등록")
+    st.subheader("② 캠페인 연계 · ③ 비용 — 송금정보 등록" if my_role == "influencer" else "📥 인플루언서 송금정보 등록")
     st.info(
         "**당분간은 표준 양식으로 등록해요 (AI 없이 바로 읽혀요):** ① 아래 양식 다운로드 → ② 캠페인별로 시트 작성 → ③ 파일을 올려서 등록. "
         "구글시트에서 만들었다면 '파일 → 다운로드 → CSV 또는 엑셀'로 내려받은 파일을 올리면 돼요."
@@ -3300,230 +3387,230 @@ if _nav == "finance":
             for pr in st.session_state["pay_std_problems"]:
                 st.caption(f"- {pr}")
 
-    st.markdown("---")
-    st.subheader("🤖 자유 양식 시트를 AI가 읽기 (Claude 크레딧 필요)")
-    st.caption(
-        "표준 양식이 아닌 기존 시트를 그대로 올릴 때만 써요. 열 순서가 달라도 Claude가 각 행의 내용을 보고 이름·금액·결제수단·링크를 찾아내지만, "
-        "API 크레딧이 없으면 동작하지 않아요(그땐 위의 표준 양식을 쓰세요). 같은 콘텐츠를 다시 올려도 중복 등록되지 않아요."
-    )
-
-    with st.form("pay_load_form"):
-        pay_sheet_url = st.text_input("구글시트 링크", key="payment_sheet_url", placeholder="https://docs.google.com/spreadsheets/d/...")
-        pay_sheet_file = st.file_uploader(
-            "또는 엑셀(.xlsx)/CSV 파일로 올리기 (링크 공유가 어려울 때)", type=["xlsx", "csv"], key="payment_sheet_file",
+    with st.expander("🤖 표준 양식이 아닐 때 — 자유 양식 시트·스크린샷으로 올리기 (고급 · Claude 크레딧 필요)", expanded=False):
+        st.subheader("🤖 자유 양식 시트를 AI가 읽기 (Claude 크레딧 필요)")
+        st.caption(
+            "표준 양식이 아닌 기존 시트를 그대로 올릴 때만 써요. 열 순서가 달라도 Claude가 각 행의 내용을 보고 이름·금액·결제수단·링크를 찾아내지만, "
+            "API 크레딧이 없으면 동작하지 않아요(그땐 위의 표준 양식을 쓰세요). 같은 콘텐츠를 다시 올려도 중복 등록되지 않아요."
         )
-        load_clicked = st.form_submit_button("1단계: 시트 불러오기", type="primary")
-    if load_clicked:
-        all_sheets, err_title, err_fix = None, None, None
-        if pay_sheet_file is not None:
-            all_sheets, err_title = _read_uploaded_sheet_file(pay_sheet_file)
-        elif pay_sheet_url.strip():
-            all_sheets, err_title, err_fix = _fetch_google_sheet(pay_sheet_url)
-        else:
-            err_title = "링크를 붙여넣거나 파일을 올려주세요."
-        if all_sheets is None:
-            st.error(f"❌ {err_title}" + (f"\n\n{err_fix}" if err_fix else ""))
-        else:
-            for i, (_nm, _df) in enumerate(all_sheets.items()):
-                st.session_state[f"hdr_rows_{i}"] = ", ".join(str(n) for n in _detect_header_rows(_df))  # 제목줄 후보(고칠 수 있음)
-                st.session_state[f"hdr_skip_{i}"] = True  # 처음에는 모든 탭을 '제외'로 — 송금 정보가 있는 탭만 직접 해제한다
-            st.session_state["payment_all_sheets"] = all_sheets
-            st.session_state.pop("payment_mapping_desc", None)
-            st.session_state.pop("payment_rows_preview", None)
 
-    all_sheets_now = st.session_state.get("payment_all_sheets")
-    if all_sheets_now is not None:
-        st.markdown(
-            "**🗂️ 2단계: 사용할 탭 고르기** — 처음에는 모든 탭이 **'제외'**로 되어 있어요. 송금 정보가 있는 탭만 **제외를 해제**하고, "
-            "한 탭 안에 제목줄(헤더)이 또 나오면 행 번호를 모두 적어주세요. 아래 버튼을 눌러야 반영돼요(고르는 동안은 아무것도 실행되지 않아요)."
-        )
-        with st.form("pay_struct_form"):
-            for i, (sheet_name, sheet_df) in enumerate(all_sheets_now.items()):
-                skipped = st.session_state.get(f"hdr_skip_{i}", True)
-                heads = _parse_row_numbers(st.session_state.get(f"hdr_rows_{i}", ""), len(sheet_df)) or [1]
-                with st.expander(f"{'⛔ 제외' if skipped else '✅ 사용'} · 탭 '{sheet_name}' ({len(sheet_df)}행) — 제목줄 {len(heads)}개", expanded=not skipped):
-                    hc1, hc2 = st.columns([3, 1])
-                    hc1.text_input("제목줄(헤더) 행 번호 — 여러 개면 쉼표로 (예: 1, 22)", key=f"hdr_rows_{i}")
-                    hc2.checkbox("이 탭은 제외", key=f"hdr_skip_{i}")
-                    preview = sheet_df.head(80).fillna("").astype(str).copy()
-                    preview.columns = [_col_letter(j) for j in range(preview.shape[1])]
-                    preview.insert(0, "행", range(1, len(preview) + 1))
-                    preview.insert(1, " ", ["◀ 제목줄" if n in heads else "" for n in preview["행"]])
-                    st.dataframe(preview, hide_index=True, use_container_width=True)
-                    if len(sheet_df) > 80:
-                        st.caption("(앞 80행만 보여드려요. 80행 뒤에 제목줄이 또 있으면 행 번호를 직접 적어주세요.)")
-            sb1, sb2 = st.columns(2)
-            struct_go = sb1.form_submit_button("🔍 선택한 탭의 열 구성 확인하기 (AI)", type="primary", use_container_width=True)
-            struct_cancel = sb2.form_submit_button("❌ 취소", use_container_width=True)
-        if struct_cancel:
-            for k in ("payment_mapping_desc", "payment_all_sheets"):
-                st.session_state.pop(k, None)
-            load_my_pending_payments.clear()
-            st.rerun()
-        if struct_go:
-            chosen = _collect_sections(all_sheets_now)
-            if not chosen:
-                st.error("사용할 탭이 없어요. 송금 정보가 있는 탭의 '이 탭은 제외'를 해제하고 다시 눌러주세요.")
-            else:
-                with st.spinner("Claude가 열 구성을 파악하는 중..."):
-                    _desc, _err = _ai_infer_column_mapping(chosen)
-                st.session_state["payment_mapping_desc"] = _desc or f"(자동 파악 실패: {_err} — 그냥 바로 추출을 시도해볼 수 있어요)"
-                if not _desc:
-                    st.warning(f"⚠️ 열 구조 파악 실패 — {_err}")
-
-    mapping_desc = st.session_state.get("payment_mapping_desc")
-    if mapping_desc and all_sheets_now is not None:
-        st.info(f"🧐 **제가 파악한 열 구성이에요 — 맞는지 봐주세요:**\n\n{mapping_desc}")
-        st.caption("탭 선택이나 제목줄을 바꿨다면, 위의 '열 구성 확인하기'를 다시 눌러주세요.")
-        with st.form("pay_extract_form"):
-            mapping_correction = st.text_input(
-                "다르면 바로잡아주세요(선택)", key="mapping_correction",
-                placeholder="예: A열은 이름이 아니라 방문 장소예요, 이름은 C열이에요",
+        with st.form("pay_load_form"):
+            pay_sheet_url = st.text_input("구글시트 링크", key="payment_sheet_url", placeholder="https://docs.google.com/spreadsheets/d/...")
+            pay_sheet_file = st.file_uploader(
+                "또는 엑셀(.xlsx)/CSV 파일로 올리기 (링크 공유가 어려울 때)", type=["xlsx", "csv"], key="payment_sheet_file",
             )
-            xb1, xb2 = st.columns(2)
-            extract_go = xb1.form_submit_button("✅ 맞아요, 전체 추출 진행 (아직 저장되지 않아요)", type="primary", use_container_width=True)
-            extract_cancel = xb2.form_submit_button("❌ 처음부터 다시", use_container_width=True)
-        if extract_cancel:
-            for k in ("payment_mapping_desc", "payment_all_sheets"):
-                st.session_state.pop(k, None)
-            load_my_pending_payments.clear()
-            st.rerun()
-        if extract_go:
-            all_sheets = all_sheets_now
-            pay_rows, skipped_rows = [], 0
-            extract_report = {"errors": [], "reasons": {}}
-            existing_keys = {
-                r["dedup_key"] for r in SUPA.table("payment_requests").select("dedup_key").execute().data
-                if r.get("dedup_key")
-            }
-            with st.spinner("Claude가 전체 내용을 읽는 중..."):
-                for _label, raw_df in _collect_sections(all_sheets).items():
-                    if raw_df.empty:
-                        continue
-                    rows, n_skip = _ai_extract_payment_rows(
-                        raw_df, existing_keys, extra_hint=mapping_correction.strip() or None,
-                        report=extract_report,
-                    )
-                    pay_rows.extend(rows)
-                    skipped_rows += n_skip
-            reason_lines = "".join(f"\n- {k}: {v}행" for k, v in extract_report["reasons"].items())
-            if not pay_rows:
-                # 0건이면 화면을 초기화하지 않고(=다시 시도할 수 있게) 이유를 그대로 보여준다
-                err_lines = "".join(f"\n- {e}" for e in dict.fromkeys(extract_report["errors"]))
-                st.error(
-                    "❌ 새로 인식된 송금 건이 0건이에요. 아래 이유를 확인해주세요." + (f"\n\n**오류**{err_lines}" if err_lines else "")
-                    + (f"\n\n**건너뛴 이유**{reason_lines}" if reason_lines else "")
-                    + "\n\n제목줄 행 번호나 위의 '열 구성 보정'을 고친 뒤 다시 눌러보세요."
-                )
+            load_clicked = st.form_submit_button("1단계: 시트 불러오기", type="primary")
+        if load_clicked:
+            all_sheets, err_title, err_fix = None, None, None
+            if pay_sheet_file is not None:
+                all_sheets, err_title = _read_uploaded_sheet_file(pay_sheet_file)
+            elif pay_sheet_url.strip():
+                all_sheets, err_title, err_fix = _fetch_google_sheet(pay_sheet_url)
             else:
-                msg = f"✅ {len(pay_rows)}명 새로 인식됨."
-                if skipped_rows:
-                    msg += f" (건너뜀 {skipped_rows}행){reason_lines}"
-                if extract_report["errors"]:
-                    msg += "\n\n⚠️ 일부 구간은 처리하지 못했어요:" + "".join(f"\n- {e}" for e in dict.fromkeys(extract_report["errors"]))
-                st.session_state["pay_ver"] = st.session_state.get("pay_ver", 0) + 1
-                st.session_state["payment_rows_preview"] = pay_rows
-                st.session_state["payment_extract_msg"] = msg
+                err_title = "링크를 붙여넣거나 파일을 올려주세요."
+            if all_sheets is None:
+                st.error(f"❌ {err_title}" + (f"\n\n{err_fix}" if err_fix else ""))
+            else:
+                for i, (_nm, _df) in enumerate(all_sheets.items()):
+                    st.session_state[f"hdr_rows_{i}"] = ", ".join(str(n) for n in _detect_header_rows(_df))  # 제목줄 후보(고칠 수 있음)
+                    st.session_state[f"hdr_skip_{i}"] = True  # 처음에는 모든 탭을 '제외'로 — 송금 정보가 있는 탭만 직접 해제한다
+                st.session_state["payment_all_sheets"] = all_sheets
                 st.session_state.pop("payment_mapping_desc", None)
-                st.session_state.pop("payment_all_sheets", None)
+                st.session_state.pop("payment_rows_preview", None)
+
+        all_sheets_now = st.session_state.get("payment_all_sheets")
+        if all_sheets_now is not None:
+            st.markdown(
+                "**🗂️ 2단계: 사용할 탭 고르기** — 처음에는 모든 탭이 **'제외'**로 되어 있어요. 송금 정보가 있는 탭만 **제외를 해제**하고, "
+                "한 탭 안에 제목줄(헤더)이 또 나오면 행 번호를 모두 적어주세요. 아래 버튼을 눌러야 반영돼요(고르는 동안은 아무것도 실행되지 않아요)."
+            )
+            with st.form("pay_struct_form"):
+                for i, (sheet_name, sheet_df) in enumerate(all_sheets_now.items()):
+                    skipped = st.session_state.get(f"hdr_skip_{i}", True)
+                    heads = _parse_row_numbers(st.session_state.get(f"hdr_rows_{i}", ""), len(sheet_df)) or [1]
+                    with st.expander(f"{'⛔ 제외' if skipped else '✅ 사용'} · 탭 '{sheet_name}' ({len(sheet_df)}행) — 제목줄 {len(heads)}개", expanded=not skipped):
+                        hc1, hc2 = st.columns([3, 1])
+                        hc1.text_input("제목줄(헤더) 행 번호 — 여러 개면 쉼표로 (예: 1, 22)", key=f"hdr_rows_{i}")
+                        hc2.checkbox("이 탭은 제외", key=f"hdr_skip_{i}")
+                        preview = sheet_df.head(80).fillna("").astype(str).copy()
+                        preview.columns = [_col_letter(j) for j in range(preview.shape[1])]
+                        preview.insert(0, "행", range(1, len(preview) + 1))
+                        preview.insert(1, " ", ["◀ 제목줄" if n in heads else "" for n in preview["행"]])
+                        st.dataframe(preview, hide_index=True, use_container_width=True)
+                        if len(sheet_df) > 80:
+                            st.caption("(앞 80행만 보여드려요. 80행 뒤에 제목줄이 또 있으면 행 번호를 직접 적어주세요.)")
+                sb1, sb2 = st.columns(2)
+                struct_go = sb1.form_submit_button("🔍 선택한 탭의 열 구성 확인하기 (AI)", type="primary", use_container_width=True)
+                struct_cancel = sb2.form_submit_button("❌ 취소", use_container_width=True)
+            if struct_cancel:
+                for k in ("payment_mapping_desc", "payment_all_sheets"):
+                    st.session_state.pop(k, None)
                 load_my_pending_payments.clear()
                 st.rerun()
+            if struct_go:
+                chosen = _collect_sections(all_sheets_now)
+                if not chosen:
+                    st.error("사용할 탭이 없어요. 송금 정보가 있는 탭의 '이 탭은 제외'를 해제하고 다시 눌러주세요.")
+                else:
+                    with st.spinner("Claude가 열 구성을 파악하는 중..."):
+                        _desc, _err = _ai_infer_column_mapping(chosen)
+                    st.session_state["payment_mapping_desc"] = _desc or f"(자동 파악 실패: {_err} — 그냥 바로 추출을 시도해볼 수 있어요)"
+                    if not _desc:
+                        st.warning(f"⚠️ 열 구조 파악 실패 — {_err}")
 
-    st.markdown("**또는, 더 간단하게:**")
-    with st.expander("📷 스크린샷으로 대신 올리기 (시트 링크가 번거로우면 이쪽이 더 쉬워요)"):
-        st.caption("송금 정보가 보이는 화면을 캡처해서 올리면, Claude가 읽어서 자동으로 채워드려요. 여러 장 올려도 됩니다.")
-        shot_files = st.file_uploader(
-            "스크린샷 업로드", type=["png", "jpg", "jpeg"], accept_multiple_files=True, key="payment_screenshot_up",
-        )
-        if shot_files and st.button("스크린샷 읽기", key="payment_screenshot_read"):
-            api_key = os.environ.get("ANTHROPIC_API_KEY")
-            if not api_key:
-                st.error("ANTHROPIC_API_KEY가 설정되어 있지 않아 이 기능은 못 써요.")
-            else:
+        mapping_desc = st.session_state.get("payment_mapping_desc")
+        if mapping_desc and all_sheets_now is not None:
+            st.info(f"🧐 **제가 파악한 열 구성이에요 — 맞는지 봐주세요:**\n\n{mapping_desc}")
+            st.caption("탭 선택이나 제목줄을 바꿨다면, 위의 '열 구성 확인하기'를 다시 눌러주세요.")
+            with st.form("pay_extract_form"):
+                mapping_correction = st.text_input(
+                    "다르면 바로잡아주세요(선택)", key="mapping_correction",
+                    placeholder="예: A열은 이름이 아니라 방문 장소예요, 이름은 C열이에요",
+                )
+                xb1, xb2 = st.columns(2)
+                extract_go = xb1.form_submit_button("✅ 맞아요, 전체 추출 진행 (아직 저장되지 않아요)", type="primary", use_container_width=True)
+                extract_cancel = xb2.form_submit_button("❌ 처음부터 다시", use_container_width=True)
+            if extract_cancel:
+                for k in ("payment_mapping_desc", "payment_all_sheets"):
+                    st.session_state.pop(k, None)
+                load_my_pending_payments.clear()
+                st.rerun()
+            if extract_go:
+                all_sheets = all_sheets_now
+                pay_rows, skipped_rows = [], 0
+                extract_report = {"errors": [], "reasons": {}}
                 existing_keys = {
                     r["dedup_key"] for r in SUPA.table("payment_requests").select("dedup_key").execute().data
                     if r.get("dedup_key")
                 }
-                shot_rows = []
-                with st.spinner("Claude가 스크린샷을 읽는 중..."):
-                    for f in shot_files:
-                        img_bytes = f.getvalue()
-                        media_type = f.type or "image/png"
-                        # 전체화면 캡처는 해상도가 너무 커서 API가 거부(400)하는 경우가 많아, 가로/세로 1568px로 축소
-                        try:
-                            from PIL import Image
-                            img = Image.open(io.BytesIO(img_bytes))
-                            img = img.convert("RGB")
-                            max_dim = 1568
-                            if max(img.size) > max_dim:
-                                ratio = max_dim / max(img.size)
-                                img = img.resize((int(img.width * ratio), int(img.height * ratio)))
-                            buf = io.BytesIO()
-                            img.save(buf, format="JPEG", quality=85)
-                            img_bytes = buf.getvalue()
-                            media_type = "image/jpeg"
-                        except Exception as resize_err:
-                            st.caption(f"{f.name}: 리사이즈 건너뜀({resize_err}), 원본으로 시도")
-                        img_b64 = base64.b64encode(img_bytes).decode("utf-8")
-                        sys_prompt = (
-                            "이 이미지는 인플루언서 송금 정보 화면(또는 메시지)이다. 다음 정보를 찾아서 JSON으로만 출력해라: "
-                            "{\"influencer_name\": \"...\", \"amount\": 숫자(원화 기준, 콤마/₩ 제외), "
-                            "\"payment_method_raw\": \"은행명+계좌번호 또는 PayPal 이메일 등 보이는 그대로\", "
-                            "\"content_link\": \"콘텐츠 링크 있으면, 없으면 null\"}. "
-                            "확실하지 않은 값은 null로 둬라. 다른 텍스트는 절대 포함하지 마라."
+                with st.spinner("Claude가 전체 내용을 읽는 중..."):
+                    for _label, raw_df in _collect_sections(all_sheets).items():
+                        if raw_df.empty:
+                            continue
+                        rows, n_skip = _ai_extract_payment_rows(
+                            raw_df, existing_keys, extra_hint=mapping_correction.strip() or None,
+                            report=extract_report,
                         )
-                        try:
-                            r = requests.post(
-                                "https://api.anthropic.com/v1/messages",
-                                headers={"x-api-key": api_key, "anthropic-version": "2023-06-01", "content-type": "application/json"},
-                                json={
-                                    "model": "claude-sonnet-5", "max_tokens": 500, "system": sys_prompt,
-                                    "messages": [{"role": "user", "content": [
-                                        {"type": "image", "source": {"type": "base64", "media_type": media_type, "data": img_b64}},
-                                        {"type": "text", "text": "이 이미지에서 송금정보를 추출해줘."},
-                                    ]}],
-                                },
-                                timeout=30,
-                            )
-                            if r.status_code >= 300:
-                                st.warning(f"{f.name}: 읽기 실패 ({r.status_code}) — {r.text[:300]}")
-                                continue
-                            text = "".join(b.get("text", "") for b in r.json().get("content", []) if b.get("type") == "text").strip()
-                            if text.startswith("```"):
-                                text = text.strip("`")
-                                if text.startswith("json"):
-                                    text = text[4:]
-                            d = json.loads(text)
-                            amount = _clean_number(d.get("amount"))
-                            if not d.get("influencer_name") or amount is None:
-                                st.warning(f"{f.name}: 이름/금액을 못 읽었어요. 직접 입력 폼을 이용해주세요.")
-                                continue
-                            payment_method_raw = d.get("payment_method_raw")
-                            paypal_email = _extract_email(payment_method_raw)
-                            content_link = d.get("content_link")
-                            dedup_src = f"{content_link or ''}||{amount}"
-                            dedup_key = hashlib.md5(dedup_src.encode("utf-8")).hexdigest()
-                            if dedup_key in existing_keys:
-                                st.caption(f"{f.name}: 이미 등록된 것 같아 건너뜀")
-                                continue
-                            shot_rows.append({
-                                "influencer_name": d.get("influencer_name"), "tiktok_url": None, "instagram_url": None,
-                                "visit_date": None, "upload_date": None, "content_link": content_link,
-                                "payment_method_raw": payment_method_raw, "id_doc_link": None,
-                                "amount": amount, "scheduled_date": None,
-                                "paypal_email": paypal_email, "notification_email": None,
-                                "payment_destination_verified": bool(payment_method_raw),
-                                "dedup_key": dedup_key,
-                            })
-                        except Exception as e:
-                            st.warning(f"{f.name}: 오류 ({e})")
-                if shot_rows:
-                    st.session_state["payment_rows_preview"] = (
-                        st.session_state.get("payment_rows_preview") or []
-                    ) + shot_rows
-                    _flash(f"{len(shot_rows)}건 인식됨. 아래에서 확인해주세요.")
+                        pay_rows.extend(rows)
+                        skipped_rows += n_skip
+                reason_lines = "".join(f"\n- {k}: {v}행" for k, v in extract_report["reasons"].items())
+                if not pay_rows:
+                    # 0건이면 화면을 초기화하지 않고(=다시 시도할 수 있게) 이유를 그대로 보여준다
+                    err_lines = "".join(f"\n- {e}" for e in dict.fromkeys(extract_report["errors"]))
+                    st.error(
+                        "❌ 새로 인식된 송금 건이 0건이에요. 아래 이유를 확인해주세요." + (f"\n\n**오류**{err_lines}" if err_lines else "")
+                        + (f"\n\n**건너뛴 이유**{reason_lines}" if reason_lines else "")
+                        + "\n\n제목줄 행 번호나 위의 '열 구성 보정'을 고친 뒤 다시 눌러보세요."
+                    )
+                else:
+                    msg = f"✅ {len(pay_rows)}명 새로 인식됨."
+                    if skipped_rows:
+                        msg += f" (건너뜀 {skipped_rows}행){reason_lines}"
+                    if extract_report["errors"]:
+                        msg += "\n\n⚠️ 일부 구간은 처리하지 못했어요:" + "".join(f"\n- {e}" for e in dict.fromkeys(extract_report["errors"]))
+                    st.session_state["pay_ver"] = st.session_state.get("pay_ver", 0) + 1
+                    st.session_state["payment_rows_preview"] = pay_rows
+                    st.session_state["payment_extract_msg"] = msg
+                    st.session_state.pop("payment_mapping_desc", None)
+                    st.session_state.pop("payment_all_sheets", None)
                     load_my_pending_payments.clear()
                     st.rerun()
+
+        st.markdown("**또는, 더 간단하게:**")
+        with st.expander("📷 스크린샷으로 대신 올리기 (시트 링크가 번거로우면 이쪽이 더 쉬워요)"):
+            st.caption("송금 정보가 보이는 화면을 캡처해서 올리면, Claude가 읽어서 자동으로 채워드려요. 여러 장 올려도 됩니다.")
+            shot_files = st.file_uploader(
+                "스크린샷 업로드", type=["png", "jpg", "jpeg"], accept_multiple_files=True, key="payment_screenshot_up",
+            )
+            if shot_files and st.button("스크린샷 읽기", key="payment_screenshot_read"):
+                api_key = os.environ.get("ANTHROPIC_API_KEY")
+                if not api_key:
+                    st.error("ANTHROPIC_API_KEY가 설정되어 있지 않아 이 기능은 못 써요.")
+                else:
+                    existing_keys = {
+                        r["dedup_key"] for r in SUPA.table("payment_requests").select("dedup_key").execute().data
+                        if r.get("dedup_key")
+                    }
+                    shot_rows = []
+                    with st.spinner("Claude가 스크린샷을 읽는 중..."):
+                        for f in shot_files:
+                            img_bytes = f.getvalue()
+                            media_type = f.type or "image/png"
+                            # 전체화면 캡처는 해상도가 너무 커서 API가 거부(400)하는 경우가 많아, 가로/세로 1568px로 축소
+                            try:
+                                from PIL import Image
+                                img = Image.open(io.BytesIO(img_bytes))
+                                img = img.convert("RGB")
+                                max_dim = 1568
+                                if max(img.size) > max_dim:
+                                    ratio = max_dim / max(img.size)
+                                    img = img.resize((int(img.width * ratio), int(img.height * ratio)))
+                                buf = io.BytesIO()
+                                img.save(buf, format="JPEG", quality=85)
+                                img_bytes = buf.getvalue()
+                                media_type = "image/jpeg"
+                            except Exception as resize_err:
+                                st.caption(f"{f.name}: 리사이즈 건너뜀({resize_err}), 원본으로 시도")
+                            img_b64 = base64.b64encode(img_bytes).decode("utf-8")
+                            sys_prompt = (
+                                "이 이미지는 인플루언서 송금 정보 화면(또는 메시지)이다. 다음 정보를 찾아서 JSON으로만 출력해라: "
+                                "{\"influencer_name\": \"...\", \"amount\": 숫자(원화 기준, 콤마/₩ 제외), "
+                                "\"payment_method_raw\": \"은행명+계좌번호 또는 PayPal 이메일 등 보이는 그대로\", "
+                                "\"content_link\": \"콘텐츠 링크 있으면, 없으면 null\"}. "
+                                "확실하지 않은 값은 null로 둬라. 다른 텍스트는 절대 포함하지 마라."
+                            )
+                            try:
+                                r = requests.post(
+                                    "https://api.anthropic.com/v1/messages",
+                                    headers={"x-api-key": api_key, "anthropic-version": "2023-06-01", "content-type": "application/json"},
+                                    json={
+                                        "model": "claude-sonnet-5", "max_tokens": 500, "system": sys_prompt,
+                                        "messages": [{"role": "user", "content": [
+                                            {"type": "image", "source": {"type": "base64", "media_type": media_type, "data": img_b64}},
+                                            {"type": "text", "text": "이 이미지에서 송금정보를 추출해줘."},
+                                        ]}],
+                                    },
+                                    timeout=30,
+                                )
+                                if r.status_code >= 300:
+                                    st.warning(f"{f.name}: 읽기 실패 ({r.status_code}) — {r.text[:300]}")
+                                    continue
+                                text = "".join(b.get("text", "") for b in r.json().get("content", []) if b.get("type") == "text").strip()
+                                if text.startswith("```"):
+                                    text = text.strip("`")
+                                    if text.startswith("json"):
+                                        text = text[4:]
+                                d = json.loads(text)
+                                amount = _clean_number(d.get("amount"))
+                                if not d.get("influencer_name") or amount is None:
+                                    st.warning(f"{f.name}: 이름/금액을 못 읽었어요. 직접 입력 폼을 이용해주세요.")
+                                    continue
+                                payment_method_raw = d.get("payment_method_raw")
+                                paypal_email = _extract_email(payment_method_raw)
+                                content_link = d.get("content_link")
+                                dedup_src = f"{content_link or ''}||{amount}"
+                                dedup_key = hashlib.md5(dedup_src.encode("utf-8")).hexdigest()
+                                if dedup_key in existing_keys:
+                                    st.caption(f"{f.name}: 이미 등록된 것 같아 건너뜀")
+                                    continue
+                                shot_rows.append({
+                                    "influencer_name": d.get("influencer_name"), "tiktok_url": None, "instagram_url": None,
+                                    "visit_date": None, "upload_date": None, "content_link": content_link,
+                                    "payment_method_raw": payment_method_raw, "id_doc_link": None,
+                                    "amount": amount, "scheduled_date": None,
+                                    "paypal_email": paypal_email, "notification_email": None,
+                                    "payment_destination_verified": bool(payment_method_raw),
+                                    "dedup_key": dedup_key,
+                                })
+                            except Exception as e:
+                                st.warning(f"{f.name}: 오류 ({e})")
+                    if shot_rows:
+                        st.session_state["payment_rows_preview"] = (
+                            st.session_state.get("payment_rows_preview") or []
+                        ) + shot_rows
+                        _flash(f"{len(shot_rows)}건 인식됨. 아래에서 확인해주세요.")
+                        load_my_pending_payments.clear()
+                        st.rerun()
 
     pay_preview = st.session_state.get("payment_rows_preview")
     if st.session_state.get("payment_extract_msg") and pay_preview:
@@ -3601,7 +3688,7 @@ if _nav == "finance":
                     if match_camps:
                         r["campaign_ids"] = st.multiselect(
                             "이 콘텐츠에 노출된 캠페인 * (여러 개 선택 가능)", [c["id"] for c in match_camps],
-                            default=[i for i in (r.get("campaign_ids") or _suggest_campaign_ids(r.get("brand_names"), match_camps)) if i in camp_label_by_id],
+                            default=[i for i in (r.get("campaign_ids") or _suggest_campaign_ids(", ".join(x for x in (r.get("brand_names"), _brands_from_placements(r.get("content_link"))) if x), match_camps)) if i in camp_label_by_id],
                             format_func=lambda i: camp_label_by_id.get(i, i), key=f"campaigns_{_pv}_{idx}",
                             help="이 콘텐츠 비용은 선택한 캠페인에 균등하게 나뉘어 마진 계산에 쓰여요. 파일에 적힌 브랜드는 참고용으로 미리 골라드려요.",
                         )
