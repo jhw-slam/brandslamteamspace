@@ -3087,6 +3087,10 @@ _NAV = [
     ("board", "📮 요청 게시판" + (f" ⚠️{_my_overdue}" if _my_overdue else "")),
     ("leave", "🏖️ 휴가"), ("summary", "📊 요약"), ("org", "🏢 조직도"),
 ]
+if my_name == "김선재":  # 김선재는 인플루언서 송금 업무를 하지 않음(10/13). 가상인턴은 테스트용이라 그대로 둔다
+    _NAV = [x for x in _NAV if x[0] != "finance"]
+    if st.session_state.get("main_nav") == "finance":  # 이미 그 화면에 있던 상태로 이름을 바꾼 경우
+        st.session_state["main_nav"] = "home"
 if my_role == "influencer":  # 곽재선: 핵심 업무(인플루언서 성과기록→캠페인 연계→비용→보고)가 맨 앞, '내 업무' 메뉴는 없음
     _lead = [x for x in _NAV if x[0] == "finance"]
     _NAV = _lead + [x for x in _NAV if x[0] not in ("finance", "mywork")]
