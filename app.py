@@ -228,6 +228,23 @@ def _fetch_google_sheet(url):
             if res.status_code == 404:
                 break
             # 400 등: 다음 주소(드라이브 직접 다운로드)로 재시도
+        if content is None and last_status in (401, 403):
+            # 비공개 시트: 우리 서비스계정에 공유돼 있으면 드라이브로 직접 읽는다
+            token, sa_email, terr = _drive_token()
+            if token:
+                try:
+                    ex = requests.get(f"{_DRIVE_API}/{file_id}/export",
+                                      params={"mimeType": "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"},
+                                      headers={"Authorization": f"Bearer {token}"}, timeout=60)
+                    if ex.status_code != 200:
+                        ex = requests.get(f"{_DRIVE_API}/{file_id}", params={"alt": "media", "supportsAllDrives": "true"},
+                                          headers={"Authorization": f"Bearer {token}"}, timeout=60)
+                    if ex.status_code == 200 and ex.content[:2] == b"PK":
+                        content = ex.content
+                except requests.exceptions.RequestException:
+                    pass
+            if content is None and sa_email:
+                perm_fix += f" 또는 시트 '공유'에 **{sa_email}** 을(를) 뷰어로 추가해주세요 — 그러면 비공개 시트도 바로 읽혀요."
         if content is None:
             if last_status in (401, 403):
                 return None, perm_title, perm_fix
@@ -1522,9 +1539,10 @@ def _render_leave_page(my_name, today):
         } for x in team]), hide_index=True, use_container_width=True)
 
 
-PAYMENT_TEMPLATE_HEADERS = ["이름", "금액", "통화", "결제수단", "콘텐츠링크", "방문일", "업로드일", "송금예정일", "신분증링크", "브랜드"]
-PAYMENT_TEMPLATE_SAMPLE = ["홍길동(예시 — 이 줄은 지우거나 그대로 둬도 무시돼요)", "150000", "KRW", "하나은행 123-456789-01", "https://instagram.com/p/xxxx",
-                           "2026-10-01", "2026-10-05", "2026-10-10", "https://drive.google.com/...", "브랜드A, 브랜드B"]
+PAYMENT_TEMPLATE_HEADERS = ["이름", "SNS계정", "팔로워수", "금액", "통화", "결제수단", "콘텐츠링크", "방문일", "업로드일", "송금예정일",
+                            "신분증링크", "브랜드", "배분비율(%)", "조회수", "좋아요", "저장", "안내메일", "지출기안서링크"]
+PAYMENT_TEMPLATE_SAMPLE = ["홍길동(예시 — 이 줄은 지우거나 그대로 둬도 무시돼요)", "@gildong", "12000", "150000", "KRW", "하나은행 123-456789-01", "https://instagram.com/p/xxxx",
+                           "2026-10-01", "2026-10-05", "2026-10-10", "https://drive.google.com/...", "브랜드A, 브랜드B", "50, 50", "5200", "310", "45", "", ""]
 _STD_PAY_ALIASES = {
     "influencer_name": ["이름", "성명", "인플루언서", "인플루언서명", "name"],
     "amount": ["금액", "송금액", "amount"],
@@ -1856,6 +1874,529 @@ def _render_influencer_records(my_name):
         st.rerun()
     elif not errs:
         st.info("바뀐 칸이 없어요.")
+
+
+INF_FLOW_USERS = {"곽재선", "가상인턴"}  # 새 '한 번에 올리기' 흐름을 쓰는 사람(가상인턴=테스트)
+
+# (열 이름, 내부 필드, 필수?, 예시, 설명)
+INF_FORMAT = [
+    ("이름", "influencer_name", True, "홍길동", "인플루언서 이름"),
+    ("SNS계정", "sns_id", False, "@gildong", "인스타·틱톡·샤오홍슈 계정 ID"),
+    ("팔로워수", "followers", False, "12000", "숫자만"),
+    ("금액", "amount", True, "150000", "숫자만 (₩·원·쉼표는 있어도 돼요)"),
+    ("통화", "currency", True, "KRW", "KRW / USD / EUR / GBP / JPY 중 하나 — 추측하지 않아요"),
+    ("결제수단", "payment_method_raw", True, "하나은행 123-456-789 (또는 PayPal 이메일)", "실제로 돈이 가는 곳"),
+    ("콘텐츠링크", "content_link", True, "https://instagram.com/p/…", "링크만 있으면 돼요(접속 확인 안 함). 같은 링크는 두 번 못 써요"),
+    ("방문일", "visit_date", False, "2026-10-01", "방문형일 때"),
+    ("업로드일", "upload_date", True, "2026-10-05", "콘텐츠가 올라간 날"),
+    ("송금예정일", "scheduled_date", True, "2026-10-10", ""),
+    ("신분증링크", "id_doc_link", True, "https://drive.google.com/…", "신분증 사본 링크"),
+    ("브랜드", "brand_names", True, "브랜드A, 브랜드B", "이 콘텐츠에 나온 브랜드 전부(콤마로). 아래 캠페인 선택이 이 개수와 같아야 해요"),
+    ("배분비율(%)", "ratio", False, "50, 50", "브랜드가 여러 개일 때만. 비우면 균등. 브랜드 순서대로, 합 100"),
+    ("조회수", "views", True, "5200", "아직 없으면 0"),
+    ("좋아요", "likes", True, "310", "아직 없으면 0"),
+    ("저장", "saves", True, "45", "아직 없으면 0"),
+    ("안내메일", "notification_email", False, "name@email.com", "비우면 자동메일 안 보내요"),
+    ("지출기안서링크", "expense_proposal_url", False, "https://…", "있으면"),
+]
+INF_ALIASES_EXTRA = {
+    "sns_id": ["sns계정", "sns", "계정", "인스타계정", "sns_id", "아이디", "sns아이디"],
+    "followers": ["팔로워", "팔로워수", "followers"],
+    "ratio": ["배분비율", "배분비율(%)", "배분비율%", "ppl배분비율"],
+    "views": ["조회수", "조회", "views"],
+    "likes": ["좋아요", "좋아요수", "likes"],
+    "saves": ["저장", "저장수", "saves"],
+    "notification_email": ["안내메일", "안내메일주소", "알림메일"],
+    "expense_proposal_url": ["지출기안서링크", "지출기안서", "기안서링크"],
+}
+_STD_PAY_ALIASES.update(INF_ALIASES_EXTRA)  # 새 열 이름도 제목줄로 알아본다(기존 읽기와 공용)
+
+
+def _inf_split_brands(text):
+    out, seen = [], set()
+    for b in re.split(r"[,/;、\n]+", str(text or "")):
+        b = b.strip()
+        k = _drive_norm(b)
+        if k and k not in seen:
+            seen.add(k)
+            out.append(b)
+    return out
+
+
+def _inf_hdr_info(row):
+    """제목줄 후보 한 줄 분석: ({필드: 첫 열}, {필드: [열 위치들]} 중복만, [못 알아본 열 이름])."""
+    rev = {_std_norm(a): f for f, al in _STD_PAY_ALIASES.items() for a in al}
+    cols, dups, unknown = {}, {}, []
+    for i, cell in enumerate(row):
+        c = str(cell or "").strip()
+        if not c:
+            continue
+        f = rev.get(_std_norm(c))
+        if not f:
+            unknown.append(c)
+            continue
+        if f in cols:
+            dups.setdefault(f, [cols[f]]).append(i)
+        else:
+            cols[f] = i
+    return cols, dups, unknown
+
+
+def _col_letter(i):
+    s, i = "", i + 1
+    while i:
+        i, r = divmod(i - 1, 26)
+        s = chr(65 + r) + s
+    return s
+
+
+def _parse_influencer_sheets(sheets):
+    """시트(여러 탭 가능) → (행 목록[원본 글자 그대로], 안내 목록[(수준, 문구)]).
+    제목줄이 여러 번 나오거나 같은 열 이름이 두 번 있으면 조용히 넘어가지 않고 합치는 방법을 알려준다."""
+    label = {f: ko for ko, f, *_ in INF_FORMAT}
+    rows, notes = [], []
+    for tab, df in sheets.items():
+        cols, header_rows, unknown_all = {}, [], []
+        for r_i, raw in enumerate(df.fillna("").astype(str).values.tolist()):
+            hm, dups, unknown = _inf_hdr_info(raw)
+            if "influencer_name" in hm and "amount" in hm:
+                cols = hm
+                header_rows.append(r_i + 1)
+                for f, pos in dups.items():
+                    notes.append(("warn", f"탭 '{tab}' {r_i + 1}행: '{label.get(f, f)}' 열이 {len(pos)}개예요({', '.join(_col_letter(p) for p in pos)}열). "
+                                          f"한 열로 합쳐주세요 — 지금은 첫 번째({_col_letter(pos[0])}열)만 읽었어요."))
+                for u in unknown:
+                    if u not in unknown_all:
+                        unknown_all.append(u)
+                continue
+            if not cols or not any(c.strip() for c in raw):
+                continue
+            get = lambda f: (raw[cols[f]].strip() if f in cols and cols[f] < len(raw) else "")
+            name = get("influencer_name")
+            if "예시" in name or "xxxx" in get("content_link"):
+                continue
+            if not name and not get("amount"):
+                continue
+            row = {f: get(f) for f, *_ in [(x[1],) for x in INF_FORMAT]}
+            row["_src"] = f"{tab} {r_i + 1}행" if len(sheets) > 1 else f"{r_i + 1}행"
+            rows.append(row)
+        if len(header_rows) > 1:
+            notes.append(("warn", f"탭 '{tab}'에 제목줄(이름·금액…)이 {len(header_rows)}번 나와요({', '.join(str(h) for h in header_rows)}행). "
+                                  "제목줄은 탭마다 한 번만 두고, 표가 여러 개면 **시트 탭을 나눠주세요.** 일단 모두 읽었어요."))
+        if not header_rows:
+            if any(c.strip() for c in df.fillna("").astype(str).values.ravel().tolist()):
+                notes.append(("warn", f"탭 '{tab}'에서 제목줄(이름·금액 열)을 찾지 못해 건너뛰었어요. 아래 '양식'의 열 이름으로 첫 줄을 맞춰주세요."))
+        elif unknown_all:
+            notes.append(("info", f"탭 '{tab}'의 읽지 않은 열: {', '.join(unknown_all[:8])} — 필요한 정보라면 양식의 열 이름으로 바꿔주세요."))
+    return rows, list(dict.fromkeys(notes))
+
+
+def _inf_amount(v):
+    s = str(v or "").strip().replace(",", "").replace("₩", "").replace("원", "").replace("$", "").strip()
+    try:
+        x = float(s)
+        return x if x > 0 else None
+    except ValueError:
+        return None
+
+
+def _inf_count(v):
+    s = str(v if v is not None else "").strip().replace(",", "")
+    if s == "":
+        return None
+    try:
+        x = float(s)
+        return int(x) if x >= 0 and x == int(x) else None
+    except ValueError:
+        return None
+
+
+def _inf_resolve_brand(b, brand_camps):
+    """시트의 브랜드 글자 → 김선재가 등록한 브랜드(이름이 정확히 같거나, 한쪽이 다른 쪽을 포함하고 후보가 딱 하나일 때만)."""
+    k = _drive_norm(b)
+    if k in brand_camps:
+        return k
+    hit = [bk for bk in brand_camps if len(k) >= 2 and (k in bk or bk in k)]
+    return hit[0] if len(hit) == 1 else None
+
+
+def _inf_validate(raw, idx, picks, checks, camps, brand_camps, existing_links, seen_links):
+    """한 행을 철저히 검사한다. 반환: (정리된 값 dict, 빠진/틀린 칸 {열이름: 이유})."""
+    bad, v = {}, {}
+    v["influencer_name"] = raw.get("influencer_name", "").strip()
+    if not v["influencer_name"]:
+        bad["이름"] = "비어 있어요"
+    v["sns_id"] = raw.get("sns_id", "").strip() or None
+    fol = raw.get("followers", "").strip()
+    v["followers"] = _inf_count(fol) if fol else None
+    if fol and v["followers"] is None:
+        bad["팔로워수"] = "숫자가 아니에요"
+    v["amount"] = _inf_amount(raw.get("amount"))
+    if v["amount"] is None:
+        bad["금액"] = "비었거나 숫자로 읽을 수 없어요"
+    cur_raw = raw.get("currency", "").strip()
+    v["currency"] = _STD_CURRENCY.get(cur_raw.upper()) or _STD_CURRENCY.get(cur_raw)
+    if not v["currency"]:
+        bad["통화"] = "비었거나 모르는 통화예요(KRW/USD/EUR/GBP/JPY)" if cur_raw else "비어 있어요(추측하지 않아요)"
+    pm = raw.get("payment_method_raw", "").strip()
+    v["payment_method_raw"] = pm or None
+    v["paypal_email"] = _extract_email(pm) if pm else None
+    if not pm or pm in ("-", "–"):
+        bad["결제수단"] = "비어 있어요"
+    # 콘텐츠 링크: 링크만 있으면 유효, 대신 고유값 검사
+    holder = {"content_link": raw.get("content_link", "").strip() or None}
+    if not holder["content_link"]:
+        bad["콘텐츠링크"] = "비어 있어요"
+        v["content_link"] = None
+    else:
+        err = _check_link(holder, idx, existing_links, seen_links)
+        v["content_link"] = holder["content_link"]
+        if err:
+            bad["콘텐츠링크"] = err
+    for f, ko, req in (("visit_date", "방문일", False), ("upload_date", "업로드일", True), ("scheduled_date", "송금예정일", True)):
+        t = raw.get(f, "").strip()
+        v[f] = _clean_date(t) if t else None
+        if t and not v[f]:
+            bad[ko] = f"날짜로 읽을 수 없어요('{t[:15]}') — 2026-10-05 형태로"
+        elif req and not t:
+            bad[ko] = "비어 있어요"
+    idl = _extract_link(raw.get("id_doc_link", ""))
+    v["id_doc_link"] = idl
+    if not idl:
+        bad["신분증링크"] = "비었거나 링크가 아니에요"
+    ne = raw.get("notification_email", "").strip()
+    v["notification_email"] = ne or None
+    if ne and not re.fullmatch(r"[^@\s]+@[^@\s]+\.[^@\s]+", ne):
+        bad["안내메일"] = "메일 주소 형식이 아니에요"
+    v["expense_proposal_url"] = _extract_link(raw.get("expense_proposal_url", "")) or (raw.get("expense_proposal_url", "").strip() or None)
+    for f, ko in (("views", "조회수"), ("likes", "좋아요"), ("saves", "저장")):
+        t = raw.get(f, "").strip()
+        v[f] = _inf_count(t)
+        if v[f] is None:
+            bad[ko] = "비어 있어요(없으면 0)" if t == "" else "0 이상의 숫자만 가능해요"
+    # 브랜드 ↔ 캠페인 (김선재가 등록한 것 중에서만, 브랜드 수 = 캠페인 수)
+    brands = _inf_split_brands(raw.get("brand_names"))
+    v["brands_raw"] = brands
+    resolved, unknown = [], []
+    for b in brands:
+        bk = _inf_resolve_brand(b, brand_camps)
+        (resolved if bk else unknown).append(bk or b)
+    if not brands:
+        bad["브랜드"] = "비어 있어요"
+    elif unknown:
+        bad["브랜드"] = f"'{', '.join(unknown)}'는 김선재님이 등록한 브랜드에 없어요 — 시트의 브랜드명을 고치거나 김선재님께 캠페인 등록을 요청하세요"
+    chosen = [c for c in picks if c]
+    camp_ids = []
+    if not chosen:
+        bad["캠페인"] = f"브랜드 {len(brands)}개에 맞는 캠페인 {len(brands)}개를 골라주세요" if brands else "먼저 브랜드가 필요해요"
+    else:
+        cs = [camps[x] for x in chosen if x in camps]
+        camp_ids = [c["id"] for c in cs]
+        keys = [_drive_norm(c["brand"]) for c in cs]
+        if len(set(camp_ids)) != len(camp_ids):
+            bad["캠페인"] = "같은 캠페인을 두 번 골랐어요"
+        elif brands and len(cs) != len(brands):
+            bad["캠페인"] = f"브랜드가 {len(brands)}개인데 캠페인을 {len(cs)}개 골랐어요 — 브랜드마다 하나씩"
+        elif not unknown and sorted(keys) != sorted(resolved):
+            miss = [b for b in brands if _inf_resolve_brand(b, brand_camps) not in keys]
+            bad["캠페인"] = "고른 캠페인의 브랜드가 시트의 브랜드와 달라요" + (f" (빠진 브랜드: {', '.join(miss)})" if miss else "")
+    v["campaign_ids"] = camp_ids
+    rt = raw.get("ratio", "").strip()
+    w, werr = _parse_ratio_text(rt, len(camp_ids) or len(brands)) if rt else (None, None)
+    v["ratio_weights"] = w
+    if werr:
+        bad["배분비율(%)"] = werr
+    if not checks.get("id"):
+        bad["신분증 확인"] = "체크해주세요"
+    if not checks.get("contract"):
+        bad["계약서 확인"] = "체크해주세요(없으면 '해당없음'으로 보고 체크)"
+    return v, bad
+
+
+_INF_COL_OF = {"이름": "이름", "금액": "금액", "통화": "통화", "결제수단": "결제수단", "콘텐츠링크": "콘텐츠링크", "방문일": "방문일", "업로드일": "업로드일",
+               "송금예정일": "송금예정일", "신분증링크": "신분증링크", "브랜드": "브랜드", "캠페인": "캠페인", "조회수": "조회수", "좋아요": "좋아요", "저장": "저장",
+               "SNS계정": "SNS계정", "팔로워수": "팔로워수", "안내메일": "안내메일", "배분비율(%)": "배분"}
+
+
+def _placement_save(payload):
+    """매칭현황(influencer_placements) 한 줄 저장: 같은 콘텐츠링크+브랜드가 이미 있으면 갱신, 없으면 새로 만든다.
+    (DB의 고유 인덱스가 '링크가 있는 행만' 거는 부분 인덱스라 upsert(on_conflict)가 안 먹어서 직접 찾아서 처리한다)"""
+    link, brand = payload.get("content_link"), payload.get("brand_name")
+    if link and brand:
+        found = SUPA.table("influencer_placements").select("id").eq("content_link", link).eq("brand_name", brand).limit(1).execute().data
+        if found:
+            SUPA.table("influencer_placements").update(payload).eq("id", found[0]["id"]).execute()
+            return
+    SUPA.table("influencer_placements").insert(payload).execute()
+
+
+def _inf_register(rows_valid, my_name):
+    """검사를 모두 통과한 행들을 저장한다: 송금(비용) + 캠페인 연결 + 성과기록(매칭현황). 반환: (저장한 건수, 에러문구, 저장한 행 번호들)"""
+    batch_id = str(uuid.uuid4())
+    load_existing_links.clear()
+    try:
+        fresh = load_existing_links()
+    except Exception:
+        fresh = set()
+    camps_list, _ = load_match_campaigns()
+    camp_by = {c["id"]: c for c in camps_list}
+    saved, err, saved_idx, all_brands = 0, None, [], set()
+    for i, v in rows_valid:
+        try:
+            if _norm_link(v["content_link"]) in fresh:
+                raise RuntimeError("이미 등록된 콘텐츠 링크예요(같은 링크는 두 번 쓸 수 없어요).")
+            brands = [camp_by[c]["brand"] for c in v["campaign_ids"] if c in camp_by]
+            dedup = hashlib.md5(f"{v['content_link']}|{v['visit_date'] or ''}|{v['amount']}".encode("utf-8")).hexdigest()
+            ins = SUPA.table("payment_requests").insert({
+                "influencer_name": v["influencer_name"], "paypal_email": v["paypal_email"], "notification_email": v["notification_email"],
+                "amount": v["amount"], "scheduled_date": v["scheduled_date"], "visit_date": v["visit_date"], "upload_date": v["upload_date"],
+                "payment_method_raw": v["payment_method_raw"], "content_link": v["content_link"], "id_doc_link": v["id_doc_link"],
+                "brand_names": ", ".join(dict.fromkeys(brands)), "id_doc_confirmed": True, "contract_confirmed": True,
+                "currency": v["currency"], "expense_proposal_url": v["expense_proposal_url"], "dedup_key": dedup, "double_checked": True,
+                "batch_id": batch_id, "payment_destination_verified": True, "report_complete": True, "submitted_by": my_name,
+            }).execute()
+            link_err = _save_payment_matches(ins.data[0]["id"], v["amount"], v["currency"], v["campaign_ids"], my_name, v["ratio_weights"])
+            if link_err:
+                try:
+                    SUPA.table("payment_requests").delete().eq("id", ins.data[0]["id"]).execute()
+                except Exception as e2:
+                    link_err += f" (이미 저장된 송금을 되돌리지도 못했어요: {type(e2).__name__} — 관리자에게 알려주세요)"
+                raise RuntimeError(link_err)
+        except Exception as e:
+            err = f"'{v['influencer_name']}' 저장 중 오류 ({type(e).__name__}: {e})"
+            break
+        saved += 1
+        saved_idx.append(i)
+        all_brands.update(brands)
+        # 성과기록: 같은 콘텐츠·브랜드는 한 줄로(같은 링크+브랜드가 이미 있으면 덮어씀). 실패해도 송금은 이미 저장됐으니 안내만.
+        try:
+            shares = _split_payment_ratio(v["amount"], len(v["campaign_ids"]), v["ratio_weights"])
+            for cid, (_, alloc) in zip(v["campaign_ids"], shares):
+                _placement_save({
+                    "brand_name": camp_by[cid]["brand"], "influencer_name": v["influencer_name"], "content_link": v["content_link"],
+                    "status": "업로드완료", "actual_upload_date": v["upload_date"], "visit_date": v["visit_date"], "scheduled_date": v["scheduled_date"],
+                    "views": v["views"], "likes": v["likes"], "saves": v["saves"], "followers": v["followers"], "sns_id": v["sns_id"],
+                    "unit_price": alloc if v["currency"] == "KRW" else None, "assigned_to": my_name,
+                })
+        except Exception as e:
+            st.session_state.setdefault("inf_warn_after", []).append(f"'{v['influencer_name']}' 성과기록(매칭현황) 저장 실패 — 송금은 저장됐어요 ({type(e).__name__}: {e})")
+    if saved:
+        try:
+            tot = {}
+            for i, v in rows_valid:
+                if i in saved_idx:
+                    tot[v["currency"]] = tot.get(v["currency"], 0) + float(v["amount"])
+            SUPA.table("assigned_tasks").insert({
+                "person": "구정회", "category": "마진데이터",
+                "title": f"[지출발생] {', '.join(sorted(all_brands)) or '미지정'} · 총 {' · '.join(f'{c} {a:,.0f}' for c, a in tot.items())} · {saved}건 — 마진율 반영 필요",
+            }).execute()
+        except Exception:
+            pass
+    return saved, err, saved_idx
+
+
+def _render_influencer_hub(my_name):
+    """곽재선 한 화면 흐름: 성과기록 → 캠페인 연계 → 비용(송금) → 보고(등록). 구글시트 링크(또는 파일)를 우리 양식으로 불러와 한 표에서 검사하고, 전부 통과해야 등록."""
+    ver = st.session_state.get("inf_ver", 0)
+    st.subheader("인플루언서 업무 — 성과기록 · 캠페인 연계 · 비용 · 보고")
+    st.caption("구글시트(또는 파일)를 우리 양식으로 올리면 한 번에 읽어서 표로 검사해요. **모든 칸이 채워져야** 등록할 수 있어요. 노란 칸은 시트에서 고치고 같은 링크로 다시 불러오세요.")
+    rows = st.session_state.get("inf_rows")
+
+    with st.expander("📋 우리 양식 (이 열 이름대로 시트 첫 줄을 맞춰주세요)", expanded=not rows):
+        spec = pd.DataFrame([{"열 이름": h, "필수": "필수" if req else "선택", "예시": ex, "설명": note} for h, _f, req, ex, note in INF_FORMAT])
+        st.dataframe(spec, hide_index=True, use_container_width=True)
+        st.caption("• 탭마다 제목줄은 한 번만 · 표가 여러 개면 시트 탭을 나눠주세요 · 같은 열 이름을 두 번 쓰지 마세요(합쳐주세요) · 캠페인은 시트에 적지 않고 아래 표에서 김선재님이 등록한 캠페인 중에서만 고릅니다.")
+        tpl = (",".join(PAYMENT_TEMPLATE_HEADERS) + "\n").encode("utf-8-sig")
+        d1, d2, _sp = st.columns([1, 1, 3])
+        d1.download_button("📋 양식 받기 (CSV)", data=tpl, file_name="인플루언서_업로드_양식.csv", mime="text/csv", key="inf_tpl_csv", use_container_width=True)
+        d2.download_button("📗 양식 받기 (엑셀)", data=_payment_template_xlsx(), file_name="인플루언서_업로드_양식.xlsx",
+                           mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", key="inf_tpl_xlsx", use_container_width=True)
+
+    if st.session_state.get("inf_done"):
+        st.success(st.session_state.pop("inf_done"))
+    for w in st.session_state.pop("inf_warn_after", []) or []:
+        st.warning(w)
+
+    with st.form("inf_load_form"):
+        url = st.text_input("구글시트(또는 드라이브 엑셀) 링크", value=st.session_state.get("inf_url", ""), placeholder="https://docs.google.com/spreadsheets/d/…")
+        up = st.file_uploader("또는 파일로 올리기 (엑셀·CSV)", type=["xlsx", "csv"], key=f"inf_file_{ver}")
+        load = st.form_submit_button("📥 불러오기 (아직 저장되지 않아요)", type="primary")
+    if load:
+        sheets, src = None, None
+        if url.strip():
+            st.session_state["inf_url"] = url.strip()
+            sheets, title, fix = _fetch_google_sheet(url.strip())
+            src = "구글시트"
+            if sheets is None:
+                st.error(f"❌ {title}")
+                st.info(fix)
+                _log_upload_attempt(my_name, "parse_failed", file_name="(구글시트 링크)", detail=title)
+        elif up is not None:
+            sheets, ferr = _read_uploaded_sheet_file(up)
+            src = up.name
+            if sheets is None:
+                st.error(f"❌ {ferr}")
+                _log_upload_attempt(my_name, "parse_failed", file_name=up.name, detail=ferr)
+        else:
+            st.error("링크를 붙여넣거나 파일을 올려주세요.")
+        if sheets is not None:
+            new_rows, notes = _parse_influencer_sheets(sheets)
+            st.session_state["inf_notes"] = notes
+            if not new_rows:
+                st.error("❌ 읽을 수 있는 행이 없어요. 위 '우리 양식'의 열 이름(이름·금액…)으로 첫 줄을 맞췄는지 확인해주세요.")
+                st.session_state.pop("inf_rows", None)
+                _log_upload_attempt(my_name, "parse_failed", file_name=src, n_rows=0)
+            else:
+                st.session_state["inf_ver"] = ver + 1
+                st.session_state["inf_rows"] = new_rows
+                st.session_state["inf_src"] = src
+                _log_upload_attempt(my_name, "loaded", file_name=src, n_rows=len(new_rows))
+                st.rerun()
+
+    rows = st.session_state.get("inf_rows")
+    for lvl, txt in st.session_state.get("inf_notes", []):
+        (st.warning if lvl == "warn" else st.caption)(("⚠️ " if lvl == "warn" else "ℹ️ ") + txt)
+    if not rows:
+        return
+
+    camps_list, cerr = load_match_campaigns()
+    if cerr:
+        st.error(f"캠페인 목록을 불러오지 못했어요 ({cerr})")
+        return
+    if not camps_list:
+        st.error("등록된 캠페인이 없어요. 먼저 김선재님이 `📝 캠페인 등록`에서 캠페인을 등록해야 연결할 수 있어요.")
+        return
+    labels, seen_l = {}, set()
+    for c in camps_list:
+        lab = c["label"]
+        if lab in seen_l:
+            lab = f"{lab} ({c['id'][:4]})"
+        seen_l.add(lab)
+        labels[lab] = c["id"]
+    camp_by_id = {c["id"]: c for c in camps_list}
+    id_to_label = {v: k for k, v in labels.items()}
+    brand_camps = {}
+    for c in camps_list:
+        brand_camps.setdefault(_drive_norm(c["brand"]), []).append(c)
+
+    # 캠페인 선택·확인 표의 '처음 모습'(불러온 직후 한 번만 만들고, 같은 불러오기 동안은 그대로 둔다)
+    ncols = min(max((len(_inf_split_brands(r.get("brand_names"))) for r in rows), default=1), 6) or 1
+    ncols = max(ncols, 1)
+    base_key = f"inf_base_{ver}"
+    if base_key not in st.session_state:
+        recs = []
+        for i, r in enumerate(rows):
+            rec = {"행": r["_src"], "이름": r.get("influencer_name"), "브랜드(시트)": r.get("brand_names")}
+            fill = []
+            for b in _inf_split_brands(r.get("brand_names")):
+                bk = _inf_resolve_brand(b, brand_camps)
+                if bk and len(brand_camps[bk]) == 1:  # 그 브랜드 캠페인이 딱 하나일 때만 미리 골라둠(여러 개면 사람이 고름)
+                    fill.append(id_to_label.get(brand_camps[bk][0]["id"]))
+                else:
+                    fill.append(None)
+            for k in range(ncols):
+                rec[f"캠페인{k + 1}"] = fill[k] if k < len(fill) else None
+            rec["신분증 확인"] = False
+            rec["계약서 확인(없으면 해당없음)"] = False
+            recs.append(rec)
+        st.session_state[base_key] = pd.DataFrame(recs)
+    base = st.session_state[base_key]
+
+    st.markdown("#### ① 읽어온 내용 — 🟡 노란 칸은 채워야 해요 (시트에서 고친 뒤 같은 링크로 '불러오기')")
+    table_slot = st.container()
+    st.markdown("#### ② 캠페인 연결 · 확인 — 여기서 고르고 체크해요")
+    st.caption("캠페인은 **김선재님이 등록한 것 중에서만** 고를 수 있어요(직접 입력 불가). 시트의 브랜드가 N개면 캠페인도 N개 — 브랜드마다 하나씩이에요.")
+    cfg = {f"캠페인{k + 1}": st.column_config.SelectboxColumn(f"캠페인{k + 1}", options=list(labels), width="large") for k in range(ncols)}
+    edited = st.data_editor(
+        base, hide_index=True, use_container_width=True, key=f"inf_ed_{ver}", num_rows="fixed",
+        disabled=["행", "이름", "브랜드(시트)"], column_config=cfg,
+    )
+
+    existing = set()
+    try:
+        existing = load_existing_links()
+    except Exception as e:
+        st.warning(f"기존 링크와 겹치는지 확인하지 못했어요 ({type(e).__name__}: {e}) — 등록할 때 다시 확인해요.")
+    seen, results = {}, []
+    for i, r in enumerate(rows):
+        e = edited.iloc[i]
+        picks = [labels.get(e.get(f"캠페인{k + 1}")) for k in range(ncols)]
+        picks = [p for p in picks if p]
+        checks = {"id": bool(e.get("신분증 확인")), "contract": bool(e.get("계약서 확인(없으면 해당없음)"))}
+        v, bad = _inf_validate(r, i, picks, checks, camp_by_id, brand_camps, existing, seen)
+        results.append((v, bad))
+
+    # ① 표: 노란 칸 표시
+    shown = []
+    for i, (v, bad) in enumerate(results):
+        shown.append({
+            "상태": "✅ 준비됨" if not bad else f"🟡 {len(bad)}칸", "행": rows[i]["_src"], "이름": rows[i].get("influencer_name"),
+            "SNS계정": rows[i].get("sns_id"), "금액": rows[i].get("amount"), "통화": rows[i].get("currency"), "결제수단": rows[i].get("payment_method_raw"),
+            "콘텐츠링크": rows[i].get("content_link"), "방문일": rows[i].get("visit_date"), "업로드일": rows[i].get("upload_date"),
+            "송금예정일": rows[i].get("scheduled_date"), "신분증링크": rows[i].get("id_doc_link"), "브랜드": rows[i].get("brand_names"),
+            "캠페인": " + ".join(camp_by_id[c]["brand"] for c in v["campaign_ids"] if c in camp_by_id) or None,
+            "배분": rows[i].get("ratio"), "조회수": rows[i].get("views"), "좋아요": rows[i].get("likes"), "저장": rows[i].get("saves"),
+            "팔로워수": rows[i].get("followers"), "안내메일": rows[i].get("notification_email"),
+        })
+    sdf = pd.DataFrame(shown).replace("", None)
+    bad_cells = {(i, _INF_COL_OF.get(k, k)) for i, (_, bad) in enumerate(results) for k in bad}
+
+    def _paint(frame):
+        css = pd.DataFrame("", index=frame.index, columns=frame.columns)
+        for (ri, col) in bad_cells:
+            if col in css.columns:
+                css.loc[ri, col] = "background-color: #fff3b0; color: #5c4a00;"
+        return css
+    with table_slot:
+        try:
+            st.dataframe(sdf.style.apply(_paint, axis=None), hide_index=True, use_container_width=True)
+        except Exception:
+            st.dataframe(sdf, hide_index=True, use_container_width=True)
+
+    n_ok = sum(1 for _, b in results if not b)
+    all_ok = n_ok == len(results)
+    st.markdown(f"**준비 상태: {n_ok} / {len(results)}건** " + ("— 모두 준비됐어요. 아래에서 등록하세요." if all_ok else f"— 🟡 노란 칸 {len(bad_cells)}개를 채워야 다음 단계로 넘어가요."))
+    if not all_ok:
+        with st.expander("🟡 무엇을 채워야 하나요", expanded=True):
+            for i, (v, bad) in enumerate(results):
+                if bad:
+                    st.markdown(f"**{rows[i]['_src']} · {rows[i].get('influencer_name') or '(이름 없음)'}** — " + " / ".join(f"{k}: {why}" for k, why in bad.items()))
+
+    # ③④ 비용·보고: 전부 통과해야 열림
+    if all_ok:
+        by_cur = {}
+        for v, _ in results:
+            by_cur[v["currency"]] = by_cur.get(v["currency"], 0) + float(v["amount"])
+        total_line = " · ".join(f"{c} {a:,.0f}" for c, a in by_cur.items())
+        st.markdown(f"#### ③ 비용 · 보고 — 이번 송금 합계 **{total_line}** ({len(results)}건)")
+    else:
+        st.markdown("#### ③ 비용 · 보고")
+    sure = st.checkbox("위 내용과 합계를 확인했고, 이미 송금한 건과 겹치지 않아요", key=f"inf_sure_{ver}", disabled=not all_ok)
+    if st.button("✅ 전체 등록 (여기서 저장돼요)" if all_ok else "🟡 노란 칸을 모두 채우면 열려요", type="primary", disabled=not (all_ok and sure), key=f"inf_reg_{ver}"):
+        saved, err, saved_idx = _inf_register([(i, v) for i, (v, _) in enumerate(results)], my_name)
+        _log_upload_attempt(my_name, "failed" if err else "registered", n_rows=len(results), n_ok=saved, n_blocked=(len(results) - saved) or None, detail=err)
+        for fn in (load_my_pending_payments, load_existing_links, load_placements):
+            fn.clear()
+        if err:
+            st.session_state["inf_rows"] = [r for i, r in enumerate(rows) if i not in saved_idx]
+            st.session_state["inf_ver"] = ver + 1
+            st.session_state["inf_warn_after"] = st.session_state.get("inf_warn_after", []) + [f"❌ {err}. 먼저 {saved}건은 저장됐고 나머지는 표에 남아 있어요. 원인을 해결한 뒤 다시 등록해주세요."]
+        else:
+            st.session_state.pop("inf_rows", None)
+            st.session_state.pop("inf_notes", None)
+            st.session_state["inf_ver"] = ver + 1
+            st.session_state["inf_done"] = f"✅ {saved}건을 등록했어요 — 송금(비용)·캠페인 연결·성과기록이 함께 저장됐고, 구정회님께 마진데이터 알림도 보냈어요."
+        st.rerun()
+
+    with st.expander("📌 내가 등록한 송금요청 (대표님 처리 대기)", expanded=False):
+        pend, _lk = load_my_pending_payments(my_name)
+        if not pend:
+            st.caption("대기 중인 건이 없어요.")
+        else:
+            st.dataframe(pd.DataFrame([{"이름": p["influencer_name"], "금액": f"{float(p['amount']):,.0f} {p.get('currency') or ''}", "예정일": p.get("scheduled_date"),
+                                        "콘텐츠링크": p.get("content_link")} for p in pend]), hide_index=True, use_container_width=True)
+    with st.expander("🔧 지난 성과기록 빈칸 보정 (이미 올라온 매칭현황)", expanded=False):
+        _render_influencer_records(my_name)
 
 
 def _hub_refresh():
@@ -3077,12 +3618,7 @@ if _nav == "campaign":
                 }
                 # 콘텐츠 링크는 진짜 고유값이라, 같은 링크+브랜드 조합이 이미 있으면 새로 만들지 않고 덮어씀
                 # (담당자가 구글시트에서 계속 작업하다 몇 번을 다시 업로드해도 안전하게 최신 값으로 갱신됨)
-                if payload.get("content_link"):
-                    SUPA.table("influencer_placements").upsert(
-                        payload, on_conflict="content_link,brand_name"
-                    ).execute()
-                else:
-                    SUPA.table("influencer_placements").insert(payload).execute()
+                _placement_save(payload)
             st.session_state.pop("sheet_rows_preview", None)
             _flash(f"{len(preview_rows)}건 등록 완료!")
             refresh()
@@ -3281,6 +3817,10 @@ if _nav == "campaign":
                             _flash("저장 완료")
                             refresh()
 
+
+if _nav == "finance" and my_name in INF_FLOW_USERS:
+    _render_influencer_hub(my_name)
+    st.stop()  # 새 흐름 사용자는 아래의 예전 송금 화면을 건너뛴다
 
 if _nav == "finance":
     # ══════════════════════════════════════════════════════════
