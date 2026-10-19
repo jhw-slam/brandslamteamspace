@@ -2399,6 +2399,229 @@ def _render_influencer_hub(my_name):
         _render_influencer_records(my_name)
 
 
+BREAKOUT_VIEWS = 100_000  # '콘텐츠가 터졌다'고 볼 조회수 기준(임시 — 대표님이 정하면 이 한 줄만 바꾸면 됨)
+MACRO_TARGETS = {}  # 거시 목표 숫자(예: {"uploads": 30}) — 대표님이 정하면 채운다. 비어 있으면 '목표 미설정'으로 현황만 보여준다
+
+
+def _week_start(d):
+    return d - timedelta(days=d.weekday())  # 월요일 시작
+
+
+@st.cache_data(ttl=30)
+def load_headlines():
+    """사람별 핵심 KPI 1개. {person: okr_items 행}. 칸이 아직 DB에 없으면 (None, 에러문구)."""
+    try:
+        rows = SUPA.table("okr_items").select("*").eq("is_headline", True).execute().data
+    except Exception as e:
+        return None, f"{type(e).__name__}: {e}"
+    return {r["person"]: r for r in rows}, None
+
+
+@st.cache_data(ttl=30)
+def load_weekly_logs():
+    """주간 기록 전체. 테이블이 아직 없으면 (None, 에러문구)."""
+    try:
+        return SUPA.table("okr_weekly_log").select("*").order("week_start").limit(5000).execute().data, None
+    except Exception as e:
+        return None, f"{type(e).__name__}: {e}"
+
+
+def _kpi_series(item, logs, today):
+    """핵심 KPI의 주별 표: 주, 계획, 실제, 누적계획, 누적실제, 목표페이스. 기간은 기간 시작~끝(없으면 마감일, 그것도 없으면 최근 7주+앞 2주)."""
+    target = float(item.get("target_qty") or 0)
+    ps = _to_date(item.get("period_start"))
+    pe = _to_date(item.get("period_end")) or _to_date(item.get("due_date"))
+    first = _week_start(ps) if ps else _week_start(today) - timedelta(weeks=6)
+    last = _week_start(pe) if pe and pe >= first else _week_start(today) + timedelta(weeks=2)
+    by_week = {_to_date(l["week_start"]): l for l in logs}
+    weeks, w = [], first
+    while w <= last and len(weeks) < 60:
+        weeks.append(w)
+        w += timedelta(weeks=1)
+    rows, cp, ca = [], 0.0, 0.0
+    for i, w in enumerate(weeks):
+        l = by_week.get(w, {})
+        p, a = l.get("plan"), l.get("actual")
+        cp += float(p or 0)
+        ca += float(a or 0)
+        rows.append({"week": w, "label": w.strftime("%m/%d"), "plan": p, "actual": a, "cum_plan": cp,
+                     "cum_actual": ca if w <= _week_start(today) else None,
+                     "pace": target * (i + 1) / len(weeks) if target else None})
+    return pd.DataFrame(rows)
+
+
+def _sample_series(today):
+    """가상인턴용 예시(가상 데이터): 목표 20건 중 6주 동안 계획 대비 실제가 따라가는 모양."""
+    plan, actual = [2, 3, 3, 4, 4, 4], [2, 2, 4, 3, None, None]
+    start = _week_start(today) - timedelta(weeks=3)
+    rows, cp, ca = [], 0.0, 0.0
+    for i in range(6):
+        w = start + timedelta(weeks=i)
+        cp += plan[i]
+        ca += actual[i] or 0
+        rows.append({"week": w, "label": w.strftime("%m/%d"), "plan": plan[i], "actual": actual[i], "cum_plan": cp,
+                     "cum_actual": ca if actual[i] is not None else None, "pace": 20 * (i + 1) / 6})
+    return pd.DataFrame(rows)
+
+
+def _render_weekly_focus(my_name):
+    """① 내 핵심 KPI: 지난주·이번주·다음주와 누적 그래프, 이번 주 입력(저장 버튼 1개)."""
+    today = _today_kst()
+    ws = _week_start(today)
+    heads, herr = load_headlines()
+    logs_all, lerr = load_weekly_logs()
+    item = (heads or {}).get(my_name)
+    demo = False
+    st.markdown("### 🎯 내 핵심 KPI — 이번 주 확인")
+    if herr or lerr:
+        st.info("핵심 KPI 기능은 DB에 칸이 추가돼야 켜져요(`migrations/20261019_okr_weekly.sql`). 아래는 **예시(가상) 화면**이에요." if my_name == "가상인턴"
+                else "핵심 KPI 기능은 DB 준비 중이에요(`migrations/20261019_okr_weekly.sql` 적용 필요).")
+        demo = my_name == "가상인턴"
+    elif not item:
+        st.info("대표님이 아직 내 핵심 KPI를 지정하지 않았어요." + (" 아래는 **예시(가상) 화면**이에요." if my_name == "가상인턴" else ""))
+        demo = my_name == "가상인턴"
+    if not demo and not item:
+        return
+    if demo:
+        item = {"title": "(예시) 인플루언서 신규 영입", "target_qty": 20, "unit": "건", "period_start": str(ws - timedelta(weeks=3)), "period_end": str(ws + timedelta(weeks=2))}
+        df = _sample_series(today)
+        st.caption("⚠️ 가상 데이터예요. 실제 저장되지 않아요.")
+    else:
+        mine = [l for l in (logs_all or []) if l["item_id"] == item["id"]]
+        df = _kpi_series(item, mine, today)
+    unit = item.get("unit") or ""
+    target = float(item.get("target_qty") or 0)
+    st.markdown(f"**{item['title']}** · 목표 {target:g}{unit}")
+    cur = df[df["week"] == ws]
+    cur_plan = None if cur.empty else cur.iloc[0]["plan"]
+    cur_act = None if cur.empty else cur.iloc[0]["actual"]
+    prev = df[df["week"] == ws - timedelta(weeks=1)]
+    nxt = df[df["week"] == ws + timedelta(weeks=1)]
+    done = float(df["cum_actual"].dropna().iloc[-1]) if df["cum_actual"].notna().any() else 0.0
+    m1, m2, m3, m4 = st.columns(4)
+    m1.metric("지난주 실제", "-" if prev.empty or pd.isna(prev.iloc[0]["actual"]) else f"{prev.iloc[0]['actual']:g}{unit}")
+    m2.metric("이번주 계획 → 실제", f"{'-' if cur_plan is None or pd.isna(cur_plan) else format(cur_plan, 'g')} → {'-' if cur_act is None or pd.isna(cur_act) else format(cur_act, 'g')}")
+    m3.metric("다음주 계획", "-" if nxt.empty or pd.isna(nxt.iloc[0]["plan"]) else f"{nxt.iloc[0]['plan']:g}{unit}")
+    m4.metric("누적 / 목표", f"{done:g} / {target:g}{unit}" if target else f"{done:g}{unit}", delta=f"{done / target * 100:.0f}%" if target else None)
+    chart = df.set_index("label")[["cum_plan", "cum_actual", "pace"]].rename(columns={"cum_plan": "누적 계획", "cum_actual": "누적 실제", "pace": "목표 페이스"})
+    st.line_chart(chart, height=260)
+    if target and not demo:
+        pace_now = float(df[df["week"] == ws].iloc[0]["pace"]) if not cur.empty else None
+        if pace_now is not None and done < pace_now:
+            st.warning(f"목표 페이스보다 {pace_now - done:g}{unit} 뒤처져 있어요. 이번 주에 따라잡을 계획을 적어주세요.")
+    with st.form("weekly_focus_form"):
+        st.caption(f"{ws.strftime('%m/%d')} 주 (월~일) · 저장해야 반영돼요")
+        f1, f2, f3 = st.columns(3)
+        n_plan = f1.number_input("이번주 계획", min_value=0.0, step=1.0, value=float(cur_plan) if cur_plan is not None and not pd.isna(cur_plan) else 0.0)
+        n_act = f2.number_input("이번주 실제(한 개수)", min_value=0.0, step=1.0, value=float(cur_act) if cur_act is not None and not pd.isna(cur_act) else 0.0)
+        nx_plan = f3.number_input("다음주 계획", min_value=0.0, step=1.0,
+                                  value=float(nxt.iloc[0]["plan"]) if not nxt.empty and not pd.isna(nxt.iloc[0]["plan"]) else 0.0)
+        note = st.text_input("한 줄 메모(막힌 점·도움이 필요한 점)", placeholder="없으면 비워두세요")
+        saved = st.form_submit_button("💾 이번 주 저장 (여기서 저장돼요)", type="primary", disabled=demo)
+    if saved and not demo:
+        try:
+            now = datetime.utcnow().isoformat() + "Z"
+            for w, vals in ((ws, {"plan": n_plan, "actual": n_act, "note": note.strip() or None}), (ws + timedelta(weeks=1), {"plan": nx_plan})):
+                SUPA.table("okr_weekly_log").upsert({"item_id": item["id"], "person": my_name, "week_start": w.isoformat(), "updated_by": my_name,
+                                                     "updated_at": now, **vals}, on_conflict="item_id,week_start").execute()
+        except Exception as e:
+            st.error(f"저장하지 못했어요 ({type(e).__name__}: {e})")
+        else:
+            load_weekly_logs.clear()
+            _flash("이번 주 기록을 저장했어요.")
+            st.rerun()
+
+
+def _render_team_board():
+    """② 팀 핵심 KPI 한눈에: 누구의 목표가 얼마나 왔고, 이번 주 입력을 했는지."""
+    st.markdown("### 👥 팀 핵심 KPI 한눈에")
+    heads, herr = load_headlines()
+    logs_all, lerr = load_weekly_logs()
+    if herr or lerr or not heads:
+        st.caption("아직 지정된 핵심 KPI가 없어요." if not (herr or lerr) else "DB 준비 중이에요(`migrations/20261019_okr_weekly.sql`).")
+        return
+    today = _today_kst()
+    ws = _week_start(today)
+    rows = []
+    for person, it in sorted(heads.items()):
+        mine = [l for l in (logs_all or []) if l["item_id"] == it["id"]]
+        df = _kpi_series(it, mine, today)
+        done = float(df["cum_actual"].dropna().iloc[-1]) if df["cum_actual"].notna().any() else 0.0
+        target = float(it.get("target_qty") or 0)
+        cur = df[df["week"] == ws]
+        entered = (not cur.empty) and pd.notna(cur.iloc[0]["actual"])
+        pace = float(cur.iloc[0]["pace"]) if not cur.empty and pd.notna(cur.iloc[0]["pace"]) else None
+        rows.append({"이름": person, "핵심 KPI": it["title"][:30], "누적/목표": f"{done:g}/{target:g}{it.get('unit') or ''}",
+                     "달성률": min(done / target, 1.0) if target else 0.0,
+                     "페이스": "—" if pace is None else ("✅ 순조" if done >= pace else f"⚠️ {pace - done:g} 뒤처짐"),
+                     "이번주 입력": "✅" if entered else "❌ 아직"})
+    st.dataframe(pd.DataFrame(rows), hide_index=True, use_container_width=True,
+                 column_config={"달성률": st.column_config.ProgressColumn("달성률", min_value=0.0, max_value=1.0, format="percent")})
+
+
+def _render_macro_board():
+    """③ 거시 목표 현황(이번 달): 이미 DB에 있는 데이터로 계산. 목표 숫자가 없으면 현황만."""
+    st.markdown("### 🌐 이번 달 거시 현황")
+    today = _today_kst()
+    m0 = today.replace(day=1)
+    try:
+        pl = load_placements()
+        accs = SUPA.table("sales_accounts").select("status,created_at").execute().data
+        camps = SUPA.table("sales_campaigns").select("open_date").execute().data
+    except Exception as e:
+        st.error(f"불러오지 못했어요 ({type(e).__name__}: {e})")
+        return
+    up_m = [p for p in pl if p.get("status") == "업로드완료" and (d := _to_date(p.get("actual_upload_date"))) and d >= m0]
+    seen_before = {p["influencer_name"] for p in pl if (d := _to_date(p.get("actual_upload_date"))) and d < m0}
+    new_inf = {p["influencer_name"] for p in up_m} - seen_before
+    popped = [p for p in up_m if (p.get("views") or 0) >= BREAKOUT_VIEWS]
+    sales_pool = [a for a in accs if a.get("status") in ("계약완료", "운영중")]
+    new_accs = [a for a in accs if (d := _to_date(a.get("created_at"))) and d >= m0]
+    camps_m = [c for c in camps if (d := _to_date(c.get("open_date"))) and d >= m0]
+    items = [
+        ("uploads", "업로드 완료 콘텐츠", len(up_m), "건"), ("new_inf", "신규 인플루언서", len(new_inf), "명"),
+        ("popped", f"터진 콘텐츠(조회 {BREAKOUT_VIEWS // 10000}만+)", len(popped), "건"), ("sales_pool", "운영·계약 브랜드", len(sales_pool), "개"),
+        ("new_accs", "신규 영업 브랜드", len(new_accs), "개"), ("camps", "새로 연 캠페인", len(camps_m), "개"),
+    ]
+    cols = st.columns(len(items))
+    for c, (k, label, val, unit) in zip(cols, items):
+        tgt = MACRO_TARGETS.get(k)
+        c.metric(label, f"{val}{unit}", delta=(f"목표 {tgt}{unit}" if tgt else None), delta_color="off")
+    st.caption("목표 숫자는 대표님이 정하면 표시돼요 · '설득 빈도', '기획전 참여'는 아직 기록하는 곳이 없어 빠져 있어요(어디에 남길지 정해야 해요).")
+
+
+def _render_headline_admin():
+    """대표 전용: 사람마다 핵심 KPI 1개 지정(비밀번호). 직원이 쉬운 걸로 바꾸지 못하게 잠가 둔다."""
+    with st.expander("🔒 대표 전용 — 핵심 KPI 지정", expanded=False):
+        pw_env = os.environ.get("FINANCE_PASSWORD")
+        if not pw_env:
+            st.caption("FINANCE_PASSWORD 환경변수가 이 서비스에 없어서 지정 기능을 쓸 수 없어요(Railway Variables에 추가).")
+            return
+        with st.form("headline_form"):
+            pw = st.text_input("비밀번호", type="password")
+            org, items = load_okr()
+            who = st.selectbox("사람", [o["person"] for o in org] if org else [], key="hl_person")
+            cands = [it for it in items if it["person"] == who and float(it.get("target_qty") or 0) > 0]
+            pick = st.selectbox("핵심 KPI로 지정할 항목(중장기 목표 1개)", [c["id"] for c in cands], key="hl_item",
+                                format_func=lambda i: next(f"[{c.get('category') or ''}] {c['title'][:40]} · 목표 {float(c['target_qty']):g}{c.get('unit') or ''}" for c in cands if c["id"] == i))
+            go = st.form_submit_button("📌 지정 (여기서 저장돼요)", type="primary")
+        if go:
+            if pw != pw_env:
+                st.error("비밀번호가 맞지 않아요.")
+            elif not pick:
+                st.error("지정할 항목을 골라주세요.")
+            else:
+                try:
+                    SUPA.table("okr_items").update({"is_headline": False}).eq("person", who).execute()
+                    SUPA.table("okr_items").update({"is_headline": True}).eq("id", pick).execute()
+                except Exception as e:
+                    st.error(f"저장하지 못했어요 — DB에 칸이 없을 수 있어요(`migrations/20261019_okr_weekly.sql`) ({type(e).__name__}: {e})")
+                else:
+                    load_headlines.clear()
+                    _flash(f"{who}님의 핵심 KPI를 지정했어요.")
+                    st.rerun()
+
+
 def _hub_refresh():
     """캠페인 수정(인보이스·입금 연결) 뒤: 관련 캐시를 비우고 다시 그린다."""
     load_hub_data.clear(); load_match_campaigns.clear()
@@ -3233,10 +3456,17 @@ if _nav == "okr":
     # ══════════════════════════════════════════════════════════
     # 🎯 팀 OKR 현황 (읽기 전용 — 기존 OKR 자료 그대로, 편집 기능 없음)
     # ══════════════════════════════════════════════════════════
-    st.subheader("🎯 팀 OKR 현황")
+    st.subheader("🎯 목표 — 매주 확인")
+    st.caption("OKR은 내 커리어를 쌓는 기록이에요. 시스템이 조금 불편해도, 할 수 있는 만큼만 매주 꾸준히 남겨주세요 — 대표님과 매주 이 화면으로 이야기해요.")
+    _render_weekly_focus(my_name)
+    st.divider()
+    _render_team_board()
+    st.divider()
+    _render_macro_board()
+    _render_headline_admin()
+    st.divider()
 
-
-    with st.expander("열기 (내 OKR이 먼저 보여요)", expanded=False):
+    with st.expander("📚 전체 OKR 상세 보기 (내 OKR이 먼저 보여요)", expanded=False):
         st.caption("전사 목표(OKR)를 참고용으로 보여드려요. 여기서는 수정이 안 되고 확인만 하는 용도예요 — 편집은 기존 OKR 페이지에서 계속 하시면 됩니다.")
         okr_org_data, okr_items_data = load_okr()
 
