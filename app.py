@@ -1727,7 +1727,7 @@ def _log_upload_attempt(person, stage, file_name=None, n_rows=None, n_ok=None, n
 def load_hub_data():
     """모든 브랜드의 캠페인·주차루틴(캘린더용). 반환: (계정, 캠페인, 주차루틴, 에러문구)"""
     try:
-        accs = SUPA.table("sales_accounts").select("id,brand_name,assigned_to,status").execute().data
+        accs = SUPA.table("sales_accounts").select("id,brand_name,assigned_to,status,created_at").execute().data
         camps = SUPA.table("sales_campaigns").select("*").order("open_date", desc=True).limit(300).execute().data
         tasks = SUPA.table("sales_campaign_tasks").select("*").limit(2000).execute().data
         return accs, camps, tasks, None
@@ -2661,7 +2661,7 @@ def _render_kpi_board(my_name):
             if got < pace * 0.8:
                 behind.append(f"{KPI_DEFS[k]['label']} {_fmt_kpi(pace - got, KPI_DEFS[k]['unit'])} 뒤처짐")
     if behind and not demo:
-        st.warning("목표 페이스보다 뒤처진 지표: " + " · ".join(behind))
+        st.info("이번 달 페이스까지 남은 지표: " + " · ".join(b.replace(" 뒤처짐", "") for b in behind))
 
     with st.form("kpi_plan_form"):
         st.caption(f"{ws.strftime('%m/%d')} 주 계획 · 다음주 계획 — 비워두면(0) 계획 없음으로 봐요. 저장해야 반영돼요.")
@@ -2781,44 +2781,109 @@ def load_quests():
         return None, f"{type(e).__name__}: {e}"
 
 
-XP_PER_LEVEL = 100
+@st.cache_data(ttl=60)
+def load_comments_recent(since_iso):
+    try:
+        return SUPA.table("team_comments").select("author,created_at,target_type").gte("created_at", since_iso).limit(3000).execute().data
+    except Exception:
+        return []
 
 
-def _quest_xp(person, quests):
-    return sum(int(q.get("xp") or 0) for q in quests if q["owner"] == person and q["status"] == "done")
+def _scorecard(person, ctx, targets, today):
+    """개인 목표를 세분화한 숫자들(데이터에서 자동 계산, 입력 없음): KPI 개수·클리어 수·이번 달 달성률·협력지수·외부 협력·혁신 요소."""
+    keys = _kpi_keys(person)
+    m0 = today.replace(day=1)
+    rates, cleared, with_target = [], 0, 0
+    for k in keys:
+        tgt = (targets or {}).get((person, k))
+        if not tgt:
+            continue
+        d = KPI_DEFS[k]
+        val = _kpi_sum(person, k, m0, today, ctx) if d["kind"] == "sum" else _kpi_level(person, k, today, ctx)
+        r = min((val or 0) / tgt, 1.0)
+        rates.append(r)
+        with_target += 1
+        cleared += 1 if r >= 1.0 else 0
+    since = (today - timedelta(days=30)).isoformat()
+    n_comments = sum(1 for c in load_comments_recent(since) if c.get("author") == person)
+    reqs, _rerr = load_team_requests()
+    reqs = reqs or []
+    since_d = today - timedelta(days=30)
+    helped = sum(1 for r in reqs if r.get("assignee") == person and r.get("requester") != person and r.get("status") == "완료"
+                 and (d := _to_date(r.get("completed_at"))) and d >= since_d)
+    asked = sum(1 for r in reqs if r.get("requester") == person and r.get("assignee") != person and (d := _to_date(r.get("created_at"))) and d >= since_d)
+    accs, camps, _t, _e = load_hub_data()
+    new_accs = sum(1 for a in accs if a.get("assigned_to") == person and (d := _to_date(a.get("created_at"))) and d >= m0)
+    new_camps = sum(1 for c in camps if c.get("created_by") == person and (d := _to_date(c.get("created_at"))) and d >= m0)
+    ev_m = [e for e in ctx["events"] if e.get("person") == person and (d := _to_date(e.get("event_date"))) and d >= m0]
+    outside = {e["brand_name"] for e in ev_m if e.get("brand_name")}
+    new_pool = int(_kpi_sum(person, "pool_new", m0, today, ctx))
+    guides = int(sum(float(e.get("qty") or 0) for e in ev_m if e.get("metric_key") == "guide_selected"))
+    new_metrics = len({e.get("metric_key") for e in ev_m})
+    return {
+        "kpi_n": len(keys), "with_target": with_target, "cleared": cleared,
+        "rate": (sum(rates) / len(rates)) if rates else None,
+        "collab": n_comments + helped + asked, "collab_parts": (n_comments, helped, asked),
+        "outside": len(outside) + new_pool + new_accs, "outside_parts": (len(outside), new_pool, new_accs),
+        "innov": guides + new_camps + new_metrics, "innov_parts": (guides, new_camps, new_metrics),
+    }
+
+
+def _cheer(sc, n_open, n_clear):
+    """상태에 맞는 한 줄(가볍게, 압박 없이)."""
+    if n_clear and not n_open:
+        return "받은 퀘스트를 전부 클리어했어요. 커피 한 잔 하고 오세요 ☕"
+    r = sc.get("rate")
+    if r is None:
+        return "이번 달 목표 숫자가 정해지면 달성률이 여기 떠요. 그때까지는 이번 주 계획부터 한 칸씩."
+    if r >= 0.7:
+        return "이 페이스면 월말에 웃을 수 있어요. 지금처럼만."
+    if r >= 0.3:
+        return "중간 이상 왔어요. 이번 주 한 칸만 더 가면 분위기가 달라져요."
+    return "아직 시동 거는 중이에요. 이번 주는 가장 쉬운 한 칸부터 클리어해봐요."
 
 
 def _render_quest_board(my_name):
-    """게임처럼: 내 퀘스트(소 미션, 완료 버튼) + 오늘의 자동 퀘스트 + 레벨/XP + 팀 리더보드 + 대·중·소 미션 지도."""
-    st.markdown("### 🎮 퀘스트")
-    quests, qerr = load_quests()
-    if qerr:
-        st.info("퀘스트 칸이 DB에 아직 없어요(`migrations/20261019_quests_and_targets.sql`).")
-        return
+    """내 목표를 쪼개서 보여주는 화면: 한눈에 숫자(KPI 개수·달성률·협력지수·외부 협력·혁신) + 이번 주 퀘스트(클리어!) + 팀 미션 지도."""
+    st.markdown("### 🧭 내 목표 한눈에")
     today = _today_kst()
     ws = _week_start(today)
-    mine = [q for q in quests if q["kind"] == "small" and q["owner"] == my_name]
+    ctx, _eerr = _kpi_ctx()
+    targets, terr = load_kpi_targets()
+    sc = _scorecard(my_name, ctx, None if terr else targets, today)
+    quests, qerr = load_quests()
+    mine = [q for q in (quests or []) if q["kind"] == "small" and q["owner"] == my_name]
     opens = sorted([q for q in mine if q["status"] == "open"], key=lambda q: str(q.get("due_date") or "9999"))
-    done_n = sum(1 for q in mine if q["status"] == "done")
-    xp = _quest_xp(my_name, quests)
-    lv = 1 + xp // XP_PER_LEVEL
-    c1, c2, c3 = st.columns(3)
-    c1.metric("레벨", f"Lv.{lv}")
-    c2.metric("경험치", f"{xp} XP", delta=f"다음 레벨까지 {XP_PER_LEVEL - xp % XP_PER_LEVEL}", delta_color="off")
-    c3.metric("완료한 퀘스트", f"{done_n}/{len(mine)}")
-    st.progress((xp % XP_PER_LEVEL) / XP_PER_LEVEL)
+    clear_n = sum(1 for q in mine if q["status"] == "done")
+    c1, c2, c3, c4, c5 = st.columns(5)
+    c1.metric("내 KPI", f"{sc['kpi_n']}개", delta=f"{sc['cleared']}개 클리어" if sc["with_target"] else "목표 대기", delta_color="off")
+    c2.metric("이번 달 달성률", "-" if sc["rate"] is None else f"{sc['rate'] * 100:.0f}%")
+    c3.metric("협력지수", f"{sc['collab']}건", delta="최근 30일", delta_color="off")
+    c4.metric("외부 협력", f"{sc['outside']}곳", delta="이번 달", delta_color="off")
+    c5.metric("혁신 요소", f"{sc['innov']}개", delta="이번 달 새로 만든 것", delta_color="off")
+    if sc["rate"] is not None:
+        st.progress(sc["rate"])
+    st.caption(_cheer(sc, len(opens), clear_n))
+    with st.expander("이 숫자는 이렇게 계산해요", expanded=False):
+        cm, hp, ak = sc["collab_parts"]
+        ol, npool, nacc = sc["outside_parts"]
+        gd, ncamp, nmet = sc["innov_parts"]
+        st.markdown(
+            f"- **달성률**: 월 목표가 있는 KPI의 달성 정도(100%까지)를 평균 낸 값이에요. 목표가 있는 KPI {sc['with_target']}개 기준.\n"
+            f"- **협력지수**: 최근 30일 동안 댓글 {cm}건 + 도와서 끝낸 요청 {hp}건 + 동료에게 보낸 요청 {ak}건.\n"
+            f"- **외부 협력**: 이번 달 새로 만난 외부 상대 — 기록에 남긴 브랜드/상대 {ol}곳 + 새로 쓴 인플루언서 {npool}명 + 새 영업 브랜드 {nacc}곳.\n"
+            f"- **혁신 요소**: 이번 달 새로 만든 것 — 브랜드가 선정한 가이드 {gd}개 + 새 캠페인 {ncamp}개 + 이번 달 처음 기록한 지표 {nmet}종류.\n"
+            "- 입력하는 게 아니라 이미 남긴 기록에서 자동으로 세요. 많이 남길수록 정확해져요.")
 
-    # 오늘의 자동 퀘스트: 데이터가 알아서 만든다(저장 안 함)
+    # 이번 주 퀘스트(자동): 데이터가 알아서 만든다
     auto = []
     keys = _kpi_keys(my_name)
     plans, perr = load_kpi_plans()
     if keys and not perr:
-        miss = [KPI_DEFS[k]["label"] for k in keys if (my_name, k, ws.isoformat()) not in plans]
+        miss = [k for k in keys if (my_name, k, ws.isoformat()) not in plans]
         if miss:
-            auto.append(f"⚡ 이번 주 계획을 적어요 — 아직 {len(miss)}개 지표 비어 있어요 (1분이면 끝나요, 아래 '내 핵심 지표')")
-    targets, terr = load_kpi_targets()
+            auto.append(f"이번 주 계획 적기 — {len(miss)}개 지표가 비어 있어요 (1분이면 돼요, 아래 '내 핵심 지표')")
     if keys and targets and not terr:
-        ctx, _e = _kpi_ctx()
         m0 = today.replace(day=1)
         days = ((m0.replace(day=28) + timedelta(days=4)).replace(day=1) - m0).days
         for k in keys:
@@ -2826,65 +2891,53 @@ def _render_quest_board(my_name):
             if tgt and KPI_DEFS[k]["kind"] == "sum":
                 pace, got = tgt * today.day / days, _kpi_sum(my_name, k, m0, today, ctx)
                 if got < pace * 0.8:
-                    auto.append(f"🔥 '{KPI_DEFS[k]['label']}' 이번 달 페이스보다 {_fmt_kpi(pace - got, KPI_DEFS[k]['unit'])} 모자라요 — 이번 주에 따라잡기")
-    for q in opens:
-        d = _to_date(q.get("due_date"))
-        if d and d < today:
-            auto.append(f"⏰ 기한이 지났어요: {q['title']} ({d.strftime('%m/%d')})")
-    if auto:
-        st.markdown("**⚡ 오늘의 퀘스트**")
-        for a in auto[:5]:
-            st.markdown(f"- {a}")
-    elif keys:
-        st.success("오늘의 퀘스트를 모두 끝냈어요 👏")
-
+                    auto.append(f"'{KPI_DEFS[k]['label']}' 이번 달 페이스까지 {_fmt_kpi(pace - got, KPI_DEFS[k]['unit'])} 남았어요")
+    st.markdown("### 🎮 이번 주 퀘스트")
+    if qerr:
+        st.info("퀘스트 칸이 DB에 아직 없어요(`migrations/20261019_quests_and_targets.sql`).")
+    for a in auto[:4]:
+        st.markdown(f"- 🎯 {a}")
     if opens:
-        st.markdown("**📜 내 퀘스트** (끝내면 `완료!`를 눌러요 · 완료할 때마다 20 XP)")
+        st.caption("끝내면 `클리어!`를 눌러요.")
         for q in opens[:8]:
             d = _to_date(q.get("due_date"))
-            tag = "" if not d else (f" · ⏰ 기한 지남 {d.strftime('%m/%d')}" if d < today else f" · D-{(d - today).days} ({d.strftime('%m/%d')})")
+            tag = ""
+            if d:
+                tag = f" · {(today - d).days}일 지났어요 — 막힌 점이 있으면 요청 게시판에 남겨요" if d < today else f" · D-{(d - today).days} ({d.strftime('%m/%d')})"
             qc1, qc2 = st.columns([6, 1])
             qc1.markdown(f"🔹 {q['title']}{tag}")
-            if qc2.button("완료!", key=f"quest_done_{q['id']}"):
+            if qc2.button("클리어!", key=f"quest_done_{q['id']}"):
                 try:
                     SUPA.table("quests").update({"status": "done", "done_at": datetime.utcnow().isoformat() + "Z", "done_by": my_name}).eq("id", q["id"]).execute()
                 except Exception as e:
                     st.error(f"저장하지 못했어요 ({type(e).__name__}: {e})")
                 else:
                     load_quests.clear()
-                    _flash(f"퀘스트 완료! +{int(q.get('xp') or 0)} XP")
+                    _flash("클리어! 한 칸 전진했어요 🙌")
                     st.rerun()
     elif mine:
-        st.success("받은 퀘스트를 모두 끝냈어요. 새 퀘스트를 기다려요!")
+        st.success("받은 퀘스트를 전부 클리어했어요.")
+    elif not auto and not qerr:
+        st.caption("지금 받은 퀘스트가 없어요.")
 
-    with st.expander("🏆 팀 리더보드 · 🗺️ 우리 팀 미션 지도", expanded=False):
-        people = [p for p in STAFF_NAMES if p != _KPI_TEST_USER and any(q["owner"] == p for q in quests)]
-        rows = []
-        for p in people:
-            sm = [q for q in quests if q["kind"] == "small" and q["owner"] == p]
-            late = sum(1 for q in sm if q["status"] == "open" and (d := _to_date(q.get("due_date"))) and d < today)
-            wk = sum(1 for q in sm if q["status"] == "done" and (d := _to_date(q.get("done_at"))) and d >= ws)
-            x = _quest_xp(p, quests)
-            rows.append({"이름": p, "레벨": f"Lv.{1 + x // XP_PER_LEVEL}", "XP": x, "이번 주 완료": wk, "남은 퀘스트": sum(1 for q in sm if q["status"] == "open"), "기한 지남": late})
-        if rows:
-            st.dataframe(pd.DataFrame(rows).sort_values("XP", ascending=False), hide_index=True, use_container_width=True)
-        targets, _t = load_kpi_targets()
-        ctx2, _e2 = _kpi_ctx() if targets else (None, None)
-        m0 = today.replace(day=1)
-        for big in [q for q in quests if q["kind"] == "big"]:
-            st.markdown(f"**🟥 대 · {big['title']}** (담당 {big['owner']})")
-            for mid in [q for q in quests if q["kind"] == "mid" and q.get("parent_id") == big["id"]]:
-                line = f"- 🟧 중 · {mid['title']} — {mid['owner']}"
-                k = mid.get("kpi_key")
-                if k in KPI_DEFS and ctx2 is not None:
-                    d = KPI_DEFS[k]
-                    val = _kpi_sum(mid["owner"], k, m0, today, ctx2) if d["kind"] == "sum" else _kpi_level(mid["owner"], k, today, ctx2)
-                    tgt = targets.get((mid["owner"], k))
-                    line += f" · 지금 {_fmt_kpi(val, d['unit'])}" + (f" / 목표 {_fmt_kpi(tgt, d['unit'])}" if tgt else "")
-                st.markdown(line)
-            smalls = [q for q in quests if q["kind"] == "small" and q.get("parent_id") == big["id"]]
-            if smalls:
-                st.caption("  🟨 소 · " + " / ".join(f"{'✅' if q['status'] == 'done' else '⬜'} {q['owner']}: {q['title'][:28]}" for q in sorted(smalls, key=lambda q: str(q.get('due_date') or ''))))
+    if quests:
+        with st.expander("🗺️ 우리 팀 미션 지도 (대 → 중 → 소)", expanded=False):
+            m0 = today.replace(day=1)
+            ctx2 = ctx
+            for big in [q for q in quests if q["kind"] == "big"]:
+                st.markdown(f"**대 · {big['title']}** (담당 {big['owner']})")
+                for mid in [q for q in quests if q["kind"] == "mid" and q.get("parent_id") == big["id"]]:
+                    line = f"- 중 · {mid['title']} — {mid['owner']}"
+                    k = mid.get("kpi_key")
+                    if k in KPI_DEFS and not terr:
+                        d = KPI_DEFS[k]
+                        val = _kpi_sum(mid["owner"], k, m0, today, ctx2) if d["kind"] == "sum" else _kpi_level(mid["owner"], k, today, ctx2)
+                        tgt = targets.get((mid["owner"], k))
+                        line += f" · 지금 {_fmt_kpi(val, d['unit'])}" + (f" / 목표 {_fmt_kpi(tgt, d['unit'])}" if tgt else "")
+                    st.markdown(line)
+                smalls = [q for q in quests if q["kind"] == "small" and q.get("parent_id") == big["id"]]
+                if smalls:
+                    st.caption("  소 · " + " / ".join(f"{'✅' if q['status'] == 'done' else '⬜'} {q['owner']}: {q['title'][:28]}" for q in sorted(smalls, key=lambda q: str(q.get('due_date') or ''))))
 
 
 def _render_macro_board():
@@ -3750,8 +3803,8 @@ if _nav == "okr":
     # ══════════════════════════════════════════════════════════
     # 🎯 팀 OKR 현황 (읽기 전용 — 기존 OKR 자료 그대로, 편집 기능 없음)
     # ══════════════════════════════════════════════════════════
-    st.subheader("🎯 목표 — 매주 확인")
-    st.caption("OKR은 내 커리어를 쌓는 기록이에요. 시스템이 조금 불편해도, 할 수 있는 만큼만 매주 꾸준히 남겨주세요 — 대표님과 매주 이 화면으로 이야기해요.")
+    st.subheader("🎯 목표")
+    st.caption("내 목표가 어디까지 왔는지 한눈에 보는 화면이에요. 일주일에 한 번, 1분만 남겨도 충분해요. 숫자보다 '어디서 막혔는지'를 같이 보려고 만든 거라서, 막힌 건 편하게 적어주세요.")
     _render_quest_board(my_name)
     st.divider()
     _render_kpi_board(my_name)
