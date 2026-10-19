@@ -2679,7 +2679,7 @@ def _render_kpi_board(my_name):
         st.info("이번 달 페이스까지 남은 지표: " + " · ".join(b.replace(" 뒤처짐", "") for b in behind))
 
     with st.form("kpi_plan_form"):
-        st.caption("지난주 달성은 자동으로 채워져요. 이번주·다음주 목표만 적고 저장해요 (비워두면 0 = 계획 없음). 저장해야 반영돼요.")
+        st.caption("이번주·다음주 목표만 적고 저장하세요.")
         h0, h1, h2, h3 = st.columns([3, 1.2, 1.5, 1.5])
         h0.markdown("**지표**")
         h1.markdown("**지난주 달성**")
@@ -2694,7 +2694,7 @@ def _render_kpi_board(my_name):
             nxt_p = (plans or {}).get((my_name, k, (ws + timedelta(weeks=1)).isoformat()), {}).get("plan")
             inputs[k] = (c1.number_input("이번주 목표", min_value=0.0, step=1.0, value=float(cur_p or 0), key=f"kp_c_{k}", label_visibility="collapsed"),
                          c2.number_input("다음주 목표", min_value=0.0, step=1.0, value=float(nxt_p or 0), key=f"kp_n_{k}", label_visibility="collapsed"))
-        save_plan = st.form_submit_button("💾 계획 저장 (여기서 저장돼요)", type="primary", disabled=demo)
+        save_plan = st.form_submit_button("💾 저장", type="primary", disabled=demo)
     if save_plan and not demo:
         try:
             now = datetime.utcnow().isoformat() + "Z"
@@ -2713,16 +2713,15 @@ def _render_kpi_board(my_name):
 
     ev_keys = [k for k in keys if KPI_DEFS[k]["src"] in ("events", "snapshot")]
     if ev_keys:
-        with st.expander("➕ 기록 한 줄 추가 (자동으로 안 잡히는 지표)", expanded=False):
+        with st.expander("➕ 실적 등록", expanded=False):
             with st.form("kpi_event_form", clear_on_submit=True):
                 e1, e2, e3 = st.columns([2, 1, 1])
                 mk = e1.selectbox("지표", ev_keys, format_func=lambda x: f"{KPI_DEFS[x]['label']} ({KPI_DEFS[x]['unit']})")
                 ed = e2.date_input("날짜", value=today)
-                eq = e3.number_input("수량(또는 그 시점의 값)", min_value=0.0, step=1.0, value=1.0)
-                eb = st.text_input("브랜드/상대(선택)", placeholder="예: 닥터리앤장 / 담당 staff 이름")
-                en = st.text_input("메모·링크(선택)", placeholder="근거가 되는 링크나 한 줄 메모")
-                add = st.form_submit_button("➕ 기록 추가 (여기서 저장돼요)", disabled=demo)
-            st.caption("합계 지표는 '그 건의 수량'을, 팔로워·왕홍 수 같은 현재 수준 지표는 '그 시점의 값'을 적어요.")
+                eq = e3.number_input("수량", min_value=0.0, step=1.0, value=1.0, help="건수를 적어요. 팔로워·왕홍·위챗방 인원처럼 '지금 몇 명'인 지표는 지금 값을 적어요.")
+                eb = st.text_input("거래처 / 상대 (선택)", placeholder="예: 닥터리앤장")
+                en = st.text_input("메모 (선택)", placeholder="링크나 한 줄 메모")
+                add = st.form_submit_button("💾 저장", disabled=demo)
             if add and not demo:
                 try:
                     SUPA.table("kpi_events").insert({"person": my_name, "metric_key": mk, "event_date": ed.isoformat(), "qty": eq,
@@ -2731,7 +2730,7 @@ def _render_kpi_board(my_name):
                     st.error(f"저장하지 못했어요 ({type(e).__name__}: {e})")
                 else:
                     load_kpi_events.clear()
-                    _flash("기록을 추가했어요.")
+                    _flash("실적을 등록했어요.")
                     st.rerun()
 
 
@@ -2777,7 +2776,7 @@ def _render_kpi_admin():
             who = t1.selectbox("사람", people, key="kt_person")
             mk = t2.selectbox("지표", _kpi_keys(who) if who else [], format_func=lambda x: KPI_DEFS[x]["label"], key="kt_metric")
             val = t3.number_input("월 목표", min_value=0.0, step=1.0, key="kt_val")
-            go = st.form_submit_button("📌 지정 (여기서 저장돼요)", type="primary")
+            go = st.form_submit_button("💾 저장", type="primary")
         if go:
             if pw != pw_env:
                 st.error("비밀번호가 맞지 않아요.")
@@ -3073,7 +3072,7 @@ def _render_plan_chat(my_name):
         txt = st.text_area("어떤 거래처와, 어떤 캠페인에서, 무엇을 하기로 했는지 편하게 써주세요 (여러 개를 한꺼번에, 두서없이 써도 돼요)",
                            height=110, key="plan_chat_text",
                            placeholder="예) 닥터리앤장이랑 10월 캠페인에서 행사 하기로 함. 내일 OWM 대표님 통화. 다음주 수요일 가이드 3개 브랜드에 보냄")
-        go = st.form_submit_button("✨ 정리하기 (아직 저장되지 않아요)", type="primary")
+        go = st.form_submit_button("✨ 정리하기", type="primary")
     if go:
         if not txt.strip():
             st.error("한 줄이라도 적어주세요.")
@@ -3108,7 +3107,7 @@ def _render_plan_chat(my_name):
         if n_dup:
             st.caption("같은 계획을 말만 바꿔 또 쓰면 새 목표가 아니라 기존 목표 1개로 세어요. 몇 번 미뤘는지만 늘어나요.")
         b1, b2 = st.columns([1, 1])
-        if b1.button("💾 이대로 저장 (여기서 저장돼요)", type="primary", key="plan_save_btn"):
+        if b1.button("💾 저장", type="primary", key="plan_save_btn"):
             new_n, dup_n, serr = _plan_save(props, my_name)
             if serr:
                 st.error(f"저장하지 못했어요 ({serr})")
