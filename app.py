@@ -2619,17 +2619,32 @@ def _render_kpi_board(my_name):
         ctx, plans, targets = _demo_ctx(today), {}, {("가상인턴", "guide_selected"): 6, ("가상인턴", "recruited"): 10, ("가상인턴", "uploads"): 40}
         st.caption("⚠️ 가상 데이터예요. 저장되지 않아요.")
     m0 = today.replace(day=1)
+    pitems_all, _pe0 = load_plan_items()
     rows = []
     for k in keys:
         d = KPI_DEFS[k]
         last, cur, nxt = (_kpi_week_value(my_name, k, ws + timedelta(weeks=o), today, ctx) for o in (-1, 0, 1))
-        pl = lambda o: (plans or {}).get((my_name, k, (ws + timedelta(weeks=o)).isoformat()), {}).get("plan")
+        pl = lambda o: ((plans or {}).get((my_name, k, (ws + timedelta(weeks=o)).isoformat()), {}).get("plan")
+                        or (_chat_plan_count(my_name, k, ws + timedelta(weeks=o), pitems_all) or None))  # 직접 적은 계획이 없으면 채팅 계획 수
         month = _kpi_sum(my_name, k, m0, today, ctx) if d["kind"] == "sum" else _kpi_level(my_name, k, today, ctx)
         tgt = (targets or {}).get((my_name, k))
         rows.append({"지표": d["label"], "지난주": _fmt_kpi(last, d["unit"]), "이번주 계획 → 실제": f"{_fmt_kpi(pl(0), d['unit'])} → {_fmt_kpi(cur, d['unit'])}",
                      "다음주 계획": _fmt_kpi(pl(1), d["unit"]), "이번 달·현재": _fmt_kpi(month, d["unit"]),
                      "월 목표": _fmt_kpi(tgt, d["unit"]) if tgt else "미설정",
                      "달성": (month / tgt) if (tgt and month is not None) else None})
+    # 직원이 '써내려가는 지표'(AI가 이름 붙인 것): 클리어/예정 수를 같은 표에 보여준다
+    custom = {}
+    for p in pitems_all or []:
+        if p["person"] == my_name and not p.get("metric_key") and p.get("custom_label") and p["status"] in ("open", "done"):
+            custom.setdefault(p["custom_label"], []).append(p)
+    for label, ps in custom.items():
+        def _cnt(pred):
+            return sum(float(p.get("qty") or 1) for p in ps if pred(p))
+        in_w = lambda w: (lambda p: (d := _to_date(p.get("due_date"))) is not None and w <= d <= w + timedelta(days=6))
+        rows.append({"지표": f"✍️ {label}", "지난주": f"{_cnt(lambda p: p['status'] == 'done' and in_w(ws - timedelta(weeks=1))(p)):g}건",
+                     "이번주 계획 → 실제": f"{_cnt(in_w(ws)):g}건 예정 → {_cnt(lambda p: p['status'] == 'done' and in_w(ws)(p)):g}건",
+                     "다음주 계획": f"{_cnt(in_w(ws + timedelta(weeks=1))):g}건", "이번 달·현재": f"{_cnt(lambda p: p['status'] == 'done' and (d := _to_date(p.get('done_at'))) is not None and d >= m0):g}건",
+                     "월 목표": "미설정", "달성": None})
     df = pd.DataFrame(rows)
     st.dataframe(df, hide_index=True, use_container_width=True,
                  column_config={"달성": st.column_config.ProgressColumn("달성", min_value=0.0, max_value=1.0, format="percent")})
@@ -2820,13 +2835,295 @@ def _scorecard(person, ctx, targets, today):
     new_pool = int(_kpi_sum(person, "pool_new", m0, today, ctx))
     guides = int(sum(float(e.get("qty") or 0) for e in ev_m if e.get("metric_key") == "guide_selected"))
     new_metrics = len({e.get("metric_key") for e in ev_m})
+    pitems, _perr = load_plan_items()
+    pm = [p for p in (pitems or []) if p["person"] == person and (d := _to_date(p.get("created_at"))) and d >= m0]
+    plan_total = len(pm)
+    plan_done = sum(1 for p in (pitems or []) if p["person"] == person and p["status"] == "done" and (d := _to_date(p.get("done_at"))) and d >= m0)
     return {
+        "plan_total": plan_total, "plan_done": plan_done,
         "kpi_n": len(keys), "with_target": with_target, "cleared": cleared,
         "rate": (sum(rates) / len(rates)) if rates else None,
         "collab": n_comments + helped + asked, "collab_parts": (n_comments, helped, asked),
         "outside": len(outside) + new_pool + new_accs, "outside_parts": (len(outside), new_pool, new_accs),
         "innov": guides + new_camps + new_metrics, "innov_parts": (guides, new_camps, new_metrics),
     }
+
+
+# ── 채팅처럼 쓰는 계획: 두서없이 쓰면 AI(없으면 기본 분석)가 거래처·캠페인·종류·날짜로 정리하고 핵심 지표에 연결, 같은 계획은 1개로 묶는다 ──
+PLAN_ACTIONS = {  # 키워드 → 종류, 연결할 지표 후보(그 사람이 가진 지표일 때만 연결)
+    "통화": ("통화", "persuasion"), "전화": ("통화", "persuasion"), "미팅": ("미팅", "persuasion"), "만나": ("미팅", "persuasion"),
+    "방문": ("미팅", "persuasion"), "제안": ("제안", "persuasion"), "견적": ("제안", "persuasion"), "설득": ("제안", "persuasion"),
+    "행사": ("행사", "planexpo"), "기획전": ("행사", "planexpo"), "계약": ("계약", None), "가이드": ("가이드", "guide_selected"),
+    "모집": ("모집", "recruited"), "섭외": ("모집", "recruited"), "서칭": ("서칭", "searched"), "왕홍": ("왕홍", None), "위챗": ("위챗", None),
+    "발송": ("발송", None), "공지": ("공지", None),
+}
+
+
+@st.cache_data(ttl=20)
+def load_plan_items():
+    try:
+        return SUPA.table("plan_items").select("*").neq("status", "dropped").order("created_at", desc=True).limit(2000).execute().data, None
+    except Exception as e:
+        return None, f"{type(e).__name__}: {e}"
+
+
+def _plan_norm(text):
+    """말만 바꾼 같은 계획을 알아보려고: 조사·공백·기호를 지운 글자만."""
+    t = unicodedata.normalize("NFKC", str(text or "")).lower()
+    t = re.sub(r"(하기로|하겠다|할게요|할 예정|예정|진행|하려고|해야|했다|합니다|할거야|할 거야|하자|하기|하고|으로|에서|이랑|랑|와|과|을|를|은|는|이|가|의|에|도)", "", t)
+    return re.sub(r"[^0-9a-z가-힣]", "", t)
+
+
+def _plan_sim(a, b):
+    """두 계획 문장의 글자 2개 단위 겹침(0~1)."""
+    x, y = _plan_norm(a), _plan_norm(b)
+    if not x or not y:
+        return 0.0
+    gx = {x[i:i + 2] for i in range(max(len(x) - 1, 1))}
+    gy = {y[i:i + 2] for i in range(max(len(y) - 1, 1))}
+    return len(gx & gy) / len(gx | gy)
+
+
+def _plan_date(text, today):
+    """'내일·다음주·10/25·10월 25일·금요일' 같은 말에서 날짜를 뽑는다. 못 찾으면 None."""
+    t = str(text or "")
+    if "모레" in t:
+        return today + timedelta(days=2)
+    if "내일" in t:
+        return today + timedelta(days=1)
+    if "오늘" in t:
+        return today
+    wk = _week_start(today)
+    days = "월화수목금토일"
+    m = re.search(r"(다음\s*주|이번\s*주)?\s*([월화수목금토일])요일", t)
+    if m:
+        base = wk + timedelta(weeks=1) if (m.group(1) and "다음" in m.group(1)) else wk
+        return base + timedelta(days=days.index(m.group(2)))
+    if re.search(r"다음\s*주", t):
+        return wk + timedelta(weeks=1, days=4)
+    if re.search(r"이번\s*주|금주", t):
+        return wk + timedelta(days=4)
+    m = re.search(r"(\d{1,2})\s*월\s*(\d{1,2})\s*일", t) or re.search(r"(?<!\d)(\d{1,2})\s*/\s*(\d{1,2})(?!\d)", t)
+    if m:
+        try:
+            d = date(today.year, int(m.group(1)), int(m.group(2)))
+            return d if d >= today - timedelta(days=60) else date(today.year + 1, d.month, d.day)
+        except ValueError:
+            return None
+    return None
+
+
+def _plan_known(camps):
+    brands = sorted({c["brand"] for c in camps if c.get("brand") and c["brand"] != "?"}, key=len, reverse=True)
+    return brands, camps
+
+
+def _plan_pick_metric(action, person):
+    keys = set(_kpi_keys(person))
+    cand = next((v[1] for k, v in PLAN_ACTIONS.items() if v[0] == action), None)
+    return cand if cand in keys else None
+
+
+def _plan_parse_basic(text, person, camps, today):
+    """AI 없이 쓰는 기본 분석: 문장을 나누고, 아는 브랜드·캠페인 이름·키워드·날짜를 찾는다."""
+    brands, _c = _plan_known(camps)
+    out = []
+    for raw in re.split(r"[\n。;]|(?<=[다요음임])\s*[.]\s*|(?<=\S)\s*[·•]\s*", text):
+        clause = raw.strip(" -•\t")
+        if len(clause) < 3:
+            continue
+        nk = _plan_norm(clause)
+        brand = next((b for b in brands if _plan_norm(b) and _plan_norm(b) in nk), None)
+        camp = next((c["campaign"] for c in camps if c.get("campaign") and _plan_norm(c["campaign"]) and _plan_norm(c["campaign"]) in nk), None)
+        action = next((v[0] for k, v in PLAN_ACTIONS.items() if k in clause), "기타")
+        out.append({"title": clause[:80], "counterparty": brand, "campaign": camp, "action_type": action, "due_date": _plan_date(clause, today),
+                    "metric_key": _plan_pick_metric(action, person), "custom_label": None, "qty": 1})
+        if not out[-1]["metric_key"]:
+            out[-1]["custom_label"] = f"{action} 계획"  # 맞는 핵심 지표가 없으면 '내가 쓴 지표'로 센다
+    return out
+
+
+def _plan_parse_ai(text, person, camps, today):
+    """Claude가 두서없는 글을 계획 목록으로 정리. 반환: (목록 또는 None, 오류문구)."""
+    api_key = os.environ.get("ANTHROPIC_API_KEY")
+    if not api_key:
+        return None, "ANTHROPIC_API_KEY 없음"
+    brands, _c = _plan_known(camps)
+    metrics = "\n".join(f"- {k}: {KPI_DEFS[k]['label']} ({KPI_DEFS[k]['help']})" for k in _kpi_keys(person) if KPI_DEFS[k]["src"] in ("events", "snapshot") or k in ("uploads",))
+    camp_txt = "\n".join(f"- {c['brand']} / {c['campaign']}" for c in camps[:60])
+    system = (
+        "너는 직원이 채팅처럼 두서없이 쓴 업무 계획을 정리하는 보조원이다. 글에는 여러 계획이 섞여 있을 수 있다(예: '닥터리앤장이랑 10월 캠페인에서 행사하기로 했고 내일 OWM 통화'). "
+        "각 계획을 따로 뽑아 아래 JSON 배열로만 답해라. 다른 글은 절대 쓰지 마라.\n"
+        "[{\"title\":\"한 줄 요약(30자 이내)\", \"counterparty\":\"거래처/브랜드 또는 null\", \"campaign\":\"캠페인 이름 또는 null\", "
+        "\"action_type\":\"통화|미팅|제안|행사|계약|가이드|모집|서칭|기타\", \"due_date\":\"YYYY-MM-DD 또는 null\", "
+        "\"metric_key\":\"아래 핵심 지표 키 중 맞는 것 또는 null\", \"custom_label\":\"metric_key가 null일 때 이 계획을 세는 지표 이름(10자 이내, 예: 거래처 통화) 또는 null\", \"qty\":숫자}]\n"
+        f"오늘은 {today.isoformat()}({'월화수목금토일'[today.weekday()]}요일). '다음주', '내일' 같은 말은 날짜로 바꿔라. 날짜가 없으면 null.\n"
+        "거래처·캠페인 이름은 아래 목록과 같은 것이면 목록의 이름 그대로 써라(오타·줄임말 보정). 목록에 없으면 글에 쓴 그대로.\n"
+        f"아는 브랜드: {', '.join(brands[:60]) or '(없음)'}\n아는 캠페인:\n{camp_txt or '(없음)'}\n"
+        f"이 사람의 핵심 지표 키:\n{metrics or '(없음)'}\n"
+        "확실히 맞는 지표가 없으면 metric_key는 null로 두고 custom_label을 정해라. 숫자가 없으면 qty는 1."
+    )
+    try:
+        res = requests.post(
+            "https://api.anthropic.com/v1/messages",
+            headers={"x-api-key": api_key, "anthropic-version": "2023-06-01", "content-type": "application/json"},
+            json={"model": "claude-sonnet-5", "max_tokens": 1500, "system": system, "messages": [{"role": "user", "content": text}]},
+            timeout=40,
+        )
+        if res.status_code >= 300:
+            return None, _api_error_text(res.status_code, res.text)
+        data = res.json()
+        txt = "".join(b.get("text", "") for b in data.get("content", []) if b.get("type") == "text").strip()
+        if txt.startswith("```"):
+            txt = txt.strip("`")
+            txt = txt[4:] if txt.startswith("json") else txt
+        arr = json.loads(txt)
+    except Exception as e:
+        return None, f"{type(e).__name__}: {e}"
+    keys = set(_kpi_keys(person))
+    out = []
+    for it in arr if isinstance(arr, list) else []:
+        if not isinstance(it, dict) or not str(it.get("title") or "").strip():
+            continue
+        mk = it.get("metric_key") if it.get("metric_key") in keys else None
+        try:
+            qty = float(it.get("qty") or 1)
+        except (TypeError, ValueError):
+            qty = 1.0
+        out.append({"title": str(it["title"]).strip()[:80], "counterparty": (it.get("counterparty") or None), "campaign": (it.get("campaign") or None),
+                    "action_type": it.get("action_type") or "기타", "due_date": _to_date(it.get("due_date")), "metric_key": mk,
+                    "custom_label": None if mk else (str(it.get("custom_label") or "").strip()[:12] or None), "qty": max(qty, 0.0) or 1.0})
+    return out, None
+
+
+def _plan_dedup(items, existing_open):
+    """같은 계획인지 판단: (거래처+종류가 같고 캠페인이 같거나 한쪽이 비었음) 이거나 문장이 많이 비슷하면 중복.
+    이미 있는 '안 끝난' 계획이나 같이 쓴 앞 문장과만 비교한다(끝낸 일을 또 하는 건 새 계획)."""
+    pool = [dict(e, _src="db") for e in existing_open]
+    res = []
+    for it in items:
+        hit, why = None, None
+        for e in pool:
+            same_party = it.get("counterparty") and e.get("counterparty") and _plan_norm(it["counterparty"]) == _plan_norm(e["counterparty"])
+            same_act = (it.get("action_type") or "기타") == (e.get("action_type") or "기타")
+            camp_ok = (not it.get("campaign") or not e.get("campaign")) or _plan_norm(it["campaign"]) == _plan_norm(e["campaign"])
+            sim = _plan_sim(it["title"], e["title"])
+            if (same_party and same_act and camp_ok and it.get("action_type") != "기타") or sim >= 0.6:
+                hit, why = e, ("같은 거래처·같은 종류" if same_party and same_act else f"문장이 {int(sim * 100)}% 비슷")
+                break
+        res.append({"item": it, "dup": hit, "why": why})
+        if not hit:
+            pool.append(dict(it, id=None, _src="batch"))
+    return res
+
+
+def _plan_save(proposals, my_name):
+    """제안된 계획을 저장: 새 계획은 추가, 중복은 기존 계획의 '적은 횟수'와 말투 기록만 늘린다. 반환: (새 건수, 중복 건수, 에러)"""
+    new_n, dup_n = 0, 0
+    try:
+        for p in proposals:
+            it, dup = p["item"], p["dup"]
+            raw = it.get("_raw") or it["title"]
+            if dup and dup.get("id"):
+                SUPA.table("plan_items").update({"repeat_count": int(dup.get("repeat_count") or 1) + 1,
+                                                 "raw_texts": list(dup.get("raw_texts") or []) + [raw]}).eq("id", dup["id"]).execute()
+                dup_n += 1
+            elif dup:  # 같은 입력 안에서 먼저 나온 계획과 중복 → 저장 생략(앞 것에 합쳐짐)
+                dup_n += 1
+            else:
+                SUPA.table("plan_items").insert({
+                    "person": my_name, "title": it["title"], "counterparty": it.get("counterparty"), "campaign": it.get("campaign"),
+                    "action_type": it.get("action_type"), "metric_key": it.get("metric_key"), "custom_label": it.get("custom_label"),
+                    "qty": it.get("qty") or 1, "due_date": it["due_date"].isoformat() if it.get("due_date") else None, "raw_texts": [raw]}).execute()
+                new_n += 1
+    except Exception as e:
+        return new_n, dup_n, f"{type(e).__name__}: {e}"
+    load_plan_items.clear()
+    return new_n, dup_n, None
+
+
+def _plan_clear(item, my_name):
+    """계획 클리어: 완료 처리 + 연결된 지표가 있으면 기록(kpi_events)을 자동으로 한 줄 남긴다."""
+    now = datetime.utcnow().isoformat() + "Z"
+    SUPA.table("plan_items").update({"status": "done", "done_at": now}).eq("id", item["id"]).execute()
+    if item.get("metric_key"):
+        SUPA.table("kpi_events").insert({"person": my_name, "metric_key": item["metric_key"], "event_date": _today_kst().isoformat(),
+                                         "qty": float(item.get("qty") or 1), "brand_name": item.get("counterparty"),
+                                         "note": item["title"], "created_by": my_name}).execute()
+        load_kpi_events.clear()
+    load_plan_items.clear()
+
+
+def _render_plan_chat(my_name):
+    """💬 계획 쓰기: 두서없이 쓰면 정리해서 보여주고(저장 전), 확인하면 저장 + 핵심 지표에 반영."""
+    st.markdown("### 💬 계획 쓰기")
+    items, err = load_plan_items()
+    if err:
+        st.info("계획 칸이 DB에 아직 없어요(`migrations/20261020_plan_items.sql`).")
+        return
+    camps, _cerr = load_match_campaigns()
+    camps = camps or []
+    with st.form("plan_chat_form"):
+        txt = st.text_area("어떤 거래처와, 어떤 캠페인에서, 무엇을 하기로 했는지 편하게 써주세요 (여러 개를 한꺼번에, 두서없이 써도 돼요)",
+                           height=110, key="plan_chat_text",
+                           placeholder="예) 닥터리앤장이랑 10월 캠페인에서 행사 하기로 함. 내일 OWM 대표님 통화. 다음주 수요일 가이드 3개 브랜드에 보냄")
+        go = st.form_submit_button("✨ 정리하기 (아직 저장되지 않아요)", type="primary")
+    if go:
+        if not txt.strip():
+            st.error("한 줄이라도 적어주세요.")
+        else:
+            today = _today_kst()
+            parsed, aerr = _plan_parse_ai(txt, my_name, camps, today)
+            note = None
+            if parsed is None:
+                parsed = _plan_parse_basic(txt, my_name, camps, today)
+                note = ("AI가 지금 쉬고 있어서 기본 분석으로 정리했어요 — 거래처·날짜가 비면 아래에서 확인해 주세요." if aerr else None)
+                if aerr and "크레딧" in aerr:
+                    note += " (원인: Anthropic API 크레딧 부족)"
+            for it in parsed:
+                it["_raw"] = txt.strip()[:300]
+            mine_open = [p for p in (items or []) if p["person"] == my_name and p["status"] == "open"]
+            st.session_state["plan_props"] = _plan_dedup(parsed, mine_open)
+            st.session_state["plan_note"] = note
+    props = st.session_state.get("plan_props")
+    if props:
+        if st.session_state.get("plan_note"):
+            st.caption("ℹ️ " + st.session_state["plan_note"])
+        st.markdown("**이렇게 정리했어요 — 맞으면 저장을 눌러요**")
+        rows = []
+        for p in props:
+            it = p["item"]
+            rows.append({"계획": it["title"], "거래처": it.get("counterparty") or "-", "캠페인": it.get("campaign") or "-", "종류": it.get("action_type"),
+                         "날짜": it["due_date"].strftime("%m/%d") if it.get("due_date") else "-",
+                         "핵심 지표": KPI_DEFS[it["metric_key"]]["label"] if it.get("metric_key") else (f"✍️ {it['custom_label']}" if it.get("custom_label") else "(기록만)"),
+                         "상태": f"⚠️ 중복이슈 — {p['why']}, 기존 계획에 합쳐요" if p["dup"] else "🆕 새 계획"})
+        st.dataframe(pd.DataFrame(rows), hide_index=True, use_container_width=True)
+        n_dup = sum(1 for p in props if p["dup"])
+        if n_dup:
+            st.caption("같은 계획을 말만 바꿔 또 쓰면 새 목표가 아니라 기존 목표 1개로 세어요. 몇 번 미뤘는지만 늘어나요.")
+        b1, b2 = st.columns([1, 1])
+        if b1.button("💾 이대로 저장 (여기서 저장돼요)", type="primary", key="plan_save_btn"):
+            new_n, dup_n, serr = _plan_save(props, my_name)
+            if serr:
+                st.error(f"저장하지 못했어요 ({serr})")
+            else:
+                st.session_state.pop("plan_props", None)
+                st.session_state.pop("plan_note", None)
+                _flash(f"새 계획 {new_n}개를 저장했어요." + (f" (중복 {dup_n}개는 기존 계획에 합쳤어요)" if dup_n else ""))
+                st.rerun()
+        if b2.button("다시 쓰기", key="plan_reset_btn"):
+            st.session_state.pop("plan_props", None)
+            st.rerun()
+
+
+def _chat_plan_count(person, key, w, items):
+    """채팅으로 쓴 계획 중 이 지표에 연결되고 w주(월요일 시작)에 날짜가 있는 것의 수(끝낸 것 포함)."""
+    n = 0
+    for p in items or []:
+        d = _to_date(p.get("due_date"))
+        if p["person"] == person and p.get("metric_key") == key and d and w <= d <= w + timedelta(days=6) and p["status"] in ("open", "done"):
+            n += float(p.get("qty") or 1)
+    return n
 
 
 def _cheer(sc, n_open, n_clear):
@@ -2855,7 +3152,8 @@ def _render_quest_board(my_name):
     mine = [q for q in (quests or []) if q["kind"] == "small" and q["owner"] == my_name]
     opens = sorted([q for q in mine if q["status"] == "open"], key=lambda q: str(q.get("due_date") or "9999"))
     clear_n = sum(1 for q in mine if q["status"] == "done")
-    c1, c2, c3, c4, c5 = st.columns(5)
+    c1, c2, c3, c4, c5, c6 = st.columns(6)
+    c6.metric("계획 클리어", f"{sc['plan_done']}/{sc['plan_total']}건" if sc["plan_total"] else "-", delta="이번 달 쓴 계획 중", delta_color="off")
     c1.metric("내 KPI", f"{sc['kpi_n']}개", delta=f"{sc['cleared']}개 클리어" if sc["with_target"] else "목표 대기", delta_color="off")
     c2.metric("이번 달 달성률", "-" if sc["rate"] is None else f"{sc['rate'] * 100:.0f}%")
     c3.metric("협력지수", f"{sc['collab']}건", delta="최근 30일", delta_color="off")
@@ -2872,8 +3170,11 @@ def _render_quest_board(my_name):
             f"- **달성률**: 월 목표가 있는 KPI의 달성 정도(100%까지)를 평균 낸 값이에요. 목표가 있는 KPI {sc['with_target']}개 기준.\n"
             f"- **협력지수**: 최근 30일 동안 댓글 {cm}건 + 도와서 끝낸 요청 {hp}건 + 동료에게 보낸 요청 {ak}건.\n"
             f"- **외부 협력**: 이번 달 새로 만난 외부 상대 — 기록에 남긴 브랜드/상대 {ol}곳 + 새로 쓴 인플루언서 {npool}명 + 새 영업 브랜드 {nacc}곳.\n"
+            f"- **계획 클리어**: 이번 달 '계획 쓰기'로 적은 계획 {sc['plan_total']}개 중 클리어한 개수(같은 계획을 말만 바꿔 또 써도 1개로 세요).\n"
             f"- **혁신 요소**: 이번 달 새로 만든 것 — 브랜드가 선정한 가이드 {gd}개 + 새 캠페인 {ncamp}개 + 이번 달 처음 기록한 지표 {nmet}종류.\n"
             "- 입력하는 게 아니라 이미 남긴 기록에서 자동으로 세요. 많이 남길수록 정확해져요.")
+
+    _render_plan_chat(my_name)
 
     # 이번 주 퀘스트(자동): 데이터가 알아서 만든다
     auto = []
@@ -2897,6 +3198,30 @@ def _render_quest_board(my_name):
         st.info("퀘스트 칸이 DB에 아직 없어요(`migrations/20261019_quests_and_targets.sql`).")
     for a in auto[:4]:
         st.markdown(f"- 🎯 {a}")
+    pitems, _pe = load_plan_items()
+    my_plans = sorted([p for p in (pitems or []) if p["person"] == my_name and p["status"] == "open"], key=lambda p: str(p.get("due_date") or "9999"))
+    if my_plans:
+        st.caption("💬 내가 쓴 계획 — 끝내면 `클리어!`(연결된 핵심 지표에 자동으로 한 줄 기록돼요), 안 하기로 했으면 `접기`.")
+        for p in my_plans[:10]:
+            d = _to_date(p.get("due_date"))
+            bits = [x for x in (p.get("counterparty"), p.get("campaign")) if x]
+            tag = (f" · {' / '.join(bits)}" if bits else "") + (f" · {d.strftime('%m/%d')}" if d else "")
+            if int(p.get("repeat_count") or 1) > 1:
+                tag += f" · 🔁 {int(p['repeat_count'])}번째 적었어요 — 막힌 점이 있으면 메모로 남겨요"
+            pc1, pc2, pc3 = st.columns([6, 1, 1])
+            pc1.markdown(f"💬 {p['title']}{tag}")
+            if pc2.button("클리어!", key=f"plan_done_{p['id']}"):
+                try:
+                    _plan_clear(p, my_name)
+                except Exception as e:
+                    st.error(f"저장하지 못했어요 ({type(e).__name__}: {e})")
+                else:
+                    _flash("클리어! 한 칸 전진했어요 🙌" + (f" ('{KPI_DEFS[p['metric_key']]['label']}'에 기록됐어요)" if p.get("metric_key") else ""))
+                    st.rerun()
+            if pc3.button("접기", key=f"plan_drop_{p['id']}"):
+                SUPA.table("plan_items").update({"status": "dropped"}).eq("id", p["id"]).execute()
+                load_plan_items.clear()
+                st.rerun()
     if opens:
         st.caption("끝내면 `클리어!`를 눌러요.")
         for q in opens[:8]:
