@@ -1644,7 +1644,7 @@ _LINK_END = r"\s<>\"'，。、）)】」"
 _URL_RX = re.compile(r"https?://[^" + _LINK_END + r"]+", re.I)
 _BARE_RX = re.compile(r"(?<![\w@.])((?:[a-z0-9-]+\.)+[a-z]{2,}/[^" + _LINK_END + r"]*)", re.I)
 _QUERY_FREE_HOSTS = ("instagram.com", "tiktok.com", "xiaohongshu.com", "xhslink.com", "douyin.com", "youtu.be")
-_TRACK_PARAMS = ("utm_", "fbclid", "igshid", "igsh", "si", "share_id", "xsec_", "app_platform", "share_from")
+_TRACK_PARAMS = ("utm_", "fbclid", "igshid", "igsh", "si", "share_id", "xsec_", "app_platform", "share_from", "usp", "resourcekey")
 
 
 def _extract_link(text):
@@ -2757,6 +2757,10 @@ def _render_kpi_team():
         st.caption("표시할 지표가 없어요.")
         return
     st.dataframe(pd.DataFrame(rows), hide_index=True, use_container_width=True)
+    _rr2, _rerr2 = load_recruit_reports()
+    if _rr2 is not None:
+        sent = {r["person"] for r in _rr2 if str(r["week_start"])[:10] == ws.isoformat()}
+        st.caption("📎 이번 주 모집 보고 링크: " + " · ".join(f"{p} {'✅' if p in sent else '⬜'}" for p in RECRUIT_TEAM))
     miss = sorted({r["이름"] for r in rows if r["이번주 계획"] != "✅"})
     if miss:
         st.caption("이번 주 계획을 아직 안 적은 사람: " + ", ".join(miss))
@@ -3201,6 +3205,10 @@ def _render_quest_board(my_name):
     st.markdown("### 🎮 이번 주 퀘스트")
     if qerr:
         st.info("퀘스트 칸이 DB에 아직 없어요(`migrations/20261019_quests_and_targets.sql`).")
+    if my_name in RECRUIT_TEAM:
+        _rr, _rerr = load_recruit_reports()
+        if _rr is not None and not any(r["person"] == my_name and str(r["week_start"])[:10] == ws.isoformat() for r in _rr):
+            auto.insert(0, "이번 주 모집 보고 링크 올리기 — 구글드라이브 링크 한 줄이면 돼요 (아래 '모집 보고 링크')")
     for a in auto[:4]:
         st.markdown(f"- 🎯 {a}")
     pitems, _pe = load_plan_items()
@@ -3268,6 +3276,126 @@ def _render_quest_board(my_name):
                 smalls = [q for q in quests if q["kind"] == "small" and q.get("parent_id") == big["id"]]
                 if smalls:
                     st.caption("  소 · " + " / ".join(f"{'✅' if q['status'] == 'done' else '⬜'} {q['owner']}: {q['title'][:28]}" for q in sorted(smalls, key=lambda q: str(q.get('due_date') or ''))))
+
+
+# ── 모집 파트(유원리·이단우·Sanubari·Meyna) 보고 링크: 구글드라이브 링크를 지속적으로 올리고, 대표가 한 번에 모아 본다 ──
+RECRUIT_TEAM = ["유원리", "이단우", "Sanubari", "Meyna"]
+RECRUIT_KINDS = ["인플루언서 후보 리스트", "왕홍 명단", "전문가(약사) 후보", "자체채널 현황", "기타"]
+_DRIVE_HOSTS = ("drive.google.com", "docs.google.com", "sheets.google.com", "slides.google.com", "forms.gle", "forms.google.com")
+
+
+@st.cache_data(ttl=30)
+def load_recruit_reports():
+    try:
+        return SUPA.table("recruit_reports").select("*").order("report_date", desc=True).limit(3000).execute().data, None
+    except Exception as e:
+        return None, f"{type(e).__name__}: {e}"
+
+
+def _drive_links_in(text):
+    """글에서 링크를 모두 뽑아 (구글드라이브 링크들, 구글이 아닌 링크들)로 나눈다."""
+    from urllib.parse import urlsplit
+    found = list(dict.fromkeys(m.group(0).rstrip(".,;") for m in _URL_RX.finditer(str(text or ""))))
+    if not found:
+        b = _extract_link(text)
+        found = [b] if b else []
+    ok, bad = [], []
+    for u in found:
+        host = (urlsplit(u).hostname or "").lower()
+        (ok if host.endswith(_DRIVE_HOSTS) else bad).append(u)
+    return ok, bad
+
+
+def _render_recruit_report(my_name):
+    """📎 모집 보고: 구글드라이브 링크를 올린다(여러 개 가능). 이번 주에 올렸는지 확인하고, 내가 올린 목록을 보여준다."""
+    st.markdown("### 📎 모집 보고 링크")
+    rows, err = load_recruit_reports()
+    if err:
+        st.info("보고 링크 칸이 DB에 아직 없어요(`migrations/20261020_recruit_reports.sql`).")
+        return
+    today = _today_kst()
+    ws = _week_start(today)
+    mine = [r for r in rows if r["person"] == my_name]
+    this_week = [r for r in mine if str(r["week_start"])[:10] == ws.isoformat()]
+    st.caption(("✅ 이번 주 보고를 올렸어요 (" + f"{len(this_week)}건)") if this_week
+               else "이번 주 보고 링크가 아직 없어요. 구글드라이브 링크(리스트·시트·문서)를 올려주세요.")
+    with st.form("recruit_report_form", clear_on_submit=True):
+        links = st.text_area("구글드라이브 링크", height=80, placeholder="여러 개면 줄을 바꿔서 붙여넣어요")
+        c1, c2 = st.columns([1, 2])
+        kind = c1.selectbox("종류", RECRUIT_KINDS)
+        title = c2.text_input("제목 (선택)", placeholder="예: 10월 4주차 후보 리스트")
+        go = st.form_submit_button("💾 저장", type="primary")
+    if go:
+        ok, bad = _drive_links_in(links)
+        if not links.strip():
+            st.error("링크를 붙여넣어주세요.")
+        elif bad and not ok:
+            st.error("구글드라이브 링크만 올릴 수 있어요(drive.google.com / docs.google.com …). 다른 주소는 드라이브에 올린 뒤 그 링크를 붙여넣어주세요.")
+        elif not ok:
+            st.error("링크를 찾지 못했어요.")
+        else:
+            saved, dup = 0, 0
+            try:
+                have = {(r["person"], _norm_link(r["link"]), str(r["week_start"])[:10]) for r in rows}
+                for u in ok:
+                    if (my_name, _norm_link(u), ws.isoformat()) in have:
+                        dup += 1
+                        continue
+                    SUPA.table("recruit_reports").insert({"person": my_name, "link": u, "title": title.strip() or None, "kind": kind,
+                                                          "report_date": today.isoformat(), "week_start": ws.isoformat()}).execute()
+                    saved += 1
+            except Exception as e:
+                st.error(f"저장하지 못했어요 ({type(e).__name__}: {e})")
+            else:
+                load_recruit_reports.clear()
+                msg = f"보고 링크 {saved}건을 저장했어요."
+                if dup:
+                    msg += f" (이번 주에 이미 올린 링크 {dup}건은 건너뛰었어요)"
+                if bad:
+                    msg += f" 구글이 아닌 링크 {len(bad)}건은 제외했어요."
+                _flash(msg)
+                st.rerun()
+    if mine:
+        with st.expander(f"내가 올린 보고 {len(mine)}건", expanded=False):
+            st.dataframe(pd.DataFrame([{"날짜": str(r["report_date"])[:10], "종류": r.get("kind"), "제목": r.get("title"), "링크": r["link"]} for r in mine[:30]]),
+                         hide_index=True, use_container_width=True, column_config={"링크": st.column_config.LinkColumn("링크")})
+
+
+def _render_recruit_admin():
+    """대표 전용(비밀번호): 모집 파트 보고 링크를 사람별·주별로 한 번에 보고 CSV로 받는다. 같은 DB 테이블(recruit_reports)이라 대표용 앱에서도 읽을 수 있다."""
+    with st.expander("🔒 대표 전용 — 모집 보고 한눈에", expanded=False):
+        pw_env = os.environ.get("FINANCE_PASSWORD")
+        if not pw_env:
+            st.caption("FINANCE_PASSWORD 환경변수가 이 서비스에 없어서 쓸 수 없어요(Railway Variables에 추가).")
+            return
+        with st.form("recruit_admin_form"):
+            pw = st.text_input("비밀번호", type="password")
+            ok = st.form_submit_button("열기")
+        if not ok and not st.session_state.get("_recruit_admin_ok"):
+            return
+        if ok:
+            st.session_state["_recruit_admin_ok"] = (pw == pw_env)
+            if pw != pw_env:
+                st.error("비밀번호가 맞지 않아요.")
+        if not st.session_state.get("_recruit_admin_ok"):
+            return
+        rows, err = load_recruit_reports()
+        if err:
+            st.error(f"불러오지 못했어요 ({err})")
+            return
+        ws = _week_start(_today_kst())
+        sent = {r["person"] for r in rows if str(r["week_start"])[:10] == ws.isoformat()}
+        st.markdown("**이번 주 제출 현황** — " + " · ".join(f"{p} {'✅' if p in sent else '❌'}" for p in RECRUIT_TEAM))
+        if not rows:
+            st.caption("아직 올라온 보고가 없어요.")
+            return
+        df = pd.DataFrame([{"주(월)": str(r["week_start"])[:10], "날짜": str(r["report_date"])[:10], "이름": r["person"], "종류": r.get("kind"),
+                            "제목": r.get("title"), "링크": r["link"]} for r in rows])
+        who = st.multiselect("사람 고르기(비우면 전체)", RECRUIT_TEAM, key="recruit_admin_who")
+        if who:
+            df = df[df["이름"].isin(who)]
+        st.dataframe(df, hide_index=True, use_container_width=True, column_config={"링크": st.column_config.LinkColumn("링크")})
+        st.download_button("📥 CSV로 받기", df.to_csv(index=False).encode("utf-8-sig"), file_name="모집보고_링크.csv", mime="text/csv", key="recruit_admin_csv")
 
 
 def _render_macro_board():
@@ -4136,6 +4264,9 @@ if _nav == "okr":
     st.subheader("🎯 목표")
     st.caption("내 목표가 어디까지 왔는지 한눈에 보는 화면이에요. 일주일에 한 번, 1분만 남겨도 충분해요. 숫자보다 '어디서 막혔는지'를 같이 보려고 만든 거라서, 막힌 건 편하게 적어주세요.")
     _render_quest_board(my_name)
+    if my_name in RECRUIT_TEAM or my_name == _KPI_TEST_USER:
+        st.divider()
+        _render_recruit_report(my_name)
     st.divider()
     _render_kpi_board(my_name)
     st.divider()
@@ -4143,6 +4274,7 @@ if _nav == "okr":
     st.divider()
     _render_macro_board()
     _render_kpi_admin()
+    _render_recruit_admin()
     st.divider()
 
     with st.expander("📚 전체 OKR 상세 보기 (내 OKR이 먼저 보여요)", expanded=False):
