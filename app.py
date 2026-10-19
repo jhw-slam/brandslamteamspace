@@ -15,7 +15,10 @@ import requests
 import streamlit as st
 from supabase import create_client
 
+import i18n
+
 st.set_page_config(page_title="업무보고", layout="wide", initial_sidebar_state="collapsed")
+i18n.render_switch()  # 맨 위 오른쪽 언어 버튼(한국어/English/中文) — 이후 화면 글자는 자동으로 번역돼 보임
 
 # ── 앱 공통 비밀번호 게이트 (다른 페이지와 동일) ──
 PW = os.environ.get("APP_PASSWORD")
@@ -6381,3 +6384,6 @@ if _nav == "org":
     headcounts = {"장현우": 1, "박솔": 1, "구정회팀": 1 + 2, "곽재선팀": 1 + 4, "김선재팀": 1 + 1, "이단우팀": 1 + 6}
     total_headcount = sum(headcounts.values())
     st.caption(f"현재 기준 총 **{total_headcount}명** 규모 (충원 예정 1명 포함)")
+
+
+i18n.flush()  # 영어/중국어 화면: 이번 화면에서 못 찾은 문구를 모아 한 번에 번역(번역되면 화면을 다시 그림)
