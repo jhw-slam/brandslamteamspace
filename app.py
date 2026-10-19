@@ -2679,15 +2679,21 @@ def _render_kpi_board(my_name):
         st.info("이번 달 페이스까지 남은 지표: " + " · ".join(b.replace(" 뒤처짐", "") for b in behind))
 
     with st.form("kpi_plan_form"):
-        st.caption(f"{ws.strftime('%m/%d')} 주 계획 · 다음주 계획 — 비워두면(0) 계획 없음으로 봐요. 저장해야 반영돼요.")
+        st.caption("지난주 달성은 자동으로 채워져요. 이번주·다음주 목표만 적고 저장해요 (비워두면 0 = 계획 없음). 저장해야 반영돼요.")
+        h0, h1, h2, h3 = st.columns([3, 1.2, 1.5, 1.5])
+        h0.markdown("**지표**")
+        h1.markdown("**지난주 달성**")
+        h2.markdown(f"**이번주 목표** ({ws.strftime('%m/%d')}~)")
+        h3.markdown("**다음주 목표**")
         inputs = {}
         for k in keys:
-            c0, c1, c2 = st.columns([3, 1, 1])
-            c0.markdown(f"**{KPI_DEFS[k]['label']}** ({KPI_DEFS[k]['unit']})")
+            c0, c_last, c1, c2 = st.columns([3, 1.2, 1.5, 1.5])
+            c0.markdown(f"{KPI_DEFS[k]['label']} ({KPI_DEFS[k]['unit']})")
+            c_last.markdown(_fmt_kpi(_kpi_week_value(my_name, k, ws - timedelta(weeks=1), today, ctx), KPI_DEFS[k]["unit"]))
             cur_p = (plans or {}).get((my_name, k, ws.isoformat()), {}).get("plan")
             nxt_p = (plans or {}).get((my_name, k, (ws + timedelta(weeks=1)).isoformat()), {}).get("plan")
-            inputs[k] = (c1.number_input("이번주", min_value=0.0, step=1.0, value=float(cur_p or 0), key=f"kp_c_{k}", label_visibility="collapsed"),
-                         c2.number_input("다음주", min_value=0.0, step=1.0, value=float(nxt_p or 0), key=f"kp_n_{k}", label_visibility="collapsed"))
+            inputs[k] = (c1.number_input("이번주 목표", min_value=0.0, step=1.0, value=float(cur_p or 0), key=f"kp_c_{k}", label_visibility="collapsed"),
+                         c2.number_input("다음주 목표", min_value=0.0, step=1.0, value=float(nxt_p or 0), key=f"kp_n_{k}", label_visibility="collapsed"))
         save_plan = st.form_submit_button("💾 계획 저장 (여기서 저장돼요)", type="primary", disabled=demo)
     if save_plan and not demo:
         try:
