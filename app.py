@@ -1540,9 +1540,9 @@ def _render_leave_page(my_name, today):
 
 
 PAYMENT_TEMPLATE_HEADERS = ["이름", "SNS계정", "팔로워수", "금액", "통화", "결제수단", "콘텐츠링크", "방문일", "업로드일", "송금예정일",
-                            "신분증링크", "브랜드", "배분비율(%)", "조회수", "좋아요", "저장", "안내메일", "지출기안서링크"]
+                            "신분증링크", "브랜드", "배분비율(%)", "조회수", "좋아요", "저장", "댓글", "공유", "안내메일", "지출기안서링크"]
 PAYMENT_TEMPLATE_SAMPLE = ["홍길동(예시 — 이 줄은 지우거나 그대로 둬도 무시돼요)", "@gildong", "12000", "150000", "KRW", "하나은행 123-456789-01", "https://instagram.com/p/xxxx",
-                           "2026-10-01", "2026-10-05", "2026-10-10", "https://drive.google.com/...", "브랜드A, 브랜드B", "50, 50", "5200", "310", "45", "", ""]
+                           "2026-10-01", "2026-10-05", "2026-10-10", "https://drive.google.com/...", "브랜드A, 브랜드B", "50, 50", "5200", "310", "45", "12", "8", "", ""]
 _STD_PAY_ALIASES = {
     "influencer_name": ["이름", "성명", "인플루언서", "인플루언서명", "name"],
     "amount": ["금액", "송금액", "amount"],
@@ -1896,6 +1896,8 @@ INF_FORMAT = [
     ("조회수", "views", True, "5200", "아직 없으면 0"),
     ("좋아요", "likes", True, "310", "아직 없으면 0"),
     ("저장", "saves", True, "45", "아직 없으면 0"),
+    ("댓글", "comments", True, "12", "아직 없으면 0"),
+    ("공유", "shares", True, "8", "아직 없으면 0 — 반응(좋아요+저장+댓글+공유) 1천 이상 + 조회 1만 이상이면 '터진 콘텐츠'"),
     ("안내메일", "notification_email", False, "name@email.com", "비우면 자동메일 안 보내요"),
     ("지출기안서링크", "expense_proposal_url", False, "https://…", "있으면"),
 ]
@@ -1906,6 +1908,8 @@ INF_ALIASES_EXTRA = {
     "views": ["조회수", "조회", "views"],
     "likes": ["좋아요", "좋아요수", "likes"],
     "saves": ["저장", "저장수", "saves"],
+    "comments": ["댓글", "댓글수", "comments"],
+    "shares": ["공유", "공유수", "shares"],
     "notification_email": ["안내메일", "안내메일주소", "알림메일"],
     "expense_proposal_url": ["지출기안서링크", "지출기안서", "기안서링크"],
 }
@@ -2069,7 +2073,7 @@ def _inf_validate(raw, idx, picks, checks, camps, brand_camps, existing_links, s
     if ne and not re.fullmatch(r"[^@\s]+@[^@\s]+\.[^@\s]+", ne):
         bad["안내메일"] = "메일 주소 형식이 아니에요"
     v["expense_proposal_url"] = _extract_link(raw.get("expense_proposal_url", "")) or (raw.get("expense_proposal_url", "").strip() or None)
-    for f, ko in (("views", "조회수"), ("likes", "좋아요"), ("saves", "저장")):
+    for f, ko in (("views", "조회수"), ("likes", "좋아요"), ("saves", "저장"), ("comments", "댓글"), ("shares", "공유")):
         t = raw.get(f, "").strip()
         v[f] = _inf_count(t)
         if v[f] is None:
@@ -2114,7 +2118,7 @@ def _inf_validate(raw, idx, picks, checks, camps, brand_camps, existing_links, s
 
 
 _INF_COL_OF = {"이름": "이름", "금액": "금액", "통화": "통화", "결제수단": "결제수단", "콘텐츠링크": "콘텐츠링크", "방문일": "방문일", "업로드일": "업로드일",
-               "송금예정일": "송금예정일", "신분증링크": "신분증링크", "브랜드": "브랜드", "캠페인": "캠페인", "조회수": "조회수", "좋아요": "좋아요", "저장": "저장",
+               "송금예정일": "송금예정일", "신분증링크": "신분증링크", "브랜드": "브랜드", "캠페인": "캠페인", "조회수": "조회수", "좋아요": "좋아요", "저장": "저장", "댓글": "댓글", "공유": "공유",
                "SNS계정": "SNS계정", "팔로워수": "팔로워수", "안내메일": "안내메일", "배분비율(%)": "배분"}
 
 
@@ -2175,7 +2179,8 @@ def _inf_register(rows_valid, my_name):
                 _placement_save({
                     "brand_name": camp_by[cid]["brand"], "influencer_name": v["influencer_name"], "content_link": v["content_link"],
                     "status": "업로드완료", "actual_upload_date": v["upload_date"], "visit_date": v["visit_date"], "scheduled_date": v["scheduled_date"],
-                    "views": v["views"], "likes": v["likes"], "saves": v["saves"], "followers": v["followers"], "sns_id": v["sns_id"],
+                    "views": v["views"], "likes": v["likes"], "saves": v["saves"], "comments": v["comments"], "shares": v["shares"],
+                    "followers": v["followers"], "sns_id": v["sns_id"],
                     "unit_price": alloc if v["currency"] == "KRW" else None, "assigned_to": my_name,
                 })
         except Exception as e:
@@ -2336,6 +2341,7 @@ def _render_influencer_hub(my_name):
             "송금예정일": rows[i].get("scheduled_date"), "신분증링크": rows[i].get("id_doc_link"), "브랜드": rows[i].get("brand_names"),
             "캠페인": " + ".join(camp_by_id[c]["brand"] for c in v["campaign_ids"] if c in camp_by_id) or None,
             "배분": rows[i].get("ratio"), "조회수": rows[i].get("views"), "좋아요": rows[i].get("likes"), "저장": rows[i].get("saves"),
+            "댓글": rows[i].get("comments"), "공유": rows[i].get("shares"),
             "팔로워수": rows[i].get("followers"), "안내메일": rows[i].get("notification_email"),
         })
     sdf = pd.DataFrame(shown).replace("", None)
@@ -2399,7 +2405,16 @@ def _render_influencer_hub(my_name):
         _render_influencer_records(my_name)
 
 
-BREAKOUT_VIEWS = 100_000  # '콘텐츠가 터졌다'고 볼 조회수 기준(임시 — 대표님이 정하면 이 한 줄만 바꾸면 됨)
+BREAKOUT_VIEWS = 10_000   # 터진 콘텐츠: 조회수 1만 이상 AND (10/19 대표 확정, 채널과 상관없이 동일)
+BREAKOUT_ENGAGE = 1_000   # 반응(좋아요+저장+댓글+공유) 도합 1천 이상
+
+
+def _engage(p):
+    return sum(int(p.get(k) or 0) for k in ("likes", "saves", "comments", "shares"))
+
+
+def _is_popped(p):
+    return (p.get("views") or 0) >= BREAKOUT_VIEWS and _engage(p) >= BREAKOUT_ENGAGE
 MACRO_TARGETS = {}  # 거시 목표 숫자(예: {"uploads": 30}) — 대표님이 정하면 채운다. 비어 있으면 '목표 미설정'으로 현황만 보여준다
 
 
@@ -2415,19 +2430,24 @@ KPI_DEFS = {
     "planexpo": dict(label="기획전 참여", unit="건", kind="sum", src="events", help="기획전에 참여한 개수"),
     "guide_selected": dict(label="브랜드가 선정한 가이드", unit="개", kind="sum", src="events", help="개발한 콘텐츠 가이드 중 브랜드사가 선정한 개수"),
     "uploads": dict(label="업로드 콘텐츠", unit="건", kind="sum", src="auto", help="인플루언서 매칭현황의 업로드 완료"),
-    "popped": dict(label="터진 콘텐츠", unit="건", kind="sum", src="auto", help="조회수 기준 이상(BREAKOUT_VIEWS)"),
+    "popped": dict(label="터진 콘텐츠", unit="건", kind="sum", src="auto", help="조회수 1만 이상 AND 반응(좋아요+저장+댓글+공유) 1천 이상"),
     "popped_rate": dict(label="터진 비율(최근 4주)", unit="%", kind="level", src="auto", help="터진 콘텐츠 ÷ 업로드 콘텐츠"),
     "pool": dict(label="인플루언서 pool(누적)", unit="명", kind="level", src="auto", help="처음 활동한 인플루언서를 누적해서 센 수"),
     "recruited": dict(label="모집(staff 포함)", unit="명", kind="sum", src="events", help="새로 모집한 인원 — 담당 staff 이름은 메모에"),
+    "revenue_growth": dict(label="매출 성장률(전월 같은 기간 대비)", unit="%", kind="level", src="auto", help="이번 달 지금까지 매출 ÷ 지난달 같은 날까지 매출 − 1"),
+    "pool_new": dict(label="새로 쓴 인플루언서(검증·사용 pool)", unit="명", kind="sum", src="auto", help="그 기간에 처음 업로드까지 간 인플루언서 수 — 단순 서칭이 아니라 검증되고 실제 쓴 사람"),
+    "searched": dict(label="단순 서칭 후보", unit="명", kind="sum", src="events", help="아직 검증·사용 전, 찾아서 리스트업한 후보 수"),
+    "wechat_room": dict(label="직접 소통 위챗방 인원", unit="명", kind="level", src="snapshot", help="직접 소통하는 위챗방 총 인원(그 주의 값)"),
     "wanghong": dict(label="관리 중인 왕홍", unit="명", kind="level", src="snapshot", help="지금 관리하는 왕홍 수(그 주의 값)"),
     "own_followers": dict(label="자체채널 팔로워", unit="명", kind="level", src="snapshot", help="샤오홍슈 등 자체채널 팔로워 수(그 주의 값)"),
     "own_reach": dict(label="자체채널 주간 조회", unit="회", kind="sum", src="events", help="자체채널 게시물 조회/노출의 그 주 합"),
     "own_leads": dict(label="자체채널 모집 인입", unit="명", kind="sum", src="events", help="자체채널을 보고 들어온 모집 문의·지원자 수"),
 }
 _KPI_BY_ROLE = {
-    "sales": ["revenue", "persuasion", "planexpo"],
-    "influencer": ["guide_selected", "popped", "popped_rate", "pool", "recruited", "uploads"],
-    "china_ops": ["guide_selected", "popped", "popped_rate", "pool", "recruited", "uploads", "wanghong", "own_followers", "own_reach", "own_leads"],
+    "sales": ["revenue", "revenue_growth", "persuasion", "planexpo"],
+    "influencer": ["guide_selected", "popped_rate", "popped", "pool_new", "pool", "uploads", "recruited", "searched"],
+    "china_ops": ["guide_selected", "popped_rate", "popped", "pool_new", "pool", "uploads", "recruited", "searched",
+                  "own_followers", "wechat_room", "wanghong", "own_reach", "own_leads"],
 }
 _KPI_TEST_USER = "가상인턴"  # 테스트 계정은 모든 지표를 본다
 
@@ -2491,11 +2511,25 @@ def _kpi_sum(person, key, a, b, ctx):
         for p in ctx["placements"]:
             d = _to_date(p.get("actual_upload_date"))
             if p.get("assigned_to") == person and p.get("status") == "업로드완료" and d and a <= d <= b:
-                if key == "uploads" or (p.get("views") or 0) >= BREAKOUT_VIEWS:
+                if key == "uploads" or _is_popped(p):
                     n += 1
         return float(n)
+    if key == "pool_new":
+        return float(sum(1 for d in _first_seen(person, ctx).values() if a <= d <= b))
     return sum(float(e.get("qty") or 0) for e in ctx["events"]
                if e.get("person") == person and e.get("metric_key") == key and (d := _to_date(e.get("event_date"))) and a <= d <= b)
+
+
+def _first_seen(person, ctx):
+    """인플루언서별로 처음 업로드(없으면 등록)된 날짜: {이름: 날짜}."""
+    first = {}
+    for p in ctx["placements"]:
+        if p.get("assigned_to") != person or not p.get("influencer_name"):
+            continue
+        d = _to_date(p.get("actual_upload_date")) or _to_date(p.get("created_at"))
+        if d and (p["influencer_name"] not in first or d < first[p["influencer_name"]]):
+            first[p["influencer_name"]] = d
+    return first
 
 
 def _kpi_level(person, key, asof, ctx):
@@ -2504,14 +2538,14 @@ def _kpi_level(person, key, asof, ctx):
         a = asof - timedelta(days=27)
         up = _kpi_sum(person, "uploads", a, asof, ctx)
         return (100.0 * _kpi_sum(person, "popped", a, asof, ctx) / up) if up else None
+    if key == "revenue_growth":
+        m0 = asof.replace(day=1)
+        pm = (m0 - timedelta(days=1)).replace(day=1)
+        cur = _kpi_sum(person, "revenue", m0, asof, ctx)
+        prev = _kpi_sum(person, "revenue", pm, min(pm + timedelta(days=asof.day - 1), m0 - timedelta(days=1)), ctx)
+        return (cur / prev - 1) * 100 if prev else None
     if key == "pool":
-        first = {}
-        for p in ctx["placements"]:
-            if p.get("assigned_to") != person or not p.get("influencer_name"):
-                continue
-            d = _to_date(p.get("actual_upload_date")) or _to_date(p.get("created_at"))
-            if d and (p["influencer_name"] not in first or d < first[p["influencer_name"]]):
-                first[p["influencer_name"]] = d
+        first = _first_seen(person, ctx)
         extra = sum(float(e.get("qty") or 0) for e in ctx["events"]
                     if e.get("person") == person and e.get("metric_key") == "recruited" and (d := _to_date(e.get("event_date"))) and d <= asof)
         return float(sum(1 for d in first.values() if d <= asof)) + extra
@@ -2595,7 +2629,7 @@ def _render_kpi_board(my_name):
         rows.append({"지표": d["label"], "지난주": _fmt_kpi(last, d["unit"]), "이번주 계획 → 실제": f"{_fmt_kpi(pl(0), d['unit'])} → {_fmt_kpi(cur, d['unit'])}",
                      "다음주 계획": _fmt_kpi(pl(1), d["unit"]), "이번 달·현재": _fmt_kpi(month, d["unit"]),
                      "월 목표": _fmt_kpi(tgt, d["unit"]) if tgt else "미설정",
-                     "달성": (month / tgt) if (tgt and month is not None and d["kind"] == "sum") else None})
+                     "달성": (month / tgt) if (tgt and month is not None) else None})
     df = pd.DataFrame(rows)
     st.dataframe(df, hide_index=True, use_container_width=True,
                  column_config={"달성": st.column_config.ProgressColumn("달성", min_value=0.0, max_value=1.0, format="percent")})
@@ -2738,6 +2772,121 @@ def _render_kpi_admin():
                     st.rerun()
 
 
+@st.cache_data(ttl=30)
+def load_quests():
+    """대·중·소 미션(quests). 테이블이 아직 없으면 (None, 에러문구)."""
+    try:
+        return SUPA.table("quests").select("*").neq("status", "dropped").limit(2000).execute().data, None
+    except Exception as e:
+        return None, f"{type(e).__name__}: {e}"
+
+
+XP_PER_LEVEL = 100
+
+
+def _quest_xp(person, quests):
+    return sum(int(q.get("xp") or 0) for q in quests if q["owner"] == person and q["status"] == "done")
+
+
+def _render_quest_board(my_name):
+    """게임처럼: 내 퀘스트(소 미션, 완료 버튼) + 오늘의 자동 퀘스트 + 레벨/XP + 팀 리더보드 + 대·중·소 미션 지도."""
+    st.markdown("### 🎮 퀘스트")
+    quests, qerr = load_quests()
+    if qerr:
+        st.info("퀘스트 칸이 DB에 아직 없어요(`migrations/20261019_quests_and_targets.sql`).")
+        return
+    today = _today_kst()
+    ws = _week_start(today)
+    mine = [q for q in quests if q["kind"] == "small" and q["owner"] == my_name]
+    opens = sorted([q for q in mine if q["status"] == "open"], key=lambda q: str(q.get("due_date") or "9999"))
+    done_n = sum(1 for q in mine if q["status"] == "done")
+    xp = _quest_xp(my_name, quests)
+    lv = 1 + xp // XP_PER_LEVEL
+    c1, c2, c3 = st.columns(3)
+    c1.metric("레벨", f"Lv.{lv}")
+    c2.metric("경험치", f"{xp} XP", delta=f"다음 레벨까지 {XP_PER_LEVEL - xp % XP_PER_LEVEL}", delta_color="off")
+    c3.metric("완료한 퀘스트", f"{done_n}/{len(mine)}")
+    st.progress((xp % XP_PER_LEVEL) / XP_PER_LEVEL)
+
+    # 오늘의 자동 퀘스트: 데이터가 알아서 만든다(저장 안 함)
+    auto = []
+    keys = _kpi_keys(my_name)
+    plans, perr = load_kpi_plans()
+    if keys and not perr:
+        miss = [KPI_DEFS[k]["label"] for k in keys if (my_name, k, ws.isoformat()) not in plans]
+        if miss:
+            auto.append(f"⚡ 이번 주 계획을 적어요 — 아직 {len(miss)}개 지표 비어 있어요 (1분이면 끝나요, 아래 '내 핵심 지표')")
+    targets, terr = load_kpi_targets()
+    if keys and targets and not terr:
+        ctx, _e = _kpi_ctx()
+        m0 = today.replace(day=1)
+        days = ((m0.replace(day=28) + timedelta(days=4)).replace(day=1) - m0).days
+        for k in keys:
+            tgt = targets.get((my_name, k))
+            if tgt and KPI_DEFS[k]["kind"] == "sum":
+                pace, got = tgt * today.day / days, _kpi_sum(my_name, k, m0, today, ctx)
+                if got < pace * 0.8:
+                    auto.append(f"🔥 '{KPI_DEFS[k]['label']}' 이번 달 페이스보다 {_fmt_kpi(pace - got, KPI_DEFS[k]['unit'])} 모자라요 — 이번 주에 따라잡기")
+    for q in opens:
+        d = _to_date(q.get("due_date"))
+        if d and d < today:
+            auto.append(f"⏰ 기한이 지났어요: {q['title']} ({d.strftime('%m/%d')})")
+    if auto:
+        st.markdown("**⚡ 오늘의 퀘스트**")
+        for a in auto[:5]:
+            st.markdown(f"- {a}")
+    elif keys:
+        st.success("오늘의 퀘스트를 모두 끝냈어요 👏")
+
+    if opens:
+        st.markdown("**📜 내 퀘스트** (끝내면 `완료!`를 눌러요 · 완료할 때마다 20 XP)")
+        for q in opens[:8]:
+            d = _to_date(q.get("due_date"))
+            tag = "" if not d else (f" · ⏰ 기한 지남 {d.strftime('%m/%d')}" if d < today else f" · D-{(d - today).days} ({d.strftime('%m/%d')})")
+            qc1, qc2 = st.columns([6, 1])
+            qc1.markdown(f"🔹 {q['title']}{tag}")
+            if qc2.button("완료!", key=f"quest_done_{q['id']}"):
+                try:
+                    SUPA.table("quests").update({"status": "done", "done_at": datetime.utcnow().isoformat() + "Z", "done_by": my_name}).eq("id", q["id"]).execute()
+                except Exception as e:
+                    st.error(f"저장하지 못했어요 ({type(e).__name__}: {e})")
+                else:
+                    load_quests.clear()
+                    _flash(f"퀘스트 완료! +{int(q.get('xp') or 0)} XP")
+                    st.rerun()
+    elif mine:
+        st.success("받은 퀘스트를 모두 끝냈어요. 새 퀘스트를 기다려요!")
+
+    with st.expander("🏆 팀 리더보드 · 🗺️ 우리 팀 미션 지도", expanded=False):
+        people = [p for p in STAFF_NAMES if p != _KPI_TEST_USER and any(q["owner"] == p for q in quests)]
+        rows = []
+        for p in people:
+            sm = [q for q in quests if q["kind"] == "small" and q["owner"] == p]
+            late = sum(1 for q in sm if q["status"] == "open" and (d := _to_date(q.get("due_date"))) and d < today)
+            wk = sum(1 for q in sm if q["status"] == "done" and (d := _to_date(q.get("done_at"))) and d >= ws)
+            x = _quest_xp(p, quests)
+            rows.append({"이름": p, "레벨": f"Lv.{1 + x // XP_PER_LEVEL}", "XP": x, "이번 주 완료": wk, "남은 퀘스트": sum(1 for q in sm if q["status"] == "open"), "기한 지남": late})
+        if rows:
+            st.dataframe(pd.DataFrame(rows).sort_values("XP", ascending=False), hide_index=True, use_container_width=True)
+        targets, _t = load_kpi_targets()
+        ctx2, _e2 = _kpi_ctx() if targets else (None, None)
+        m0 = today.replace(day=1)
+        for big in [q for q in quests if q["kind"] == "big"]:
+            st.markdown(f"**🟥 대 · {big['title']}** (담당 {big['owner']})")
+            for mid in [q for q in quests if q["kind"] == "mid" and q.get("parent_id") == big["id"]]:
+                line = f"- 🟧 중 · {mid['title']} — {mid['owner']}"
+                k = mid.get("kpi_key")
+                if k in KPI_DEFS and ctx2 is not None:
+                    d = KPI_DEFS[k]
+                    val = _kpi_sum(mid["owner"], k, m0, today, ctx2) if d["kind"] == "sum" else _kpi_level(mid["owner"], k, today, ctx2)
+                    tgt = targets.get((mid["owner"], k))
+                    line += f" · 지금 {_fmt_kpi(val, d['unit'])}" + (f" / 목표 {_fmt_kpi(tgt, d['unit'])}" if tgt else "")
+                st.markdown(line)
+            smalls = [q for q in quests if q["kind"] == "small" and q.get("parent_id") == big["id"]]
+            if smalls:
+                st.caption("  🟨 소 · " + " / ".join(f"{'✅' if q['status'] == 'done' else '⬜'} {q['owner']}: {q['title'][:28]}" for q in sorted(smalls, key=lambda q: str(q.get('due_date') or ''))))
+
+
 def _render_macro_board():
     """③ 거시 목표 현황(이번 달): 이미 DB에 있는 데이터로 계산. 목표 숫자가 없으면 현황만."""
     st.markdown("### 🌐 이번 달 거시 현황")
@@ -2753,13 +2902,13 @@ def _render_macro_board():
     up_m = [p for p in pl if p.get("status") == "업로드완료" and (d := _to_date(p.get("actual_upload_date"))) and d >= m0]
     seen_before = {p["influencer_name"] for p in pl if (d := _to_date(p.get("actual_upload_date"))) and d < m0}
     new_inf = {p["influencer_name"] for p in up_m} - seen_before
-    popped = [p for p in up_m if (p.get("views") or 0) >= BREAKOUT_VIEWS]
+    popped = [p for p in up_m if _is_popped(p)]
     sales_pool = [a for a in accs if a.get("status") in ("계약완료", "운영중")]
     new_accs = [a for a in accs if (d := _to_date(a.get("created_at"))) and d >= m0]
     camps_m = [c for c in camps if (d := _to_date(c.get("open_date"))) and d >= m0]
     items = [
         ("uploads", "업로드 완료 콘텐츠", len(up_m), "건"), ("new_inf", "신규 인플루언서", len(new_inf), "명"),
-        ("popped", f"터진 콘텐츠(조회 {BREAKOUT_VIEWS // 10000}만+)", len(popped), "건"), ("sales_pool", "운영·계약 브랜드", len(sales_pool), "개"),
+        ("popped", f"터진 콘텐츠(조회 {BREAKOUT_VIEWS // 10000}만+·반응 {BREAKOUT_ENGAGE:,}+)", len(popped), "건"), ("sales_pool", "운영·계약 브랜드", len(sales_pool), "개"),
         ("new_accs", "신규 영업 브랜드", len(new_accs), "개"), ("camps", "새로 연 캠페인", len(camps_m), "개"),
     ]
     cols = st.columns(len(items))
@@ -3452,21 +3601,19 @@ _req_rows, _req_err = load_team_requests()
 _req_today = _today_kst()
 _my_overdue = sum(1 for r in _req_rows if r["assignee"] == my_name and _req_days_overdue(r, _req_today))
 _NAV = [
-    ("home", "🏠 홈"), ("okr", "🎯 목표"), ("log", "📝 오늘 기록"), ("campaign", "📋 캠페인"),
+    ("okr", "🎯 목표"), ("home", "🏠 홈"), ("log", "📝 오늘 기록"), ("campaign", "📋 캠페인"),
     ("finance", "💸 인플루언서 송금"), ("mywork", "🧰 내 업무"),
     ("board", "📮 요청 게시판" + (f" ⚠️{_my_overdue}" if _my_overdue else "")),
     ("leave", "🏖️ 휴가"), ("summary", "📊 요약"), ("org", "🏢 조직도"),
 ]
 if my_name == "김선재":  # 김선재는 인플루언서 송금 업무를 하지 않음(10/13). 가상인턴은 테스트용이라 그대로 둔다
     _NAV = [x for x in _NAV if x[0] != "finance"]
-    if st.session_state.get("main_nav") == "finance":  # 이미 그 화면에 있던 상태로 이름을 바꾼 경우
-        st.session_state["main_nav"] = "home"
-if my_role == "influencer":  # 곽재선: 핵심 업무(인플루언서 성과기록→캠페인 연계→비용→보고)가 맨 앞, '내 업무' 메뉴는 없음
-    _lead = [x for x in _NAV if x[0] == "finance"]
-    _NAV = _lead + [x for x in _NAV if x[0] not in ("finance", "mywork")]
-    if st.session_state.get("_nav_for") != my_name:  # 이름을 고른 처음 한 번만 핵심 화면으로
-        st.session_state["main_nav"] = "finance"
-        st.session_state["_nav_for"] = my_name
+if my_role == "influencer":  # 곽재선: '내 업무' 메뉴는 없음. 업무보고는 OKR 회의용이라 🎯 목표가 맨 앞(열자마자 보이는 화면), 그다음이 핵심 업무인 인플루언서 송금
+    _NAV = [x for x in _NAV if x[0] != "mywork"]
+    _NAV = [x for x in _NAV if x[0] == "okr"] + [x for x in _NAV if x[0] == "finance"] + [x for x in _NAV if x[0] not in ("okr", "finance")]
+if st.session_state.get("main_nav") not in [k for k, _ in _NAV]:  # 이름을 바꿨는데 그 사람에게 없는 화면이면 목표로
+    st.session_state["main_nav"] = "okr"
+st.session_state.setdefault("main_nav", "okr")
 _NAV_LABEL = dict(_NAV)
 # 선택한 화면만 실행(느림 개선): st.tabs는 안 보이는 탭까지 매번 전부 실행해서 라디오로 교체
 _nav = st.radio("화면", [k for k, _ in _NAV], format_func=_NAV_LABEL.get, horizontal=True,
@@ -3605,6 +3752,8 @@ if _nav == "okr":
     # ══════════════════════════════════════════════════════════
     st.subheader("🎯 목표 — 매주 확인")
     st.caption("OKR은 내 커리어를 쌓는 기록이에요. 시스템이 조금 불편해도, 할 수 있는 만큼만 매주 꾸준히 남겨주세요 — 대표님과 매주 이 화면으로 이야기해요.")
+    _render_quest_board(my_name)
+    st.divider()
     _render_kpi_board(my_name)
     st.divider()
     _render_kpi_team()
