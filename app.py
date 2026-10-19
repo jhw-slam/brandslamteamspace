@@ -2631,7 +2631,7 @@ def _render_kpi_board(my_name):
         rows.append({"지표": d["label"], "지난주": _fmt_kpi(last, d["unit"]), "이번주 계획 → 실제": f"{_fmt_kpi(pl(0), d['unit'])} → {_fmt_kpi(cur, d['unit'])}",
                      "다음주 계획": _fmt_kpi(pl(1), d["unit"]), "이번 달·현재": _fmt_kpi(month, d["unit"]),
                      "월 목표": _fmt_kpi(tgt, d["unit"]) if tgt else "미설정",
-                     "달성": (month / tgt) if (tgt and month is not None) else None})
+                     "달성": max(0.0, month / tgt) if (tgt and month is not None) else None})
     # 직원이 '써내려가는 지표'(AI가 이름 붙인 것): 클리어/예정 수를 같은 표에 보여준다
     custom = {}
     for p in pitems_all or []:
@@ -2815,7 +2815,7 @@ def _scorecard(person, ctx, targets, today):
             continue
         d = KPI_DEFS[k]
         val = _kpi_sum(person, k, m0, today, ctx) if d["kind"] == "sum" else _kpi_level(person, k, today, ctx)
-        r = min((val or 0) / tgt, 1.0)
+        r = max(0.0, min((val or 0) / tgt, 1.0))  # 매출 성장률처럼 음수가 될 수 있는 지표도 0~100%로
         rates.append(r)
         with_target += 1
         cleared += 1 if r >= 1.0 else 0
@@ -3160,7 +3160,7 @@ def _render_quest_board(my_name):
     c4.metric("외부 협력", f"{sc['outside']}곳", delta="이번 달", delta_color="off")
     c5.metric("혁신 요소", f"{sc['innov']}개", delta="이번 달 새로 만든 것", delta_color="off")
     if sc["rate"] is not None:
-        st.progress(sc["rate"])
+        st.progress(max(0.0, min(float(sc["rate"]), 1.0)))
     st.caption(_cheer(sc, len(opens), clear_n))
     with st.expander("이 숫자는 이렇게 계산해요", expanded=False):
         cm, hp, ak = sc["collab_parts"]
