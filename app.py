@@ -31,7 +31,7 @@ if PW and not st.session_state.get("ok"):
 st.title("📋 업무보고")
 st.caption("업체별 컨텐츠 배치, 가이드라인 준수, 섭외 지시, 예정입출금 — 오늘 진행한 것만 짧게 남겨주세요.")
 
-STAFF_NAMES = ["김선재", "곽재선", "구정회", "이단우", "Sanubari", "Meyna", "가상인턴"]
+STAFF_NAMES = ["김선재", "곽재선", "구정회", "이단우", "유원리", "Sanubari", "Meyna", "가상인턴"]
 CATEGORY_OPTS = ["뷰티", "라이프스타일", "기타"]
 CONTENT_TYPE_OPTS = ["PPL", "시딩", "방문형", "캐러셀", "기타"]
 STATUS_OPTS = ["섭외중", "섭외완료", "제작중", "업로드완료", "드롭앤고체크완료", "취소"]
@@ -2407,156 +2407,335 @@ def _week_start(d):
     return d - timedelta(days=d.weekday())  # 월요일 시작
 
 
-@st.cache_data(ttl=30)
-def load_headlines():
-    """사람별 핵심 KPI 1개. {person: okr_items 행}. 칸이 아직 DB에 없으면 (None, 에러문구)."""
-    try:
-        rows = SUPA.table("okr_items").select("*").eq("is_headline", True).execute().data
-    except Exception as e:
-        return None, f"{type(e).__name__}: {e}"
-    return {r["person"]: r for r in rows}, None
+# ── 핵심 지표(KPI) 추적: 사람(역할)마다 정해진 지표를 매주 계획→실제로 본다 ──
+# kind: sum=그 주에 한 양(합), level=그 시점의 수준(누적 pool·팔로워 등). src: auto=이미 있는 데이터로 자동 계산(숨길 수 없음), events=직원이 '기록 한 줄'로 남김
+KPI_DEFS = {
+    "revenue": dict(label="매출(입금 확정)", unit="원", kind="sum", src="auto", help="대표님이 매출로 확정한 은행 입금 합계"),
+    "persuasion": dict(label="설득 빈도", unit="회", kind="sum", src="events", help="브랜드를 설득·제안한 횟수"),
+    "planexpo": dict(label="기획전 참여", unit="건", kind="sum", src="events", help="기획전에 참여한 개수"),
+    "guide_selected": dict(label="브랜드가 선정한 가이드", unit="개", kind="sum", src="events", help="개발한 콘텐츠 가이드 중 브랜드사가 선정한 개수"),
+    "uploads": dict(label="업로드 콘텐츠", unit="건", kind="sum", src="auto", help="인플루언서 매칭현황의 업로드 완료"),
+    "popped": dict(label="터진 콘텐츠", unit="건", kind="sum", src="auto", help="조회수 기준 이상(BREAKOUT_VIEWS)"),
+    "popped_rate": dict(label="터진 비율(최근 4주)", unit="%", kind="level", src="auto", help="터진 콘텐츠 ÷ 업로드 콘텐츠"),
+    "pool": dict(label="인플루언서 pool(누적)", unit="명", kind="level", src="auto", help="처음 활동한 인플루언서를 누적해서 센 수"),
+    "recruited": dict(label="모집(staff 포함)", unit="명", kind="sum", src="events", help="새로 모집한 인원 — 담당 staff 이름은 메모에"),
+    "wanghong": dict(label="관리 중인 왕홍", unit="명", kind="level", src="snapshot", help="지금 관리하는 왕홍 수(그 주의 값)"),
+    "own_followers": dict(label="자체채널 팔로워", unit="명", kind="level", src="snapshot", help="샤오홍슈 등 자체채널 팔로워 수(그 주의 값)"),
+    "own_reach": dict(label="자체채널 주간 조회", unit="회", kind="sum", src="events", help="자체채널 게시물 조회/노출의 그 주 합"),
+    "own_leads": dict(label="자체채널 모집 인입", unit="명", kind="sum", src="events", help="자체채널을 보고 들어온 모집 문의·지원자 수"),
+}
+_KPI_BY_ROLE = {
+    "sales": ["revenue", "persuasion", "planexpo"],
+    "influencer": ["guide_selected", "popped", "popped_rate", "pool", "recruited", "uploads"],
+    "china_ops": ["guide_selected", "popped", "popped_rate", "pool", "recruited", "uploads", "wanghong", "own_followers", "own_reach", "own_leads"],
+}
+_KPI_TEST_USER = "가상인턴"  # 테스트 계정은 모든 지표를 본다
+
+
+def _kpi_keys(person):
+    if person == _KPI_TEST_USER:
+        return list(KPI_DEFS)
+    return _KPI_BY_ROLE.get(ROLE_MAP.get(person), [])
+
+
+def _fmt_kpi(v, unit):
+    if v is None or (isinstance(v, float) and pd.isna(v)):
+        return "-"
+    if unit == "원":
+        return f"₩{v:,.0f}"
+    return f"{v:,.0f}{unit}" if abs(v - round(v)) < 1e-9 else f"{v:,.1f}{unit}"
 
 
 @st.cache_data(ttl=30)
-def load_weekly_logs():
-    """주간 기록 전체. 테이블이 아직 없으면 (None, 에러문구)."""
+def load_kpi_events():
     try:
-        return SUPA.table("okr_weekly_log").select("*").order("week_start").limit(5000).execute().data, None
+        return SUPA.table("kpi_events").select("*").order("event_date").limit(10000).execute().data, None
     except Exception as e:
         return None, f"{type(e).__name__}: {e}"
 
 
-def _kpi_series(item, logs, today):
-    """핵심 KPI의 주별 표: 주, 계획, 실제, 누적계획, 누적실제, 목표페이스. 기간은 기간 시작~끝(없으면 마감일, 그것도 없으면 최근 7주+앞 2주)."""
-    target = float(item.get("target_qty") or 0)
-    ps = _to_date(item.get("period_start"))
-    pe = _to_date(item.get("period_end")) or _to_date(item.get("due_date"))
-    first = _week_start(ps) if ps else _week_start(today) - timedelta(weeks=6)
-    last = _week_start(pe) if pe and pe >= first else _week_start(today) + timedelta(weeks=2)
-    by_week = {_to_date(l["week_start"]): l for l in logs}
-    weeks, w = [], first
-    while w <= last and len(weeks) < 60:
-        weeks.append(w)
-        w += timedelta(weeks=1)
-    rows, cp, ca = [], 0.0, 0.0
-    for i, w in enumerate(weeks):
-        l = by_week.get(w, {})
-        p, a = l.get("plan"), l.get("actual")
-        cp += float(p or 0)
-        ca += float(a or 0)
-        rows.append({"week": w, "label": w.strftime("%m/%d"), "plan": p, "actual": a, "cum_plan": cp,
-                     "cum_actual": ca if w <= _week_start(today) else None,
-                     "pace": target * (i + 1) / len(weeks) if target else None})
-    return pd.DataFrame(rows)
+@st.cache_data(ttl=30)
+def load_kpi_plans():
+    try:
+        rows = SUPA.table("kpi_weekly_plan").select("*").limit(5000).execute().data
+    except Exception as e:
+        return None, f"{type(e).__name__}: {e}"
+    return {(r["person"], r["metric_key"], str(r["week_start"])[:10]): r for r in rows}, None
 
 
-def _sample_series(today):
-    """가상인턴용 예시(가상 데이터): 목표 20건 중 6주 동안 계획 대비 실제가 따라가는 모양."""
-    plan, actual = [2, 3, 3, 4, 4, 4], [2, 2, 4, 3, None, None]
-    start = _week_start(today) - timedelta(weeks=3)
-    rows, cp, ca = [], 0.0, 0.0
-    for i in range(6):
-        w = start + timedelta(weeks=i)
-        cp += plan[i]
-        ca += actual[i] or 0
-        rows.append({"week": w, "label": w.strftime("%m/%d"), "plan": plan[i], "actual": actual[i], "cum_plan": cp,
-                     "cum_actual": ca if actual[i] is not None else None, "pace": 20 * (i + 1) / 6})
-    return pd.DataFrame(rows)
+@st.cache_data(ttl=60)
+def load_kpi_targets():
+    try:
+        rows = SUPA.table("kpi_targets").select("*").execute().data
+    except Exception as e:
+        return None, f"{type(e).__name__}: {e}"
+    return {(r["person"], r["metric_key"]): float(r["month_target"]) for r in rows if r.get("month_target") is not None}, None
 
 
-def _render_weekly_focus(my_name):
-    """① 내 핵심 KPI: 지난주·이번주·다음주와 누적 그래프, 이번 주 입력(저장 버튼 1개)."""
+@st.cache_data(ttl=60)
+def load_revenue_deposits(since_iso):
+    """대표가 매출로 확정한 입금 (날짜, 금액) — 300만 원 기준 없이 전부."""
+    cats = load_fin_categories()
+    rows = (SUPA.table("bank_transactions").select("txn_date,amount,account_category_id,is_auto_categorized")
+            .eq("direction", "in").gte("txn_date", since_iso).not_.is_("account_category_id", "null").limit(5000).execute().data)
+    return [(_to_date(r["txn_date"]), float(r["amount"] or 0)) for r in rows
+            if (cats.get(r["account_category_id"]) or {}).get("type") == "revenue" and not r.get("is_auto_categorized")]
+
+
+def _kpi_sum(person, key, a, b, ctx):
+    """[a, b] 기간(날짜 포함)의 합."""
+    if key == "revenue":
+        return sum(v for d, v in ctx["revenue"] if d and a <= d <= b)
+    if key in ("uploads", "popped"):
+        n = 0
+        for p in ctx["placements"]:
+            d = _to_date(p.get("actual_upload_date"))
+            if p.get("assigned_to") == person and p.get("status") == "업로드완료" and d and a <= d <= b:
+                if key == "uploads" or (p.get("views") or 0) >= BREAKOUT_VIEWS:
+                    n += 1
+        return float(n)
+    return sum(float(e.get("qty") or 0) for e in ctx["events"]
+               if e.get("person") == person and e.get("metric_key") == key and (d := _to_date(e.get("event_date"))) and a <= d <= b)
+
+
+def _kpi_level(person, key, asof, ctx):
+    """asof 시점의 수준."""
+    if key == "popped_rate":
+        a = asof - timedelta(days=27)
+        up = _kpi_sum(person, "uploads", a, asof, ctx)
+        return (100.0 * _kpi_sum(person, "popped", a, asof, ctx) / up) if up else None
+    if key == "pool":
+        first = {}
+        for p in ctx["placements"]:
+            if p.get("assigned_to") != person or not p.get("influencer_name"):
+                continue
+            d = _to_date(p.get("actual_upload_date")) or _to_date(p.get("created_at"))
+            if d and (p["influencer_name"] not in first or d < first[p["influencer_name"]]):
+                first[p["influencer_name"]] = d
+        extra = sum(float(e.get("qty") or 0) for e in ctx["events"]
+                    if e.get("person") == person and e.get("metric_key") == "recruited" and (d := _to_date(e.get("event_date"))) and d <= asof)
+        return float(sum(1 for d in first.values() if d <= asof)) + extra
+    best = None  # snapshot: asof 이전 가장 최근 기록
+    for e in ctx["events"]:
+        d = _to_date(e.get("event_date"))
+        if e.get("person") == person and e.get("metric_key") == key and d and d <= asof and (best is None or d >= best[0]):
+            best = (d, float(e.get("qty") or 0))
+    return best[1] if best else None
+
+
+def _kpi_week_value(person, key, w, today, ctx):
+    """w(월요일) 주의 값: 합이면 그 주 합, 수준이면 그 주 일요일(또는 오늘) 시점 값. 미래면 None."""
+    if w > today:
+        return None
+    end = min(w + timedelta(days=6), today)
+    if KPI_DEFS[key]["kind"] == "sum":
+        return _kpi_sum(person, key, w, end, ctx)
+    return _kpi_level(person, key, end, ctx)
+
+
+def _kpi_ctx():
+    """계산에 쓰는 원자료(자동 지표 + 기록). 반환: (ctx, 오류문구)"""
+    today = _today_kst()
+    ev, eerr = load_kpi_events()
+    try:
+        rev = load_revenue_deposits((today - timedelta(weeks=14)).isoformat())
+    except Exception:
+        rev = []
+    ctx = {"events": ev or [], "placements": load_placements(), "revenue": rev}
+    return ctx, eerr
+
+
+def _demo_ctx(today):
+    """가상 데이터(DB 칸이 아직 없을 때 가상인턴 화면용): 매주 조금씩 우상향."""
+    ws = _week_start(today)
+    ev, pl, rev = [], [], []
+    for i in range(8):
+        w = ws - timedelta(weeks=7 - i)
+        d = w.isoformat()  # 이번 주 월요일(오늘 이전)이라 이번 주 값도 보이게
+        for key, base in (("guide_selected", 1), ("recruited", 2), ("persuasion", 3), ("planexpo", 1), ("own_leads", 3)):
+            ev.append({"person": _KPI_TEST_USER, "metric_key": key, "event_date": d, "qty": base + i // 3})
+        ev.append({"person": _KPI_TEST_USER, "metric_key": "wanghong", "event_date": d, "qty": 8 + i})
+        ev.append({"person": _KPI_TEST_USER, "metric_key": "own_followers", "event_date": d, "qty": 1200 + 150 * i})
+        ev.append({"person": _KPI_TEST_USER, "metric_key": "own_reach", "event_date": d, "qty": 4000 + 700 * i})
+        rev.append((w, 12_000_000 + 4_000_000 * i))
+        for j in range(3 + i):
+            pl.append({"assigned_to": _KPI_TEST_USER, "status": "업로드완료", "influencer_name": f"가상{i}-{j}", "actual_upload_date": d,
+                       "views": 150000 if j == 0 else 30000, "created_at": d})
+    return {"events": ev, "placements": pl, "revenue": rev}
+
+
+def _render_kpi_board(my_name):
+    """내 핵심 지표: 한 표(지난주·이번주 계획→실제·다음주 계획·이번 달·월 목표) + 고른 지표의 그래프 + 이번 주 계획 저장 + 기록 한 줄 추가."""
     today = _today_kst()
     ws = _week_start(today)
-    heads, herr = load_headlines()
-    logs_all, lerr = load_weekly_logs()
-    item = (heads or {}).get(my_name)
-    demo = False
-    st.markdown("### 🎯 내 핵심 KPI — 이번 주 확인")
-    if herr or lerr:
-        st.info("핵심 KPI 기능은 DB에 칸이 추가돼야 켜져요(`migrations/20261019_okr_weekly.sql`). 아래는 **예시(가상) 화면**이에요." if my_name == "가상인턴"
-                else "핵심 KPI 기능은 DB 준비 중이에요(`migrations/20261019_okr_weekly.sql` 적용 필요).")
-        demo = my_name == "가상인턴"
-    elif not item:
-        st.info("대표님이 아직 내 핵심 KPI를 지정하지 않았어요." + (" 아래는 **예시(가상) 화면**이에요." if my_name == "가상인턴" else ""))
-        demo = my_name == "가상인턴"
-    if not demo and not item:
+    keys = _kpi_keys(my_name)
+    st.markdown("### 🎯 내 핵심 지표 — 이번 주 확인")
+    if not keys:
+        st.info("아직 내 핵심 지표가 정해지지 않았어요.")
         return
+    ctx, eerr = _kpi_ctx()
+    plans, perr = load_kpi_plans()
+    targets, terr = load_kpi_targets()
+    demo = bool(eerr or perr or terr) and my_name == _KPI_TEST_USER
+    if eerr or perr or terr:
+        st.info("지표 기록을 남기는 칸이 DB에 아직 없어요(`migrations/20261019_kpi_tracking.sql` 적용 필요)." + (" 아래는 **예시(가상) 화면**이에요." if demo else ""))
+        if not demo:
+            plans, targets = plans or {}, targets or {}
     if demo:
-        item = {"title": "(예시) 인플루언서 신규 영입", "target_qty": 20, "unit": "건", "period_start": str(ws - timedelta(weeks=3)), "period_end": str(ws + timedelta(weeks=2))}
-        df = _sample_series(today)
-        st.caption("⚠️ 가상 데이터예요. 실제 저장되지 않아요.")
-    else:
-        mine = [l for l in (logs_all or []) if l["item_id"] == item["id"]]
-        df = _kpi_series(item, mine, today)
-    unit = item.get("unit") or ""
-    target = float(item.get("target_qty") or 0)
-    st.markdown(f"**{item['title']}** · 목표 {target:g}{unit}")
-    cur = df[df["week"] == ws]
-    cur_plan = None if cur.empty else cur.iloc[0]["plan"]
-    cur_act = None if cur.empty else cur.iloc[0]["actual"]
-    prev = df[df["week"] == ws - timedelta(weeks=1)]
-    nxt = df[df["week"] == ws + timedelta(weeks=1)]
-    done = float(df["cum_actual"].dropna().iloc[-1]) if df["cum_actual"].notna().any() else 0.0
-    m1, m2, m3, m4 = st.columns(4)
-    m1.metric("지난주 실제", "-" if prev.empty or pd.isna(prev.iloc[0]["actual"]) else f"{prev.iloc[0]['actual']:g}{unit}")
-    m2.metric("이번주 계획 → 실제", f"{'-' if cur_plan is None or pd.isna(cur_plan) else format(cur_plan, 'g')} → {'-' if cur_act is None or pd.isna(cur_act) else format(cur_act, 'g')}")
-    m3.metric("다음주 계획", "-" if nxt.empty or pd.isna(nxt.iloc[0]["plan"]) else f"{nxt.iloc[0]['plan']:g}{unit}")
-    m4.metric("누적 / 목표", f"{done:g} / {target:g}{unit}" if target else f"{done:g}{unit}", delta=f"{done / target * 100:.0f}%" if target else None)
-    chart = df.set_index("label")[["cum_plan", "cum_actual", "pace"]].rename(columns={"cum_plan": "누적 계획", "cum_actual": "누적 실제", "pace": "목표 페이스"})
-    st.line_chart(chart, height=260)
-    if target and not demo:
-        pace_now = float(df[df["week"] == ws].iloc[0]["pace"]) if not cur.empty else None
-        if pace_now is not None and done < pace_now:
-            st.warning(f"목표 페이스보다 {pace_now - done:g}{unit} 뒤처져 있어요. 이번 주에 따라잡을 계획을 적어주세요.")
-    with st.form("weekly_focus_form"):
-        st.caption(f"{ws.strftime('%m/%d')} 주 (월~일) · 저장해야 반영돼요")
-        f1, f2, f3 = st.columns(3)
-        n_plan = f1.number_input("이번주 계획", min_value=0.0, step=1.0, value=float(cur_plan) if cur_plan is not None and not pd.isna(cur_plan) else 0.0)
-        n_act = f2.number_input("이번주 실제(한 개수)", min_value=0.0, step=1.0, value=float(cur_act) if cur_act is not None and not pd.isna(cur_act) else 0.0)
-        nx_plan = f3.number_input("다음주 계획", min_value=0.0, step=1.0,
-                                  value=float(nxt.iloc[0]["plan"]) if not nxt.empty and not pd.isna(nxt.iloc[0]["plan"]) else 0.0)
-        note = st.text_input("한 줄 메모(막힌 점·도움이 필요한 점)", placeholder="없으면 비워두세요")
-        saved = st.form_submit_button("💾 이번 주 저장 (여기서 저장돼요)", type="primary", disabled=demo)
-    if saved and not demo:
+        ctx, plans, targets = _demo_ctx(today), {}, {("가상인턴", "guide_selected"): 6, ("가상인턴", "recruited"): 10, ("가상인턴", "uploads"): 40}
+        st.caption("⚠️ 가상 데이터예요. 저장되지 않아요.")
+    m0 = today.replace(day=1)
+    rows = []
+    for k in keys:
+        d = KPI_DEFS[k]
+        last, cur, nxt = (_kpi_week_value(my_name, k, ws + timedelta(weeks=o), today, ctx) for o in (-1, 0, 1))
+        pl = lambda o: (plans or {}).get((my_name, k, (ws + timedelta(weeks=o)).isoformat()), {}).get("plan")
+        month = _kpi_sum(my_name, k, m0, today, ctx) if d["kind"] == "sum" else _kpi_level(my_name, k, today, ctx)
+        tgt = (targets or {}).get((my_name, k))
+        rows.append({"지표": d["label"], "지난주": _fmt_kpi(last, d["unit"]), "이번주 계획 → 실제": f"{_fmt_kpi(pl(0), d['unit'])} → {_fmt_kpi(cur, d['unit'])}",
+                     "다음주 계획": _fmt_kpi(pl(1), d["unit"]), "이번 달·현재": _fmt_kpi(month, d["unit"]),
+                     "월 목표": _fmt_kpi(tgt, d["unit"]) if tgt else "미설정",
+                     "달성": (month / tgt) if (tgt and month is not None and d["kind"] == "sum") else None})
+    df = pd.DataFrame(rows)
+    st.dataframe(df, hide_index=True, use_container_width=True,
+                 column_config={"달성": st.column_config.ProgressColumn("달성", min_value=0.0, max_value=1.0, format="percent")})
+    pick = st.selectbox("그래프로 볼 지표", keys, format_func=lambda x: KPI_DEFS[x]["label"], key="kpi_pick")
+    d = KPI_DEFS[pick]
+    weeks = [ws + timedelta(weeks=o) for o in range(-7, 2)]
+    act, cum, cumplan, planv = [], 0.0, 0.0, []
+    for w in weeks:
+        v = _kpi_week_value(my_name, pick, w, today, ctx)
+        p = (plans or {}).get((my_name, pick, w.isoformat()), {}).get("plan")
+        if d["kind"] == "sum":
+            cum += v or 0
+            cumplan += p or 0
+            act.append(cum if v is not None else None)
+            planv.append(cumplan if (p is not None or cumplan) else None)
+        else:
+            act.append(v)
+            planv.append(p)
+    chart = pd.DataFrame({"실제" + (" (8주 누적)" if d["kind"] == "sum" else ""): act, "계획": planv}, index=[w.strftime("%m/%d") for w in weeks])
+    st.caption(f"{d['label']} — {d['help']}")
+    st.line_chart(chart, height=240)
+    behind = []
+    for k in keys:
+        tgt = (targets or {}).get((my_name, k))
+        if tgt and KPI_DEFS[k]["kind"] == "sum":
+            month_len = (m0.replace(month=m0.month % 12 + 1, day=1) if m0.month < 12 else m0.replace(year=m0.year + 1, month=1, day=1)) - m0
+            pace = tgt * today.day / month_len.days
+            got = _kpi_sum(my_name, k, m0, today, ctx)
+            if got < pace * 0.8:
+                behind.append(f"{KPI_DEFS[k]['label']} {_fmt_kpi(pace - got, KPI_DEFS[k]['unit'])} 뒤처짐")
+    if behind and not demo:
+        st.warning("목표 페이스보다 뒤처진 지표: " + " · ".join(behind))
+
+    with st.form("kpi_plan_form"):
+        st.caption(f"{ws.strftime('%m/%d')} 주 계획 · 다음주 계획 — 비워두면(0) 계획 없음으로 봐요. 저장해야 반영돼요.")
+        inputs = {}
+        for k in keys:
+            c0, c1, c2 = st.columns([3, 1, 1])
+            c0.markdown(f"**{KPI_DEFS[k]['label']}** ({KPI_DEFS[k]['unit']})")
+            cur_p = (plans or {}).get((my_name, k, ws.isoformat()), {}).get("plan")
+            nxt_p = (plans or {}).get((my_name, k, (ws + timedelta(weeks=1)).isoformat()), {}).get("plan")
+            inputs[k] = (c1.number_input("이번주", min_value=0.0, step=1.0, value=float(cur_p or 0), key=f"kp_c_{k}", label_visibility="collapsed"),
+                         c2.number_input("다음주", min_value=0.0, step=1.0, value=float(nxt_p or 0), key=f"kp_n_{k}", label_visibility="collapsed"))
+        save_plan = st.form_submit_button("💾 계획 저장 (여기서 저장돼요)", type="primary", disabled=demo)
+    if save_plan and not demo:
         try:
             now = datetime.utcnow().isoformat() + "Z"
-            for w, vals in ((ws, {"plan": n_plan, "actual": n_act, "note": note.strip() or None}), (ws + timedelta(weeks=1), {"plan": nx_plan})):
-                SUPA.table("okr_weekly_log").upsert({"item_id": item["id"], "person": my_name, "week_start": w.isoformat(), "updated_by": my_name,
-                                                     "updated_at": now, **vals}, on_conflict="item_id,week_start").execute()
+            for k, (cp, np_) in inputs.items():
+                for w, v in ((ws, cp), (ws + timedelta(weeks=1), np_)):
+                    old = (plans or {}).get((my_name, k, w.isoformat()), {}).get("plan")
+                    if v or old:
+                        SUPA.table("kpi_weekly_plan").upsert({"person": my_name, "metric_key": k, "week_start": w.isoformat(), "plan": v,
+                                                              "updated_by": my_name, "updated_at": now}, on_conflict="person,metric_key,week_start").execute()
         except Exception as e:
             st.error(f"저장하지 못했어요 ({type(e).__name__}: {e})")
         else:
-            load_weekly_logs.clear()
-            _flash("이번 주 기록을 저장했어요.")
+            load_kpi_plans.clear()
+            _flash("이번 주·다음주 계획을 저장했어요.")
             st.rerun()
 
+    ev_keys = [k for k in keys if KPI_DEFS[k]["src"] in ("events", "snapshot")]
+    if ev_keys:
+        with st.expander("➕ 기록 한 줄 추가 (자동으로 안 잡히는 지표)", expanded=False):
+            with st.form("kpi_event_form", clear_on_submit=True):
+                e1, e2, e3 = st.columns([2, 1, 1])
+                mk = e1.selectbox("지표", ev_keys, format_func=lambda x: f"{KPI_DEFS[x]['label']} ({KPI_DEFS[x]['unit']})")
+                ed = e2.date_input("날짜", value=today)
+                eq = e3.number_input("수량(또는 그 시점의 값)", min_value=0.0, step=1.0, value=1.0)
+                eb = st.text_input("브랜드/상대(선택)", placeholder="예: 닥터리앤장 / 담당 staff 이름")
+                en = st.text_input("메모·링크(선택)", placeholder="근거가 되는 링크나 한 줄 메모")
+                add = st.form_submit_button("➕ 기록 추가 (여기서 저장돼요)", disabled=demo)
+            st.caption("합계 지표는 '그 건의 수량'을, 팔로워·왕홍 수 같은 현재 수준 지표는 '그 시점의 값'을 적어요.")
+            if add and not demo:
+                try:
+                    SUPA.table("kpi_events").insert({"person": my_name, "metric_key": mk, "event_date": ed.isoformat(), "qty": eq,
+                                                     "brand_name": eb.strip() or None, "note": en.strip() or None, "created_by": my_name}).execute()
+                except Exception as e:
+                    st.error(f"저장하지 못했어요 ({type(e).__name__}: {e})")
+                else:
+                    load_kpi_events.clear()
+                    _flash("기록을 추가했어요.")
+                    st.rerun()
 
-def _render_team_board():
-    """② 팀 핵심 KPI 한눈에: 누구의 목표가 얼마나 왔고, 이번 주 입력을 했는지."""
-    st.markdown("### 👥 팀 핵심 KPI 한눈에")
-    heads, herr = load_headlines()
-    logs_all, lerr = load_weekly_logs()
-    if herr or lerr or not heads:
-        st.caption("아직 지정된 핵심 KPI가 없어요." if not (herr or lerr) else "DB 준비 중이에요(`migrations/20261019_okr_weekly.sql`).")
-        return
+
+def _render_kpi_team():
+    """팀 한눈에: 사람×지표의 이번 달 값·월 목표·달성, 이번 주 계획 입력 여부."""
+    st.markdown("### 👥 팀 핵심 지표 한눈에")
     today = _today_kst()
-    ws = _week_start(today)
+    ws, m0 = _week_start(today), today.replace(day=1)
+    ctx, eerr = _kpi_ctx()
+    plans, perr = load_kpi_plans()
+    targets, terr = load_kpi_targets()
+    if eerr or perr or terr:
+        st.caption("DB 준비 중이에요(`migrations/20261019_kpi_tracking.sql`).")
+        return
     rows = []
-    for person, it in sorted(heads.items()):
-        mine = [l for l in (logs_all or []) if l["item_id"] == it["id"]]
-        df = _kpi_series(it, mine, today)
-        done = float(df["cum_actual"].dropna().iloc[-1]) if df["cum_actual"].notna().any() else 0.0
-        target = float(it.get("target_qty") or 0)
-        cur = df[df["week"] == ws]
-        entered = (not cur.empty) and pd.notna(cur.iloc[0]["actual"])
-        pace = float(cur.iloc[0]["pace"]) if not cur.empty and pd.notna(cur.iloc[0]["pace"]) else None
-        rows.append({"이름": person, "핵심 KPI": it["title"][:30], "누적/목표": f"{done:g}/{target:g}{it.get('unit') or ''}",
-                     "달성률": min(done / target, 1.0) if target else 0.0,
-                     "페이스": "—" if pace is None else ("✅ 순조" if done >= pace else f"⚠️ {pace - done:g} 뒤처짐"),
-                     "이번주 입력": "✅" if entered else "❌ 아직"})
-    st.dataframe(pd.DataFrame(rows), hide_index=True, use_container_width=True,
-                 column_config={"달성률": st.column_config.ProgressColumn("달성률", min_value=0.0, max_value=1.0, format="percent")})
+    for person in [p for p in STAFF_NAMES if p != _KPI_TEST_USER and _kpi_keys(p)]:
+        for k in _kpi_keys(person):
+            d = KPI_DEFS[k]
+            month = _kpi_sum(person, k, m0, today, ctx) if d["kind"] == "sum" else _kpi_level(person, k, today, ctx)
+            tgt = targets.get((person, k))
+            rows.append({"이름": person, "지표": d["label"], "이번 달·현재": _fmt_kpi(month, d["unit"]), "월 목표": _fmt_kpi(tgt, d["unit"]) if tgt else "미설정",
+                         "이번주 계획": "✅" if (person, k, ws.isoformat()) in plans else "❌ 아직"})
+    if not rows:
+        st.caption("표시할 지표가 없어요.")
+        return
+    st.dataframe(pd.DataFrame(rows), hide_index=True, use_container_width=True)
+    miss = sorted({r["이름"] for r in rows if r["이번주 계획"] != "✅"})
+    if miss:
+        st.caption("이번 주 계획을 아직 안 적은 사람: " + ", ".join(miss))
+
+
+def _render_kpi_admin():
+    """대표 전용(비밀번호): 사람·지표별 월 목표 숫자 지정."""
+    with st.expander("🔒 대표 전용 — 월 목표 숫자 지정", expanded=False):
+        pw_env = os.environ.get("FINANCE_PASSWORD")
+        if not pw_env:
+            st.caption("FINANCE_PASSWORD 환경변수가 이 서비스에 없어서 쓸 수 없어요(Railway Variables에 추가).")
+            return
+        people = [p for p in STAFF_NAMES if p != _KPI_TEST_USER and _kpi_keys(p)]
+        with st.form("kpi_target_form"):
+            pw = st.text_input("비밀번호", type="password")
+            t1, t2, t3 = st.columns([1, 2, 1])
+            who = t1.selectbox("사람", people, key="kt_person")
+            mk = t2.selectbox("지표", _kpi_keys(who) if who else [], format_func=lambda x: KPI_DEFS[x]["label"], key="kt_metric")
+            val = t3.number_input("월 목표", min_value=0.0, step=1.0, key="kt_val")
+            go = st.form_submit_button("📌 지정 (여기서 저장돼요)", type="primary")
+        if go:
+            if pw != pw_env:
+                st.error("비밀번호가 맞지 않아요.")
+            else:
+                try:
+                    SUPA.table("kpi_targets").upsert({"person": who, "metric_key": mk, "month_target": val,
+                                                      "updated_at": datetime.utcnow().isoformat() + "Z"}, on_conflict="person,metric_key").execute()
+                except Exception as e:
+                    st.error(f"저장하지 못했어요 — DB 칸이 없을 수 있어요(`migrations/20261019_kpi_tracking.sql`) ({type(e).__name__}: {e})")
+                else:
+                    load_kpi_targets.clear()
+                    _flash(f"{who}님 '{KPI_DEFS[mk]['label']}' 월 목표를 저장했어요.")
+                    st.rerun()
 
 
 def _render_macro_board():
@@ -2588,38 +2767,6 @@ def _render_macro_board():
         tgt = MACRO_TARGETS.get(k)
         c.metric(label, f"{val}{unit}", delta=(f"목표 {tgt}{unit}" if tgt else None), delta_color="off")
     st.caption("목표 숫자는 대표님이 정하면 표시돼요 · '설득 빈도', '기획전 참여'는 아직 기록하는 곳이 없어 빠져 있어요(어디에 남길지 정해야 해요).")
-
-
-def _render_headline_admin():
-    """대표 전용: 사람마다 핵심 KPI 1개 지정(비밀번호). 직원이 쉬운 걸로 바꾸지 못하게 잠가 둔다."""
-    with st.expander("🔒 대표 전용 — 핵심 KPI 지정", expanded=False):
-        pw_env = os.environ.get("FINANCE_PASSWORD")
-        if not pw_env:
-            st.caption("FINANCE_PASSWORD 환경변수가 이 서비스에 없어서 지정 기능을 쓸 수 없어요(Railway Variables에 추가).")
-            return
-        with st.form("headline_form"):
-            pw = st.text_input("비밀번호", type="password")
-            org, items = load_okr()
-            who = st.selectbox("사람", [o["person"] for o in org] if org else [], key="hl_person")
-            cands = [it for it in items if it["person"] == who and float(it.get("target_qty") or 0) > 0]
-            pick = st.selectbox("핵심 KPI로 지정할 항목(중장기 목표 1개)", [c["id"] for c in cands], key="hl_item",
-                                format_func=lambda i: next(f"[{c.get('category') or ''}] {c['title'][:40]} · 목표 {float(c['target_qty']):g}{c.get('unit') or ''}" for c in cands if c["id"] == i))
-            go = st.form_submit_button("📌 지정 (여기서 저장돼요)", type="primary")
-        if go:
-            if pw != pw_env:
-                st.error("비밀번호가 맞지 않아요.")
-            elif not pick:
-                st.error("지정할 항목을 골라주세요.")
-            else:
-                try:
-                    SUPA.table("okr_items").update({"is_headline": False}).eq("person", who).execute()
-                    SUPA.table("okr_items").update({"is_headline": True}).eq("id", pick).execute()
-                except Exception as e:
-                    st.error(f"저장하지 못했어요 — DB에 칸이 없을 수 있어요(`migrations/20261019_okr_weekly.sql`) ({type(e).__name__}: {e})")
-                else:
-                    load_headlines.clear()
-                    _flash(f"{who}님의 핵심 KPI를 지정했어요.")
-                    st.rerun()
 
 
 def _hub_refresh():
@@ -3259,7 +3406,7 @@ def refresh():
 
 
 my_name = st.selectbox("내 이름", STAFF_NAMES, key="my_name")
-ROLE_MAP = {"김선재": "sales", "곽재선": "influencer", "구정회": "dev", "이단우": "china_ops", "가상인턴": "sales"}  # 가상인턴=테스트 계정(세일즈 화면 시험용)
+ROLE_MAP = {"김선재": "sales", "곽재선": "influencer", "구정회": "dev", "이단우": "china_ops", "유원리": "china_ops", "가상인턴": "sales"}  # 가상인턴=테스트 계정(세일즈 화면 시험용)
 my_role = ROLE_MAP.get(my_name)
 INVOICE_EDITORS = {"김선재", "가상인턴"}  # 최종 인보이스를 첨부·교체하고 브랜드 승인 처리를 할 수 있는 사람(나머지는 보기만, 가상인턴=테스트)
 
@@ -3458,12 +3605,12 @@ if _nav == "okr":
     # ══════════════════════════════════════════════════════════
     st.subheader("🎯 목표 — 매주 확인")
     st.caption("OKR은 내 커리어를 쌓는 기록이에요. 시스템이 조금 불편해도, 할 수 있는 만큼만 매주 꾸준히 남겨주세요 — 대표님과 매주 이 화면으로 이야기해요.")
-    _render_weekly_focus(my_name)
+    _render_kpi_board(my_name)
     st.divider()
-    _render_team_board()
+    _render_kpi_team()
     st.divider()
     _render_macro_board()
-    _render_headline_admin()
+    _render_kpi_admin()
     st.divider()
 
     with st.expander("📚 전체 OKR 상세 보기 (내 OKR이 먼저 보여요)", expanded=False):
